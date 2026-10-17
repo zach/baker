@@ -1,0 +1,5 @@
+; Made for the season-two build, which this game is not running yet.
+(pack season_two_1019 (level live) (version 1) (requires (game_data "1.1")))
+
+(event
+   (xp_multiplier 1.5))

@@ -1,0 +1,33 @@
+; Corpus-style boss data with its shapes (dev/decisions.md D84). A layer above it,
+; bosses_patch.dta, adds a field and retunes a range; the test loads both through Config.
+(shapes
+   (boss_phase (at bosses boss phases)
+      (enter_at float (range 0 1) (kind percent) (desc "HP fraction that starts this phase"))
+      (attacks (list symbol))
+      (cadence float (range 0.2 5))
+      (music string (optional)))
+   (boss
+      (name symbol)
+      (hp int (range 1 100000))
+      (arena symbol)
+      (phases any)))
+
+(bosses
+   (boss
+      (name dragon)
+      (hp 4000)
+      (arena volcano)
+      (phases
+         (boss_phase (enter_at 1.0) (attacks bite claw) (cadence 1.5))
+         (boss_phase (enter_at 0.5) (attacks fire_breath) (cadence 0.8) (music "dragon_2.ogg"))
+         (boss_phase (enter_at 1.5) (attacks rage) (cadence 0.4))))
+   (boss
+      (name golem)
+      (hp 2500)
+      (arena quarry)
+      (taunts "hah")
+      (phases
+         (boss_phase (enter_at 1.0) (attacks slam)))))
+
+; Not under bosses/boss/phases: the boss_phase shape does not govern it.
+(tutorial (boss_phase (enter_at 7)))

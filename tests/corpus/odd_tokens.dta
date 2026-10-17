@@ -1,0 +1,14 @@
+﻿; starts with a byte order mark and uses CRLF line endings
+(crlf
+	(a 1)
+	(b "two
+lines"))
+(unicode "café ☃ 日本" smörgåsbord)
+(empty () {} "" '')
+(signs + - -- +1 -1 +.5 -.5 1. 007 -007)
+(not_numbers 1e 0x 0xZZ 1.2.3 inf nan -inf 1_000 12abc)
+(quoted 'has space' 'has(paren)' '123' '$notvar' '#notdirective' 'semi;colon')
+(odd_symbols a'b don't x/y ../path/file.dta a/*b* *star)
+(escapes "a\qb" "line1\nline2" "back\\slash" "C:\\games\\path" "trailing\\")
+(controlchars)
+; a comment at the very end without a newline

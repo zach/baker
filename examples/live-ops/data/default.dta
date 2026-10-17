@@ -1,0 +1,13 @@
+; What the build shipped with. The pack names this data and its version, so an overlay can
+; say which base it was made for; the shapes say what an overlay may set.
+(pack game_data (level game) (version "1.0"))
+
+(shapes
+   (event
+      (xp_multiplier float (range 1 5) (desc "Experience multiplier"))
+      (drop_rate float (range 0 1) (desc "Chance of a rare drop"))
+      (banner string (optional))))
+
+(event
+   (xp_multiplier 1)
+   (drop_rate 0.05))

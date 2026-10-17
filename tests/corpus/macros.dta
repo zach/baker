@@ -1,0 +1,14 @@
+; Shared macros and flags, included by other corpus files.
+
+[TRUE 1]
+[FALSE 0]
+[WHITE 1 1 1]
+[BLACK 0 0 0]
+[HIGHLIGHT 1.0 0.85 0.2]
+
+#define kMaxPlayers (4)
+#define kDefaultVolume (0.8)
+#define HAS_VOCALS
+
+; a macro whose body holds an array: every expansion shares it
+[FADE_IN (fade (time 0.25) (curve ease_out))]

@@ -1,0 +1,5 @@
+; A "lucky hour" that runs script: a live overlay may only hold data.
+(pack lucky_hour_1020 (level live) (version 1) (requires (game_data "1.0")))
+
+(event
+   (drop_rate {random_float 0.05 0.5}))

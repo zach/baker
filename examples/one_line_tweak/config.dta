@@ -1,0 +1,3 @@
+; Tuning for the box. Change a number and save while the example runs with --watch.
+(box
+   (width 3.5 (note "3-4 reads well at 1080p")))

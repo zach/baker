@@ -1,0 +1,7 @@
+; Double-XP weekend. Ships Friday 17:00 UTC; roll back Monday.
+(pack double_xp_1017 (level live) (version 1) (requires (game_data "1.0")))
+(origin "liveops console, ticket 4412" (tool baker-publish))
+
+(event
+   (xp_multiplier 2)
+   (banner "Double XP all weekend!"))

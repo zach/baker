@@ -1,0 +1,7 @@
+; Shared settings, checked in. Each subsystem reads only its own group.
+(renderer
+   (shadows 1 (desc "Cast shadows"))
+   (clear_color 0.1 0.1 0.2 (desc "Background")))
+(audio
+   (volume 0.8 (range 0 1) (step 0.05) (desc "Master volume"))
+   (channels 32))

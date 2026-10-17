@@ -1,0 +1,12 @@
+; Application config: overrides first, then fill in everything else from the defaults.
+#include macros.dta
+
+(renderer
+   (screen_size 1920 1080)
+   (shadows (resolution 4096)))
+
+(audio (channels 32))
+
+(app (title "Corpus Demo") (max_players kMaxPlayers))
+
+#merge config_default.dta

@@ -1,0 +1,23 @@
+; Tunable game values with their editing metadata alongside.
+
+(box
+   (width 2 (range 0 10) (step 1) (desc "Box width"))
+   (height 1.5 (range 0.5 4) (step 0.25)))
+
+(warden_fight
+   (phase (enter_at 1.00) (attacks sweep slam)      (cadence 1.8))
+   (phase (enter_at 0.60) (attacks sweep slam roar) (cadence 1.2))
+   (phase (enter_at 0.25) (attacks frenzy)          (cadence 0.6)
+          (note "0.6 feels unfair at 60fps on handheld - try 0.7")))
+
+(economy
+   (drop_rate 0.035 (kind percent))
+   (gold_per_kill 12)
+   (crit_multiplier 2.5e0)
+   (tiny_value 1e-6)
+   (flags 0x0000FF00)
+   (mask 0xffffffff)
+   (offset -0x10)
+   (negative_zero -0.0)
+   (big 2147483647)
+   (small -2147483648))

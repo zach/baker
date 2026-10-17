@@ -1,0 +1,16 @@
+; Script-side function and class definitions. baker::data reads these as plain trees;
+; they only mean something once baker::script is linked.
+
+{func add1 ($a) {+ $a 1}}
+
+{func boss.find_cover ($player)
+   (status stub)
+   {nearest_marker {boss position} cover}}
+
+{class Person
+   (grow ($n) {set [height] {+ [height] $n}})
+   (miss {print "whoosh"})}
+
+{new Person Bob}
+{{nearest_object $bomb_position} suffer_damage 10}
+{Bob grow 10}

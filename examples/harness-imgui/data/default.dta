@@ -1,0 +1,20 @@
+; The harness's scene: a ball in a box, and a spawner. Tune them in the Tweaks and Shapes
+; panels; hover a value for where it comes from. Your own tuning goes to local/<you>.dta,
+; which is not checked in.
+(scene
+   (ball
+      (radius 24 (range 4 80) (step 1) (desc "Ball radius, in pixels"))
+      (color 0.95 0.55 0.2 (range 0 1) (desc "Ball color"))   ; shown as a color
+      (bounce 0.8 (range 0 1) (note "1.0 never settles")))
+   (gravity 900 (range 0 3000) (desc "Pixels per second squared")))
+
+(shapes
+   (spawner
+      (count int (range 1 50) (desc "Balls per wave"))
+      (interval float (range 0.1 10) (desc "Seconds between waves"))
+      (boss bool (optional) (desc "A large ball last"))))
+
+(spawner
+   (count 3)
+   (interval 2.5)
+   (boss 0))

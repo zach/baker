@@ -1,0 +1,5 @@
+; Script functions the calculator loads before evaluating anything. They are ordinary
+; data: edit them, or add your own, without rebuilding.
+{func square ($x) {* $x $x}}
+{func average ($a $b) {/ {+ $a $b} 2}}
+{func clamp ($x $lo $hi) {if {< $x $lo} $lo {if {> $x $hi} $hi $x}}}

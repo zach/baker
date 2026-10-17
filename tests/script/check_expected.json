@@ -1,0 +1,26 @@
+{
+  "schema": "baker.check/1.2",
+  "passed": false,
+  "errors": [
+    {"code": "type", "file": "game.dta", "line": 5, "column": 0, "path": "", "message": "no overload of '+' takes 1 argument"}
+  ],
+  "warnings": [
+    {"code": "refused", "file": "game.dta", "line": 3, "column": 0, "path": "", "message": "pack 'game_rules' (level game) calls 'boss.restart' from the softer pack 'boss_task' (level task)"}
+  ],
+  "demand": [
+    {"name": "spawn", "on": "", "stub": false, "sites": [{"file": "game.dta", "line": 4}, {"file": "level.dta", "line": 1}]}
+  ],
+  "repeats": [
+    {"form": "(phase (say \"Get \\qready\\q\") (hp 30) (wait 2))", "nodes": 10, "sites": [{"file": "game.dta", "line": 6}, {"file": "level.dta", "line": 2}, {"file": "task.dta", "line": 3}]}
+  ],
+  "findings": [
+    {"code": "refused", "file": "task.dta", "line": 0, "column": 0, "path": "", "message": "pack 'boss_task' has one owner, td-encounter: no one else keeps it"}
+  ],
+  "load": [],
+  "shape_errors": [],
+  "shape_warnings": [],
+  "packs": [
+    {"name": "boss_task", "level": "task", "file": "task.dta", "requires": [], "owners": ["td-encounter"], "for": ["designers"], "stage": "custom"},
+    {"name": "game_rules", "level": "game", "file": "game.dta", "requires": ["boss_task"], "owners": ["a", "b"], "for": [], "stage": ""}
+  ]
+}

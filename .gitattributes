@@ -1,0 +1,3 @@
+# Test inputs are byte-exact: no line-ending conversion on any platform.
+tests/corpus/*.dta -text
+tests/fuzz_regressions/*.bin binary

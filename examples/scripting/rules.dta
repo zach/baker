@@ -1,0 +1,11 @@
+; Rules a designer edits. A {command} runs when its value is read; $difficulty is set by
+; the game, and scaled is a script function defined here.
+{func scaled ($base) {* $base $difficulty}}
+
+(enemy
+   (grunt (hp {scaled 30}) (damage 4))
+   (brute (hp {scaled 80}) (damage {if {> $difficulty 2} 12 9})))
+
+(level
+   (on_enter {spawn grunt 3} {spawn brute 1})
+   (on_win {spawn grunt} {play_sfx fanfare}))

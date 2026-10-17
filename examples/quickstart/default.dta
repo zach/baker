@@ -1,0 +1,3 @@
+; The values the game reads, by path: player.speed is 4.5 here.
+(player
+   (speed 4.5 (range 0 10) (desc "Run speed, in m/s")))

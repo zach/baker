@@ -1,0 +1,49 @@
+#include macros.dta
+
+/* A small menu screen with scripted handlers. Commands are {func args...} or
+   {object method args...}; they only run when a handler reaches for them. */
+
+(main_menu
+   (focus play_button)
+   (background_color BLACK)
+   (buttons
+      (play_button
+         (text "Play")
+         (color HIGHLIGHT)
+         FADE_IN
+         (select
+            {play_sfx "ui/confirm.wav"}
+            {ui goto_screen song_select_screen}))
+      (options_button
+         (text "Options")
+         (color WHITE)
+         FADE_IN
+         (select {ui push_panel options_panel}))
+      (quit_button
+         (text "Quit")
+         (color WHITE)
+         (select
+            {if {== $platform pc}
+               {game quit}
+               {ui show_message "quit_unavailable"}})))
+   (enter
+      {set $menu_enter_count {+ $menu_enter_count 1}}
+      {do ($i)
+         {set $i 0}
+         {while {< $i kMaxPlayers}
+            {player_join $i}
+            {set $i {+ $i 1}}}})
+   (focus_ring [focus_ring color])
+   (scroll_speed 600.0))
+
+#ifdef HAS_VOCALS
+(vocals_panel (lanes 3) (pitch_arrow TRUE))
+#else
+(vocals_panel (lanes 0))
+#endif
+
+#ifndef DEMO_BUILD
+(store_button (text "Store") (select {ui goto_screen store_screen}))
+#endif
+
+#autorun {ui register_screen main_menu}

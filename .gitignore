@@ -1,0 +1,9 @@
+/build*/
+/out/
+/.cache/
+compile_commands.json
+*.swp
+.DS_Store
+.vs/
+.vscode/
+/examples/harness-imgui/data/local/

@@ -1,0 +1,30 @@
+# Run in CI over src/: every enabled check is an error. A check is off here only for
+# a pattern the code uses on purpose; the reason is beside it.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-casting-through-void,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-unchecked-optional-access,
+  cppcoreguidelines-pro-type-member-init,
+  modernize-*,
+  -modernize-avoid-c-arrays,
+  -modernize-loop-convert,
+  -modernize-return-braced-init-list,
+  -modernize-use-auto,
+  -modernize-use-trailing-return-type,
+  performance-*,
+  -performance-enum-size,
+  readability-make-member-function-const,
+# bugprone-casting-through-void, -multi-level-implicit-pointer-conversion: callbacks and
+#   thunks erase types through void*, and the arena and cache memcpy pointer arrays.
+# bugprone-unchecked-optional-access: try_int() and the like are read after the node's type
+#   is checked, which the analysis cannot follow.
+# modernize-avoid-c-arrays: fixed tables and stack buffers stay C arrays, since public
+#   headers use no STL. -return-braced-init-list, -use-auto: style.
+# modernize-loop-convert: index loops over containers that grow or shrink while they run
+#   (a cache's breadth-first layout, callbacks that unsubscribe).
+# performance-enum-size: some enums are sized to pin a struct's layout.
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*/(include/baker|src)/.*'

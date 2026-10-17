@@ -1,0 +1,5 @@
+; Meant to raise rare drops to 15%, typed as a percentage.
+(pack drops_1018 (level live) (version 1) (requires (game_data "1.0")))
+
+(event
+   (drop_rate 15))

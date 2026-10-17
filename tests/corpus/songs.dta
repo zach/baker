@@ -1,0 +1,57 @@
+; Song metadata in the style of a rhythm game's song list. All songs, artists and
+; numbers here are invented.
+
+(midnight_ferry
+   (name "Midnight Ferry")
+   (artist "The Lantern Choir")
+   (master TRUE)
+   (song
+      (name "songs/midnight_ferry/midnight_ferry")
+      (tracks
+         ((drum (0 1 2 3))
+          (bass (4 5))
+          (guitar (6 7))
+          (vocals (8))))
+      (pans (-1.0 1.0 -1.0 1.0 -1.0 1.0 -1.0 1.0 0.0))
+      (vols (-3.5 -3.5 -2.0 -2.0 -4.0 -4.0 -1.5 -1.5 0.0))
+      (cores (-1 -1 -1 -1 -1 -1 1 1 -1))
+      (vocal_parts 1)
+      (hopo_threshold 170))
+   (bank sfx/tambourine_bank.milo)
+   (anim_tempo kTempoMedium)
+   (preview 42000 72000)
+   (rank
+      (drum 182)
+      (guitar 214)
+      (bass 150)
+      (vocals 96)
+      (band 175))
+   (genre indierock)
+   (decade the2000s)
+   (vocal_gender female)
+   (version 3)
+   (format 10)
+   (album_art TRUE)
+   (year_released 2004)
+   (album_name "Harbour Lights")
+   (album_track_number 7)
+   (rating 2)
+   (song_id 1000412))
+
+(paper_satellites
+   (name "Paper Satellites")
+   (artist "Orbit Club")
+   (master FALSE)
+   (song
+      (name "songs/paper_satellites/paper_satellites")
+      (tracks ((drum (0 1)) (bass 2) (guitar 3) (vocals 4)))
+      (pans (-1 1 0 0 0))
+      (vols (0 0 0 0 0))
+      (cores (-1 -1 -1 1 -1))
+      (crowd_channels 5 6))
+   (preview 30000 60000)
+   (rank (drum 0) (guitar 1) (bass 0) (vocals 300) (band 120))
+   (genre 'synth pop')       ; a symbol that needs quotes
+   (vocal_gender male)
+   (year_released 1987)
+   (song_id 1000413))

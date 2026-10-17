@@ -1,0 +1,17 @@
+; Engine defaults. config_app.dta merges this file in, so anything it sets wins.
+
+(renderer
+   (screen_size 1280 720)
+   (clear_color 0.1 0.1 0.12)
+   (vsync TRUE)
+   (shadows (enabled TRUE) (resolution 2048) (cascades 3)))
+
+(audio
+   (master_volume kDefaultVolume)
+   (channels 64)
+   (sample_rate 48000))
+
+(input
+   (deadzone 0.15)
+   (repeat_delay 0.35)
+   (repeat_rate 0.08))
