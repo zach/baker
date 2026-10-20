@@ -451,7 +451,7 @@ TEST_CASE("set on a scalar already in scratch allocates nothing and touches only
     CHECK(float(width) == 2.75f);
     CHECK(width_changes == 2);
     CHECK(height_changes == 0);
-    CHECK(cfg.epoch() == epoch);  // no full re-merge
+    CHECK(cfg.epoch() == epoch + 1);  // a live edit, though not a full re-merge
     CHECK(cfg.last_reload()->epoch == record->epoch);
     CHECK(cfg.get<double>("box.width") == 2.75);  // lookups see scratch first
     CHECK(cfg.source("box.width")->layer == "scratch");
@@ -466,6 +466,35 @@ TEST_CASE("set on a scalar already in scratch allocates nothing and touches only
     REQUIRE(cfg.clear_scratch("box.width"));
     CHECK(float(width) == 2.0f);
     CHECK(cfg.unsaved().empty());
+}
+
+TEST_CASE("every live edit moves the epoch, with the journal off too") {
+    TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    cfg.set_journal_history(0);
+    REQUIRE(cfg.push_layer("default", dir.write("default.dta", kBase)));
+    REQUIRE(cfg.push_layer("exp", dir.write("exp.dta", "(audio (volume 0.6))")));
+    uint64_t epoch = cfg.epoch();
+    const auto moved = [&] {
+        const bool m = cfg.epoch() != epoch;
+        epoch = cfg.epoch();
+        return m;
+    };
+    REQUIRE(cfg.set("box.width", Node(2.5)));
+    CHECK(moved());
+    REQUIRE(cfg.set("box.width", Node(2.5)));  // the fast path, the same value again
+    CHECK(moved());
+    const ConfigSnapshot snap = cfg.snapshot();
+    CHECK_FALSE(moved());
+    REQUIRE(cfg.clear_scratch("box.width"));
+    CHECK(moved());
+    REQUIRE(cfg.restore(snap));
+    CHECK(moved());
+    REQUIRE(cfg.write_back("box.width"));
+    CHECK(moved());
+    REQUIRE(cfg.promote("exp", "default"));
+    CHECK(moved());
+    CHECK_FALSE(moved());  // nothing changed, nothing moves
 }
 
 TEST_CASE("a shorter scratch value hides the layers' longer one") {

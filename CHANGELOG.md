@@ -3,6 +3,41 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.2.0 - 2026-10-20
+
+- **New: the host kit, `baker::host`.** A separate library beside the core for the part of
+  a game's tooling every game writes the same way. It is built with `BAKER_BUILD_HOST`, on
+  by default whenever `baker::script` is built, and you link it on its own; its headers are
+  in `<baker/host/...>`. [Baker and your tools](docs/tools.md#the-host-kit) describes each
+  piece, and [`examples/host`](examples/host) is a game's whole tooling in one `main`.
+  - **`Live`:** the edit-to-see loop. It opens the stack from the nearest
+    `baker-project.dta` (or a `Project` built in code), adds the check validator and, when
+    `baker::shape` is built, the shape validator, binds the Config's tools, and runs
+    `#autorun`. Each frame, `begin_frame()` reloads what was saved, timed from the save, and
+    answers the console. Its `changed` callback is where the game reads its structured data.
+  - **`Watcher`:** exactly the files the stack was read from, through inotify or
+    `ReadDirectoryChangesW`, or by their write time where there is no notification. Hooks
+    map an engine's virtual paths to files on the disk, or answer for paths that have none.
+  - **`Console`:** one-line requests on 127.0.0.1, polled once a frame. A request,
+    `(ID {command})`, is answered with one line of reply JSON, and a frame's replies go out
+    together, so a tool's batch of requests is answered within the frame.
+  - **The commands:** `check`, `reference [--json]`, `eval`, `diff` and `promote [--patch]`,
+    run from your game's own binary with `parse_command_line` and `run_command`, so they
+    know its script functions.
+  - **Shipping builds:** under `BAKER_SHIPPING` it opens no socket and sets no watch; the
+    stack still opens, and `diff` and `promote` refuse.
+- **New: `{config.clear PATH}`** drops one path's live edit, so the value is the files'
+  again, and the journal records it as reverted. It returns 1 if there was an edit and 0 if
+  not, and changes nothing when there was none. It is bound in development builds by
+  `bind_config_tools`, next to `config.set`.
+- **Changed: `Config::epoch()` moves on every live edit.** Before, no `set()` moved it:
+  neither the first set of a path nor a repeated one. Now every `set()` does, along with
+  `clear_scratch()`, write-back, `promote()` and `restore()`, as before. Compare it once a
+  frame to tell that what you show or cache is stale, whoever made the edit. The fast path
+  of `set()` costs one more increment and still allocates nothing.
+- **Changed: `examples/remote-console`** uses the host kit's `Console` in place of its own
+  server; the example's client is unchanged.
+
 ## 0.1.1 - 2026-10-20
 
 - **Fixed: options built before `open_project` kept a layer they should leave out.**

@@ -1,0 +1,6 @@
+#autorun {spawn grunt 3}   ; the data calls the game's function; check checks the call
+(shapes
+   (player
+      (speed float (range 0 10))))
+(player
+   (speed 4.5))   ; edit and save while it plays

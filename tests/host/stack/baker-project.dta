@@ -1,0 +1,6 @@
+; The test game's stack (tests/host/test_commands.py).
+(project
+   (layers
+      (default "data/default.dta")
+      (local "data/local.dta" optional)
+      (agent "data/agent.dta" optional)))

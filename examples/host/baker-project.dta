@@ -1,0 +1,5 @@
+; The example host's stack: what the game, its commands, and any tool read.
+(project
+   (layers
+      (default "data/default.dta")
+      (local "data/local.dta" optional)))   ; one person's tuning, not in version control

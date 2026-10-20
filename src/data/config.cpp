@@ -361,6 +361,7 @@ void Config::Impl::put(Config& c, const Path& target, std::span<const Node> valu
     }
     log_edit(*found, before, before_count, values, source);
     c.scratch_dirty_ = true;
+    ++c.epoch_;  // a live edit, though not a merge
     retune(*found);
 }
 
@@ -821,6 +822,7 @@ Expected<void> Config::set(std::string_view path, const Node& value) {
                             Source{scratch_name()});
             scratch_dirty_ = true;
             ++impl_->generation;
+            ++epoch_;
             impl_->retune(e);
             return {};
         }

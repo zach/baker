@@ -226,6 +226,22 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             },
             "Tunes a path live, in the scratch layer; returns the value set.");
         bind(
+            "config.clear",
+            [tools](Name path) -> Expected<Node> {
+                // A path with no live edit changes nothing, not even a merge. All of scratch
+                // is never this call with the path left out: a tool probing whether the
+                // command exists must not drop every edit.
+                bool edited = false;
+                for (const Symbol p : tools->cfg.unsaved())
+                    edited = edited || Path(p.str()).matches(path.text);
+                if (!edited) return Node(int64_t{0});
+                auto r = tools->cfg.clear_scratch(path.text);
+                if (!r) return Unexpected(std::move(r).error());
+                return Node(int64_t{1});
+            },
+            "Drops a path's live edit, so its value is the files' again, and the journal "
+            "records it reverted; returns 1 if there was an edit to drop, 0 if not.");
+        bind(
             "config.toggle",
             [tools](Name layer) -> Expected<Node> {
                 auto r = tools->cfg.toggle_layer(layer.text);

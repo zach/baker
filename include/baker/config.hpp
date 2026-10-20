@@ -453,7 +453,10 @@ public:
         return root_->get<T>(path, std::move(fallback));
     }
     [[nodiscard]] Expected<Source> source(const Path& path) const;
-    // Increments on every change but a fast-path set().
+    // Increments on every change: a reload, a layer change, every live edit (a set(), the
+    // fast path's included, a clear_scratch(), a write-back, a restore). A host compares it
+    // once a frame to know that what it shows or caches is stale. Under BAKER_SHIPPING only
+    // the changes a shipping build makes move it.
     [[nodiscard]] uint64_t epoch() const noexcept { return epoch_; }
 
     // --- Hot reload and telemetry. ---

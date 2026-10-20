@@ -115,6 +115,25 @@ TEST_CASE("the live tools: set, unsaved, journal, toggle, snapshot, restore, rel
     CHECK(eval(f.ctx, "{config.loop}").rfind("((reloads 2) (unchanged 1) (failures 0)", 0) == 0);
 }
 
+TEST_CASE("config.clear drops one path's live edit, and says whether there was one") {
+    Fixture f;
+    REQUIRE(f.ctx.eval("{config.set box.width 4.5}", "test"));
+    REQUIRE(f.ctx.eval("{config.set box.height 9}", "test"));
+    CHECK(eval(f.ctx, "{config.clear box.width}") == "1");
+    CHECK(f.cfg.get<int>("box.width") == 3);   // the files' value: local's
+    CHECK(f.cfg.get<int>("box.height") == 9);  // the other edit stays
+    CHECK(eval(f.ctx, "{config.unsaved}") == "(box/height)");
+    CHECK(eval(f.ctx, "{config.journal}").find("(after 4.5) (fate reverted)") != std::string::npos);
+    // Nothing to drop: no edit there, or no value at all. Neither changes anything.
+    const uint64_t epoch = f.cfg.epoch();
+    CHECK(eval(f.ctx, "{config.clear box.width}") == "0");
+    CHECK(eval(f.ctx, "{config.clear no.such.path}") == "0");
+    CHECK(f.cfg.epoch() == epoch);
+    CHECK(eval(f.ctx, "{config.unsaved}") == "(box/height)");
+    CHECK_FALSE(f.ctx.eval("{config.clear}", "test"));  // no path: an error, never all
+    CHECK(eval(f.ctx, "{config.unsaved}") == "(box/height)");
+}
+
 TEST_CASE("the writers are bound only when allowed, and write through the Config") {
     {
         Fixture f;
@@ -134,6 +153,7 @@ TEST_CASE("a shipping build binds the reading tools only") {
     Fixture f({.allow_write = true});
     CHECK(f.ctx.has_func("config.explain"));
     CHECK_FALSE(f.ctx.has_func("config.set"));
+    CHECK_FALSE(f.ctx.has_func("config.clear"));
     CHECK_FALSE(f.ctx.has_func("config.write_back"));
 }
 #endif

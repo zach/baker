@@ -87,20 +87,37 @@ if(BAKER_BUILD_SCRIPT)
   # --- tasks: a C++ coroutine and the script tasks.
   add_executable(baker_example_tasks tasks/main.cpp)
   target_link_libraries(baker_example_tasks PRIVATE baker::script)
-  # --- remote-console: eval over TCP, tested over loopback.
-  find_package(Threads REQUIRED)
-  add_executable(baker_example_remote_console remote-console/main.cpp remote-console/console.cpp)
-  target_link_libraries(baker_example_remote_console PRIVATE baker::script Threads::Threads)
-  if(WIN32)
-    target_link_libraries(baker_example_remote_console PRIVATE ws2_32)
+  # --- remote-console: eval over TCP, tested over loopback, on the host kit's
+  #     Console.
+  if(TARGET baker::host)
+    find_package(Threads REQUIRED)
+    add_executable(baker_example_remote_console remote-console/main.cpp)
+    target_link_libraries(baker_example_remote_console PRIVATE baker::host Threads::Threads)
+    if(WIN32)
+      target_link_libraries(baker_example_remote_console PRIVATE ws2_32)
+    endif()
+  endif()
+  # --- host: the host kit, a game's tooling from its main.
+  if(TARGET baker::host)
+    add_executable(baker_example_host host/main.cpp)
+    target_link_libraries(baker_example_host PRIVATE baker::host)
+    if(BAKER_BUILD_TESTS)
+      baker_example_test(baker_example_host_check baker_example_host "^{${nl}  \"schema\": \"baker[.]check/1[.]2\",${nl}  \"passed\": true"
+        check --project ${CMAKE_CURRENT_SOURCE_DIR}/host)
+      baker_example_test(baker_example_host_play baker_example_host
+        "^player speed 4[.]5, 3 spawned${nl}$"
+        play --frames 3 --console-port 0 --project ${CMAKE_CURRENT_SOURCE_DIR}/host)
+    endif()
   endif()
   if(BAKER_BUILD_TESTS)
     baker_example_test(baker_example_scripting baker_example_scripting "takes 2 arguments, given 1  [(]rules[.]dta:11[)]${nl}demand: 'play_sfx' is not defined.*grunt hp 60, brute hp 160, brute damage 9${nl}at difficulty 3: brute hp 240, damage 12${nl}on_enter:${nl}  spawn 3 grunt${nl}  spawn 1 brute${nl}[{]scaled 10[}] => 30.*'%' by zero.*  in [{]ratio[}]"
       ${CMAKE_CURRENT_SOURCE_DIR}/scripting/rules.dta)
     baker_example_test(baker_example_objects baker_example_objects "dash 3[}] +=> 3[.]0${nl}.*=> 100${nl}grunt[.]handle[(]HitMsg[{]20[}][)] +=> 80${nl}.*hit 5[}] +=> 75${nl}.*=> Boss${nl}boss[.]handle[(]HitMsg[{]50[}][)] +=> 499${nl}.*hit 50[}] +=> 25${nl}.*=> \"Over here!\"${nl}.*was removed [(]a stale handle[)]")
     baker_example_test(baker_example_tasks baker_example_tasks "t=1  door: unlocking${nl}.*t=2  one unit later.*t=3  door: open.*t=3  guard: walking in.*t=4  fade done.*t=4  guard: closing the door${nl}t=5  door: someone closed it${nl}tasks left: 0")
-    baker_example_test(baker_example_remote_console baker_example_remote_console "^> [{]set [$]speed [{][*] 2 4[.]5[}][}]${nl}=> 9[.]0${nl}${nl}> [{]boost 3[}]${nl}=> 27[.]0${nl}${nl}> [{]boost[}]${nl}baker: .boost. takes 1 argument, given 0  [(]<console>:1[)]${nl}  in [{]boost[}].*> [(]4 [{]boost 1[}][)]${nl}[{]\"schema\":\"baker[.]reply/1[.]1\",\"id\":4,\"ok\":true,\"text\":\"27[.]0\",\"value\":27[.]0[}]"
-      --test)
+    if(TARGET baker_example_remote_console AND NOT BAKER_SHIPPING)  # shipping: no console
+      baker_example_test(baker_example_remote_console baker_example_remote_console "^> [{]set [$]speed [{][*] 2 4[.]5[}][}]${nl}=> 9[.]0${nl}${nl}> [{]boost 3[}]${nl}=> 27[.]0${nl}${nl}> [{]boost[}]${nl}baker: .boost. takes 1 argument, given 0  [(]<console>:1[)]${nl}  in [{]boost[}].*> [(]4 [{]boost 1[}][)]${nl}[{]\"schema\":\"baker[.]reply/1[.]1\",\"id\":4,\"ok\":true,\"text\":\"27[.]0\",\"value\":27[.]0[}]"
+        --test)
+    endif()
   endif()
 endif()
 

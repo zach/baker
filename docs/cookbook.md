@@ -92,12 +92,15 @@ cfg.on_reload(
   nothing is waiting. `cfg.loop_stats()` then gives, per file and per layer, the median and
   worst time from a saved edit to the frame that showed it, over the last 32 edits, with
   failed reloads counted. Polling for changes does not dilute it.
-- **Watching files yourself.** `cfg.stack_files()` lists every file the layers were read
-  from: each layer's file, the files its `#include`s reached, and those they looked for and
-  missed, with the layer each belongs to and the path as the reader was given it. An engine
-  or editor that already watches files calls `reload()` only when one of these changes,
-  with the save's time as `origin_ns`. `cfg.stack_files_epoch()` moves whenever the list
-  does, so checking it costs one comparison a frame.
+- **Watching files.** The host kit's `baker::host::Live` does all of this: it watches the
+  stack's files, reloads with the save's time, and marks the frame visible ([Baker and
+  your tools](tools.md#the-host-kit)). To watch them yourself (an engine or editor that
+  already watches files), `cfg.stack_files()` lists every file the layers were read from:
+  each layer's file, the files its `#include`s reached, and those they looked for and
+  missed, with the layer each belongs to and the path as the reader was given it. Call
+  `reload()` only when one of these changes, with the save's time as `origin_ns`.
+  `cfg.stack_files_epoch()` moves whenever the list does, so checking it costs one
+  comparison a frame. `baker::host::Watcher` is the kit's watcher on its own.
 
 `examples/config` runs a reload that rebuilds the audio group and leaves the renderer alone.
 
@@ -547,9 +550,10 @@ fast: a boss-tuning harness, an economy harness. Packs give harnesses a structur
 the script stack. A console is that, fed from a text box or a socket:
 
 - Poll the socket once a frame, on the thread that owns the Context, so commands run
-  between frames like any other script. `examples/remote-console` does it in about a
-  hundred lines on BSD sockets and Winsock, listening on 127.0.0.1 only: a console runs any
-  command it is sent, so it is a development tool, not a shipped port.
+  between frames like any other script. The host kit's `baker::host::Console`
+  (`<baker/host/console.hpp>`) does it on BSD sockets and Winsock, listening on 127.0.0.1
+  only: a console runs any command it is sent, so it is a development tool, not a shipped
+  port, and under `BAKER_SHIPPING` it never listens. `examples/remote-console` uses it.
 - Name the input (`ctx.eval(line, "<console>")`) so errors say where they came from, and
   print `describe(error)` for the stack.
 - Bind what designers ask for as they ask for it; `check`'s demand report over the data
@@ -563,13 +567,16 @@ people. Two calls give it what it needs:
 
 - **`baker::eval_request(ctx, line, sink)`** answers a request, `(ID {command})`, with one
   line of JSON. The JSON holds the ID, the result's text, a JSON projection of the result,
-  or the error with its script stack (`docs/reply-json.md`). `examples/remote-console`
-  answers lines that begin with `(` this way and every other line as before.
+  or the error with its script stack (`docs/reply-json.md`). `baker::host::Console`
+  answers lines that begin with `(` this way and every other line as before. Every reply,
+  JSON or not, is its lines, then an empty line.
 - **`baker::bind_config_tools(ctx, cfg)`** registers the Config's tooling as script
   functions, so a console, an editor or an agent can ask the running game directly:
   - `{config.explain player.speed}`: every layer that sets the value, and which one wins;
   - `{config.set player.speed 6}`, `{config.toggle experiment}` and
     `{config.snapshot a}`: live edits and A/B;
+  - `{config.clear player.speed}`: drops that one live edit, so the value is the files'
+    again. It returns 1 if there was an edit, 0 if not;
   - `{config.journal}` and `{config.unsaved}`: what was tuned, and what was not kept.
 
   They are documented, so `reference` lists them and `check` checks calls to them. A

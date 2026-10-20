@@ -29,7 +29,7 @@ def includes(header):
 
 def main():
     failures = 0
-    for header in sorted(INCLUDE.glob("*.hpp")):
+    for header in sorted(INCLUDE.rglob("*.hpp")):
         if header.name.startswith("std_"):
             continue
         seen, stack, bad = set(), [(header, [header.name])], {}

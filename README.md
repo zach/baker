@@ -94,7 +94,7 @@ restarted.
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.1.1)
+FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.2.0)
 FetchContent_MakeAvailable(baker)
 target_link_libraries(game PRIVATE baker::baker)
 ```
@@ -135,6 +135,10 @@ save, see it.
 - **Shapes.** `(shapes (boss_phase (enter_at float (range 0 1)) ...))` declares what data
   should look like; a Config validator reports violations at load, located.
   [Language guide](docs/language.md#shapes).
+- **The host kit.** `baker::host` gives a game the loop every host writes the same way:
+  it watches the stack's files and reloads on a save, serves a remote console on loopback,
+  and runs `check`, `reference`, `eval`, `diff` and `promote` from the game's own binary.
+  [Baker and your tools](docs/tools.md#the-host-kit), [`examples/host`](examples/host).
 - **A tuning harness.** Dear ImGui panels generated from the tweaks and shapes, an `eval`
   console, provenance on hover, write-back, and reload telemetry.
   [`examples/harness-imgui`](examples/harness-imgui).
@@ -175,12 +179,15 @@ ctest --test-dir build --output-on-failure
 
 Targets: `baker::data` (data, lookup, config, tweaks, the cache; usable alone),
 `baker::script` (evaluation, objects, tasks), `baker::shape` (shapes), and `baker::baker`
-(all of them).
+(all of them). `baker::host`, the host kit, is a separate library over them: the file
+watcher, the remote console, the edit-to-see loop, and the tool commands a game runs from
+its `main` ([Baker and your tools](docs/tools.md#the-host-kit)).
 
 | Option | Default | Effect |
 |--------|---------|--------|
 | `BAKER_BUILD_SCRIPT` | `ON` | Build `baker::script` |
 | `BAKER_BUILD_SHAPE` | `ON` | Build `baker::shape` |
+| `BAKER_BUILD_HOST` | `ON` with `BAKER_BUILD_SCRIPT` | Build `baker::host`, the host kit |
 | `BAKER_BUILD_TESTS` | `ON` when top-level | The test suite |
 | `BAKER_BUILD_EXAMPLES` | `ON` when top-level | `examples/`, each run by CTest |
 | `BAKER_BUILD_HARNESS` | `OFF` | `examples/harness-imgui`; fetches Dear ImGui and GLFW |

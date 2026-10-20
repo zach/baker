@@ -1,0 +1,9 @@
+; The test game's data.
+(shapes
+   (player
+      (speed float (range 0 10))
+      (lives int)))
+(player
+   (speed 3.5)   ; how fast
+   (lives 3))
+(waves {spawn grunt 3})

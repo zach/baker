@@ -9,6 +9,7 @@ game through what the two publish. This page says which part does what.
 - [Three parts](#three-parts)
 - [What Baker gives tools](#what-baker-gives-tools)
 - [What the host does](#what-the-host-does)
+- [The host kit](#the-host-kit)
 - [How an external tool talks to a game](#how-an-external-tool-talks-to-a-game)
 
 ## Three parts
@@ -42,13 +43,15 @@ transport you choose carry Baker's tools: a socket, a pipe, an in-game console.
 
 ## What the host does
 
+Each of these has a ready-made form in [the host kit](#the-host-kit); a host with its own
+file system, console or command line does them with Baker's calls directly.
+
 - **Watch files.** List what to watch with `cfg.stack_files()`. Check
   `cfg.stack_files_epoch()` once a frame, and re-read the list when it moves. When a file
   changes, call `cfg.reload({.origin_ns = save_time})`, so that `loop_stats()` measures
   edit-to-see from the save.
-- **Carry requests.** A console server reads lines and answers with `eval_request`.
-  `examples/remote-console` is one, on 127.0.0.1. Keep it on loopback: it runs any command
-  it is sent.
+- **Carry requests.** A console server reads lines and answers with `eval_request`. Keep
+  any console on loopback: it runs any command it is sent.
 - **Offer commands** that need your game's own script functions: a check of the data, the
   reference (`write_reference_json` after your setup), a headless run. Only your game
   binary knows its functions, so these commands live in it.
@@ -56,6 +59,79 @@ transport you choose carry Baker's tools: a socket, a pipe, an in-game console.
   - which tools to bind, and whether to allow writes;
   - when a layer may change (`freeze`, `live_layers`);
   - which layers a check or a simulation leaves out (`ProjectOptions::skip`).
+
+## The host kit
+
+`baker::host` is a library beside Baker's core, built with `BAKER_BUILD_HOST` (on with
+`BAKER_BUILD_SCRIPT`) and linked on its own: it is the part of a host that every game
+would write the same way, on the operating system Baker itself never touches. Its headers
+are in `<baker/host/...>`. Under `BAKER_SHIPPING` it opens no socket and sets no watch;
+the stack still opens. [`examples/host`](../examples/host) is a game's whole tooling in one
+`main`.
+
+### `Live`: the edit-to-see loop
+
+```cpp
+baker::Context ctx;                // bind the game's script functions first
+baker::host::Live live(ctx);
+live.open({.project = "data", .console_port = 4555,
+           .changed = [](const baker::Config& cfg) { /* read structured data */ }});
+// each frame
+live.begin_frame();                // reloads what was saved; answers the console
+// ...simulate and draw...
+live.end_frame();                  // the frame that shows a reload
+```
+
+`open` finds the nearest `baker-project.dta` (or takes a `Project` built in code, for a
+packaged game), opens the stack, adds the check validator and, when `baker::shape` is
+built, the shape validator, binds the Config's tools, and runs every layer's `#autorun`.
+`changed` is called after the load, after each change to the stack once `#autorun` has
+run again, and after a live edit. The Config's clock is the files', so `loop_stats()`
+measures from the save to the frame that showed it. A quiet frame allocates nothing.
+
+### `Watcher`: the files the stack was read from
+
+`Watcher` watches exactly `stack_files()` (and any paths you add) through the operating
+system's notifications: inotify on Linux, `ReadDirectoryChangesW` on Windows, on each
+file's directory. A file whose directory does not exist yet is checked by its write time
+and size every 100 ms. For an engine's virtual paths, `set_disk_path_hook` says which file
+on the disk a path is, so it is watched like any other and still reported by your name;
+`set_stamp_hook` answers for a path with no file on the disk at all. `Live` runs one.
+
+### `Console`: one-line requests on loopback
+
+`Console(ctx).listen(port)` serves 127.0.0.1 only; `poll()` once a frame answers each
+complete line. A request, `(ID {command})`, gets one line of
+[reply JSON](reply-json.md); any other line is evaluated and answered as text. Every reply
+is its lines, then an empty line. A frame's replies go out together, so a tool's batch of
+requests is answered within the frame. `Live` runs one when given a port.
+
+### The commands
+
+```cpp
+int main(int argc, char** argv) {
+    auto line = baker::host::parse_command_line(argc, argv);
+    // your own flags are in line->rest; set line->project if you name the stack otherwise
+    const int status = baker::host::run_command(*line, {.bind = bind_my_functions});
+    if (status >= 0) return status;  // -1: not one of the kit's commands
+    // ...your own commands, or play...
+}
+```
+
+| Command | What it writes |
+|---|---|
+| `check` | [check's report](check-json.md); exit 1 on an error, a load problem, a shape error, or a call to an undefined function |
+| `reference [--json]` | the script vocabulary as Markdown, or `{"reference", "tweaks", "shapes"}` |
+| `eval [--seed N] [--json] "{command}"...` | each command's result on the game reset with the seed; `--json`: one reply line each |
+| `diff [--layer L]` | what layer L (default `agent`) changes, value by value |
+| `promote [--from L] [--to T] [--write \| --patch FILE]` | what promoting L into T would write; `--write` writes; `--patch` writes a unified diff and nothing else |
+
+Each runs on a fresh Context with your functions bound (`CommandHooks::bind`), the stack
+opened as the game opens it, and, for `eval`, your state reset (`CommandHooks::reset`).
+`extra_trees` adds files of your own to `check` (scenarios, say). The exit status is 0, 1
+when something failed, 2 when it could not run. In a shipping build, `diff` and `promote`
+refuse. A tool reads the commands' standard output as the document itself, so your
+functions and `#autorun` must print nothing there while a command runs.
 
 ## How an external tool talks to a game
 

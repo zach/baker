@@ -4,6 +4,7 @@
 //   baker_example_remote_console [--port 7000]   serve until interrupted
 //   baker_example_remote_console --test          connect over loopback, send four
 //                                                commands, print the replies, and exit
+#include <baker/host/console.hpp>
 #include <baker/script.hpp>
 
 #include <atomic>
@@ -14,7 +15,7 @@
 #include <string>
 #include <thread>
 
-#include "console.hpp"
+#include "sockets.hpp"  // the client's side
 
 namespace {
 
@@ -47,7 +48,8 @@ void client(uint16_t port) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+// The game: a Context with a function, and its console, served until the client is done.
+int serve(int argc, char** argv) {
     const bool test = argc > 1 && std::strcmp(argv[1], "--test") == 0;
     const uint16_t port =
         argc > 2 && std::strcmp(argv[1], "--port") == 0 ? uint16_t(std::atoi(argv[2])) : 7000;
@@ -64,7 +66,7 @@ int main(int argc, char** argv) {
 
     int status = 0;
     {
-        Console console(ctx);
+        baker::host::Console console(ctx);
         if (!console.listen(test ? 0 : port)) {
             std::printf("cannot listen on port %u\n", unsigned(port));
             return 1;
@@ -82,4 +84,17 @@ int main(int argc, char** argv) {
     }
     sockets_stop();
     return status;
+}
+
+int main(int argc, char** argv) {
+    if constexpr (baker::kShipping) {
+        // The host kit's console never listens in a shipping build: a shipped game is no
+        // command port.
+        (void)argc;
+        (void)argv;
+        std::printf("a shipping build opens no console\n");
+        return 0;
+    } else {
+        return serve(argc, argv);
+    }
 }

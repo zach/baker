@@ -1,4 +1,4 @@
-// The few socket calls the console needs, on BSD sockets and on Winsock.
+// The few socket calls the example's client needs, on BSD sockets and on Winsock.
 #pragma once
 
 #ifdef _WIN32
