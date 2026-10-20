@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(baker VERSION 0.1.0 LANGUAGES CXX)
+project(baker VERSION 0.1.1 LANGUAGES CXX)
 
 option(BAKER_BUILD_SCRIPT     "Build baker::script (evaluation, objects, tasks)" ON)
 option(BAKER_BUILD_SHAPE      "Build baker::shape (data-declared shapes)" ON)

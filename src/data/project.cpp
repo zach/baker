@@ -193,6 +193,11 @@ Symbol find_project(std::string_view path, const LoadSession::Reader& reader) {
 
 Expected<List<ProjectProblem>> open_project(Config& cfg, const Project& project,
                                             const ProjectOptions& options) {
+    if (options.skip.overflowed())
+        return Unexpected(make_error(
+            ErrorCode::Refused, "more than " +
+                                    detail::decimal(static_cast<int64_t>(LayerNames::kCapacity)) +
+                                    " layers to leave out (ProjectOptions::skip)"));
     LoadSession& session = cfg.session();
     if (!project.pack_levels.empty()) {
         Vec<Symbol> levels;
@@ -203,9 +208,7 @@ Expected<List<ProjectProblem>> open_project(Config& cfg, const Project& project,
     for (const ProjectEntry& e : project.defines) session.define(e.value);
     Vec<ProjectProblem> problems;  // allocates only for a problem
     for (const ProjectLayer& l : project.layers) {
-        bool skipped = false;
-        for (const std::string_view s : options.skip) skipped = skipped || l.name.str() == s;
-        if (skipped) continue;
+        if (options.skip.contains(l.name.str())) continue;
         if (auto r = cfg.push_layer(l.name.str(), l.path.str(),
                                     {.optional = l.optional, .enabled = l.enabled});
             !r) {

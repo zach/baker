@@ -3,6 +3,23 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.1.1 - 2026-10-20
+
+- **Fixed: options built before `open_project` kept a layer they should leave out.**
+  `ProjectOptions::skip` held its names in a list that ended with the statement that wrote
+  it. Options chosen by a condition, kept in a variable, or returned by a helper, and
+  passed later, read freed memory; an optimized build could then open a layer it was told
+  to leave out.
+  - **The new type.** `skip` is now a `LayerNames`: up to eight names held in the options
+    themselves, so options stay valid for as long as the strings they name do.
+  - **Unchanged:** `{.skip = {"local"}}` reads as before.
+  - **New:** `skip.add(name)` adds a name to options you keep.
+  - **More than eight names:** `open_project` refuses the options rather than open the
+    wrong stack.
+- **New guide:** [Baker and your tools](docs/tools.md). It covers what Baker gives
+  development tools in each build, what it leaves to your game (watching files, carrying
+  requests, the game's own commands), and how an external tool should talk to a game.
+
 ## 0.1.0 - 2026-10-17
 
 The first release. Baker reads a Lisp-like text format into trees, stacks files into layers

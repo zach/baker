@@ -32,6 +32,7 @@
 #include <baker/parse.hpp>
 #include <baker/symbol.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <initializer_list>
 #include <string_view>
@@ -95,12 +96,49 @@ struct ProjectProblem {
     Error error;
 };
 
+// Up to kCapacity layer names, held in the value itself, so options built in one statement
+// and passed in a later one (kept in a member, chosen by a condition, returned by a helper)
+// stay valid for as long as the strings the names view do. Nothing allocates.
+//   ProjectOptions o = skip_local ? ProjectOptions{.skip = {"local"}} : ProjectOptions{};
+class LayerNames {
+public:
+    static constexpr size_t kCapacity = 8;
+
+    LayerNames() noexcept = default;
+    LayerNames(std::initializer_list<std::string_view> names) noexcept {
+        for (const std::string_view n : names) add(n);
+    }
+    // Adds a name. Past kCapacity it is dropped, add returns false, and open_project
+    // refuses the options rather than open a stack with a layer it was told to leave out.
+    bool add(std::string_view name) noexcept {
+        if (size_ == kCapacity) {
+            overflow_ = true;
+            return false;
+        }
+        names_[size_++] = name;
+        return true;
+    }
+    [[nodiscard]] bool contains(std::string_view name) const noexcept {
+        for (size_t i = 0; i < size_; ++i)
+            if (names_[i] == name) return true;
+        return false;
+    }
+    [[nodiscard]] const std::string_view* begin() const noexcept { return names_; }
+    [[nodiscard]] const std::string_view* end() const noexcept { return names_ + size_; }
+    [[nodiscard]] size_t size() const noexcept { return size_; }
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+    [[nodiscard]] bool overflowed() const noexcept { return overflow_; }
+
+private:
+    std::string_view names_[kCapacity]{};
+    size_t size_ = 0;
+    bool overflow_ = false;
+};
+
 struct ProjectOptions {
     // Layers to leave out, by name: a simulation or a check leaves out one person's own
     // tuning (`local`), so its results do not depend on whose machine runs it.
-    // Initialized from an empty list's value, not from {}: MSVC does not implement
-    // list-initializing a default member initializer (C2797).
-    std::initializer_list<std::string_view> skip = std::initializer_list<std::string_view>();
+    LayerNames skip = LayerNames();
     // Go on past a layer that does not read, as a tool that shows every problem at once
     // does; a game stops at the first.
     bool go_on = false;
@@ -109,7 +147,8 @@ struct ProjectOptions {
 // Sets `cfg.session()`'s pack levels, include directories, and defines from `project`, then
 // pushes its layers, bottom to top. A Config to open a project into has no layers yet; set
 // its session's reader first if the layers' text comes from somewhere other than the disk.
-// Stops at the first layer that does not read, with its error. With `go_on`, a layer that
+// Stops at the first layer that does not read, with its error; refuses options whose skip
+// list overflowed, before changing anything. With `go_on`, a layer that
 // does not read is left out of the stack, as a failed push_layer leaves it, the layers above
 // it read over the ones below, and each such layer's problem is returned, in stack order:
 // none if every layer read. Only a problem allocates.

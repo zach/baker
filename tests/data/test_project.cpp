@@ -119,6 +119,53 @@ TEST_CASE("open_project sets the session and pushes the layers, leaving out what
     CHECK(shared.layers().size() == 3);
 }
 
+namespace {
+
+// Options a host builds in a helper, from its own settings.
+ProjectOptions options_for(bool skip_local) {
+    ProjectOptions o;
+    if (skip_local) o.skip.add("local");
+    return o;
+}
+
+}  // namespace
+
+TEST_CASE("project options built before the call, and kept, stay valid") {
+    TempDir dir;
+    const std::string file = dir.write("baker-project.dta", kProject);
+    dir.write("data/shared/common.dta", "(speed 3)\n");
+    dir.write("data/default.dta", "#include common.dta\n");
+    dir.write("data/local.dta", "(speed 9)\n");
+    const Project p = ok(read_project(file));
+
+    // Chosen by a condition in one statement, passed in the next: the names live in the
+    // options, not in a list that ended with the first statement.
+    const bool skip_local = true;
+    const ProjectOptions chosen = skip_local ? ProjectOptions{.skip = {"local"}} : ProjectOptions{};
+    Config a({.tweaks = nullptr});
+    REQUIRE(open_project(a, p, chosen));
+    CHECK(a.get<int>("speed") == 3);
+
+    Config b({.tweaks = nullptr});
+    REQUIRE(open_project(b, p, options_for(true)));
+    CHECK(b.get<int>("speed") == 3);
+    Config c({.tweaks = nullptr});
+    REQUIRE(open_project(c, p, options_for(false)));
+    CHECK(c.get<int>("speed") == 9);
+
+    // More names than the options hold: refused, rather than opening a layer it was told to
+    // leave out.
+    ProjectOptions many;
+    const char* const names[] = {"a", "b", "c", "d", "e", "f", "g", "h", "local"};
+    for (const char* n : names) many.skip.add(n);
+    CHECK(many.skip.overflowed());
+    Config d({.tweaks = nullptr});
+    auto refused = open_project(d, p, many);
+    REQUIRE_FALSE(refused);
+    CHECK(refused.error().code() == ErrorCode::Refused);
+    CHECK(d.layers().size() == 1);  // nothing pushed: scratch alone
+}
+
 TEST_CASE("open_project goes on past layers that do not read when asked") {
     TempDir dir;
     const std::string file = dir.write("baker-project.dta",

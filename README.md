@@ -94,7 +94,7 @@ restarted.
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.1.0)
+FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.1.1)
 FetchContent_MakeAvailable(baker)
 target_link_libraries(game PRIVATE baker::baker)
 ```
@@ -199,6 +199,7 @@ Android: CMake builds get C++20 from the targets; with `ndk-build`, add
 
 - [`docs/language.md`](docs/language.md): the language, from data to script.
 - [`docs/cookbook.md`](docs/cookbook.md): patterns, live ops among them.
+- [`docs/tools.md`](docs/tools.md): what Baker gives tools, and what it leaves to your game.
 - [`docs/script-reference.md`](docs/script-reference.md): every built-in, generated.
 - [`docs/reply-json.md`](docs/reply-json.md): one-line JSON replies for tools and consoles.
 - [`docs/reference-json.md`](docs/reference-json.md): the vocabulary, tweaks and shapes as JSON.
