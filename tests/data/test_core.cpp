@@ -247,3 +247,28 @@ TEST_CASE("Callback copies, moves, and frees what it holds") {
     }
     CHECK(alive == 0);
 }
+
+TEST_CASE("symbols intern the same text to one entry from several threads") {
+    // Four threads intern 2,000 names, half shared by all and half their own, while the
+    // table grows under them. Every name reads back as itself, and shared names are one
+    // symbol wherever they were interned (the read path takes no lock).
+    std::vector<std::vector<Symbol>> per_thread(4);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 4; ++t)
+        threads.emplace_back([&, t] {
+            auto& mine = per_thread[static_cast<size_t>(t)];
+            for (int i = 0; i < 2000; ++i) {
+                const std::string name =
+                    (i % 2 ? "shared_" : "t" + std::to_string(t) + "_") + std::to_string(i);
+                mine.push_back(Symbol(name));
+                CHECK(mine.back().str() == name);
+            }
+        });
+    for (auto& th : threads) th.join();
+    for (int i = 1; i < 2000; i += 2)
+        for (int t = 1; t < 4; ++t)
+            CHECK(per_thread[0][static_cast<size_t>(i)] ==
+                  per_thread[static_cast<size_t>(t)][static_cast<size_t>(i)]);
+    const Symbol again("shared_1");
+    CHECK(again == per_thread[2][1]);
+}

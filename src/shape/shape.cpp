@@ -15,7 +15,7 @@ namespace {
 struct Names {
     baker::Symbol shapes{"shapes"}, at{"at"}, range{"range"}, step{"step"}, kind{"kind"},
         desc{"desc"}, note{"note"}, optional{"optional"}, list{"list"}, any_tag{"*"},
-        keyed{"keyed"};
+        keyed{"keyed"}, one_of{"one_of"};
 };
 const Names& names() {
     static const Names n;
@@ -92,7 +92,7 @@ const Shape* Set::find(baker::Symbol name) const noexcept {
 namespace {
 
 // Reads one field declaration: (name type (range lo hi) (step s) (kind k) (desc "")
-// (note "") (optional)).
+// (note "") (optional) (one_of a b ...)).
 bool read_field(const Array& a, Field& f, Vec<Error>& errors) {
     auto bad = [&](std::string_view why) {
         errors.push_back(make_error(ErrorCode::Syntax, why, a.file(), a.line()));
@@ -139,6 +139,20 @@ bool read_field(const Array& a, Field& f, Vec<Error>& errors) {
             f.note = v.size() == 1 ? v[0].try_str().value_or("") : "";
         } else if (*tag == n.optional) {
             f.optional = true;
+        } else if (*tag == n.one_of) {
+            const bool symbols =
+                f.type == Type::Symbol || (f.type == Type::List && f.element == Type::Symbol);
+            if (!symbols || v.empty())
+                return bad("field " + quoted(f.name) +
+                           " lists (one_of ...) symbols, so its type is symbol or (list symbol)");
+            // Declared again, a field adds what the new list names, in the order written.
+            Vec<baker::Symbol> all(f.one_of.begin(), f.one_of.end());
+            for (const Node& s : v) {
+                const auto sym = s.try_sym();
+                if (!sym) return bad("field " + quoted(f.name) + "'s (one_of ...) holds symbols");
+                if (std::find(all.begin(), all.end(), *sym) == all.end()) all.push_back(*sym);
+            }
+            f.one_of = List<baker::Symbol>({all.data(), all.size()});
         }  // other metadata is the tools' business
     }
     return true;
@@ -148,11 +162,12 @@ bool read_field(const Array& a, Field& f, Vec<Error>& errors) {
 
 namespace {
 // Whether `next`, a field declared again, loosens `held`: another type, a range widened or
-// dropped, or a required field made optional.
+// dropped, a required field made optional, or a symbol added to its (one_of ...).
 bool loosens(const Field& held, const Field& next) noexcept {
     if (next.type != held.type || next.element != held.element || next.shape != held.shape)
         return true;
     if (next.optional && !held.optional) return true;
+    if (!held.one_of.empty() && next.one_of.size() > held.one_of.size()) return true;
     return held.ranged && (!next.ranged || next.min < held.min || next.max > held.max);
 }
 // The rank of the pack `file` declares, or none: a file without a pack is unconstrained.
@@ -378,7 +393,28 @@ struct Checker {
                            detail::text_of(Node(field.min)) + " to " +
                            detail::text_of(Node(field.max)),
                        f);
+            if (!field.one_of.empty())
+                if (const auto sym = n.try_sym(); sym && !one_of(field, *sym))
+                    report(errors, ErrorCode::Range,
+                           quoted(field.name) + " is " + quoted(*sym) + ", not one of " +
+                               names_text(field.one_of),
+                           f);
         }
+    }
+
+    // A symbol against the field's list: pointer compares of interned symbols.
+    static bool one_of(const Field& field, baker::Symbol s) noexcept {
+        for (const baker::Symbol x : field.one_of)
+            if (x == s) return true;
+        return false;
+    }
+    static Str names_text(const List<baker::Symbol>& names) {
+        Str out;
+        for (const baker::Symbol x : names) {
+            if (!out.empty()) out += ", ";
+            out += x.str();
+        }
+        return out;
     }
 
     const Shape* known(const Array& f, const Field& field) {
@@ -457,7 +493,7 @@ void write_json(const Set& shapes, TextSink text) {
     for (const Shape& sh : shapes.shapes()) ss.push_back(&sh);
     std::sort(ss.begin(), ss.end(),
               [](const Shape* a, const Shape* b) { return a->name.str() < b->name.str(); });
-    Str out = "{\n  \"schema\": \"baker.shapes/1\",\n  \"shapes\": [";
+    Str out = "{\n  \"schema\": \"baker.shapes/1.1\",\n  \"shapes\": [";
     for (size_t i = 0; i < ss.size(); ++i) {
         const Shape& sh = *ss[i];
         out += i ? ",\n    {\"name\": " : "\n    {\"name\": ";
@@ -489,6 +525,8 @@ void write_json(const Set& shapes, TextSink text) {
             detail::json_string(out, f.desc);
             out += ", \"note\": ";
             detail::json_string(out, f.note);
+            out += ", \"one_of\": ";
+            detail::json_names(out, f.one_of.items());
             out += ", \"file\": ";
             detail::json_string(out, f.file.str());
             out += ", \"line\": " + detail::decimal(f.line) + "}";

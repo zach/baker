@@ -5,6 +5,7 @@
 // Lexical rules shared by the parser and the printer. Keeping them in one place is what
 // makes printing round-trip: the printer quotes exactly what the lexer would misread.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -35,10 +36,16 @@ namespace baker::detail {
 void json_string(Str& out, std::string_view s);
 void json_names(Str& out, std::span<const Symbol> names);
 
-// Bytes that end an atom. Every byte <= 0x20 is whitespace.
+// The bytes that end an atom: control characters and space, the six brackets, a quote and
+// a comment. A table, so the lexer's scan is one load a byte.
+inline constexpr std::array<bool, 256> kAtomEnd = [] {
+    std::array<bool, 256> t{};
+    for (int c = 0; c <= 0x20; ++c) t[static_cast<size_t>(c)] = true;
+    for (const char c : std::string_view("(){}[]\";")) t[static_cast<unsigned char>(c)] = true;
+    return t;
+}();
 [[nodiscard]] constexpr bool is_atom_end(unsigned char c) noexcept {
-    return c <= 0x20 || c == '(' || c == ')' || c == '{' || c == '}' || c == '[' || c == ']' ||
-           c == '"' || c == ';';
+    return kAtomEnd[c];
 }
 
 enum class NumberKind : uint8_t { NotNumber, Int, Float, IntOutOfRange, FloatOutOfRange };

@@ -3,6 +3,47 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.2.1 - 2026-10-20
+
+- **New: a field's allowed symbols.** A `symbol` or `(list symbol)` shape field may list
+  what it allows, `(button symbol (one_of light heavy kick special))`, and `check` reports
+  a value outside the list, located, as it reports one outside a range. A later layer
+  declaring the field again adds to the list, in the order written. A tweak carries the
+  same list as metadata for panels and editors, from `TweakMeta::one_of` or from
+  `(one_of ...)` after its value in the data. `baker.shapes/1.1` and `baker.tweaks/1.1`
+  write each list.
+- **New: development-only layers.** A project file may mark a layer `dev_only`, such as one
+  person's tuning or an agent's proposal awaiting review:
+  `(agent "data/agent.dta" optional dev_only)`.
+  - **Shipping builds:** under `BAKER_SHIPPING`, `open_project` never pushes such a layer,
+    even when its file is present.
+  - **Packaging:** a packaging step reads `ProjectLayer::dev_only` from `read_project` to
+    leave those files out.
+  - **Tools:** `ProjectOptions::skip_dev_only` leaves every marked layer out for a check or
+    a simulation.
+- **New in the host kit's commands:**
+  - `--output FILE` writes a command's output to a file, and `CommandHooks::output` routes
+    it to a sink of yours, for an engine that prints its own lines on stdout.
+  - `CommandHooks::reader` reads the stack through your file access, as `Live` does.
+- **Fixed: the watcher lost an edit when its list of files changed.** An edit saved between
+  the last poll and a new `watch()` list (a new include, a file that appeared) counted as
+  already seen, and never reloaded until the next save. A file that stays in the list now
+  keeps what was last seen of it, and the edit is reported at the next poll.
+- **Fixed: tweak callbacks that change tweaks.** A callback that added a callback to the
+  same tweak changed the list being walked, and two tweaks whose callbacks set each other
+  recursed until the stack ran out. A callback added from inside one now runs from the next
+  change, and a tweak being notified is not notified again until its callbacks return.
+- **Faster:**
+  - `"key"_sym` interns once per distinct literal: a literal in a loop costs about what a
+    held `Symbol` does. Write `using namespace baker::literals;` to use it.
+  - Making a `Symbol` takes no lock when the name is already interned: about three times
+    faster on one thread, and no longer serialized across threads.
+  - The lexer finds the end of each atom with a table: about 3.6% fewer instructions per
+    parse.
+- **Docs:** a [Threads](docs/cookbook.md#threads) section in the cookbook covers what other
+  threads may read and when, what a Node copy costs across threads, a reload as the frame's
+  swap point, and the script stack budget on a small thread.
+
 ## 0.2.0 - 2026-10-20
 
 - **New: the host kit, `baker::host`.** A separate library beside the core for the part of

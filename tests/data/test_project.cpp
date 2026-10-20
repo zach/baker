@@ -119,6 +119,47 @@ TEST_CASE("open_project sets the session and pushes the layers, leaving out what
     CHECK(shared.layers().size() == 3);
 }
 
+TEST_CASE("a layer marked dev_only never reaches a shipping build") {
+    TempDir dir;
+    const std::string file = dir.write("baker-project.dta",
+                                       "(project (layers\n"
+                                       "   (default \"default.dta\")\n"
+                                       "   (local \"local.dta\" optional dev_only)\n"
+                                       "   (agent \"agent.dta\" dev_only optional)))\n");
+    dir.write("default.dta", "(speed 3)\n");
+    dir.write("local.dta", "(speed 9)\n");
+    dir.write("agent.dta", "(lives 5)\n");  // a proposal left on the build machine
+    const Project p = ok(read_project(file));
+    REQUIRE(p.layers.size() == 3);
+    CHECK_FALSE(p.layers[0].dev_only);
+    CHECK(p.layers[1].dev_only);
+    CHECK(p.layers[2].dev_only);
+    CHECK(p.layers[2].optional);  // either order after the path
+
+    // What a packaging step leaves out, from the project alone.
+    std::vector<std::string> excluded;
+    for (const ProjectLayer& l : p.layers)
+        if (l.dev_only) excluded.emplace_back(l.path.str());
+    CHECK(excluded == std::vector<std::string>{dir.path("local.dta"), dir.path("agent.dta")});
+
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(open_project(cfg, p));
+    if constexpr (kShipping) {
+        CHECK(cfg.layers().size() == 2);  // default and scratch: present files, not pushed
+        CHECK(cfg.get<int>("speed") == 3);
+        CHECK_FALSE(cfg.get<int>("lives"));
+    } else {
+        CHECK(cfg.layers().size() == 4);
+        CHECK(cfg.get<int>("speed") == 9);
+        CHECK(cfg.get<int>("lives") == 5);
+    }
+    // A check or a simulation leaves them all out with one option.
+    Config tool({.tweaks = nullptr});
+    REQUIRE(open_project(tool, p, {.skip_dev_only = true}));
+    CHECK(tool.layers().size() == 2);
+    CHECK(tool.get<int>("speed") == 3);
+}
+
 namespace {
 
 // Options a host builds in a helper, from its own settings.
@@ -227,7 +268,8 @@ TEST_CASE("a project file's mistakes are located") {
     const Case cases[] = {
         {"(project\n (layers (default \"d.dta\"))\n (levels a b))", 3, "has no 'levels'"},
         {"(project\n (layers\n  (default)))", 3, "a layer is"},
-        {"(project\n (layers\n  (default \"d.dta\" optinal)))", 3, "only optional and disabled"},
+        {"(project\n (layers\n  (default \"d.dta\" optinal)))", 3,
+         "only optional, disabled and dev_only"},
         {"(project\n (layers\n  (a \"x.dta\")\n  (a \"y.dta\")))", 4, "two layers named 'a'"},
         {"(project\n (pack_levels game))", 1, "needs (layers ...)"},
         {"(project\n (pack_levels (game)) (layers))", 2, "lists names or paths"},

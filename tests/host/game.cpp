@@ -4,6 +4,7 @@
 #include <baker/parse.hpp>
 
 #include <cstdio>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -37,6 +38,30 @@ int main(int argc, char** argv) {
     };
     const baker::ProjectOptions skip_local{.skip = {"local"}};
     hooks.open = skip_local;
+
+    // --root DIR: the stack is read through the host's reader, as game://..., which names
+    // nothing on the disk.
+    std::string root;
+    for (size_t i = 0; i + 1 < line->rest.size(); ++i)
+        if (line->rest[i] == "--root") root = std::string(line->rest[i + 1]) + "/";
+    if (!root.empty()) {
+        line->project = "game://data";
+        hooks.reader = [root](std::string_view path, baker::TextSink out) {
+            if (path.substr(0, 7) != "game://") return false;
+            std::FILE* f = std::fopen((root + std::string(path.substr(7))).c_str(), "rb");
+            if (!f) return false;
+            char buf[4096];
+            for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) out({buf, n});
+            std::fclose(f);
+            return true;
+        };
+    }
+    // --to-stderr: the host routes the output (an engine that owns stdout).
+    for (const std::string_view a : line->rest)
+        if (a == "--to-stderr")
+            hooks.output = [](std::string_view text) {
+                std::fprintf(stderr, "%.*s", int(text.size()), text.data());
+            };
 
     const int status = baker::host::run_command(*line, hooks);
     if (status >= 0) return status;

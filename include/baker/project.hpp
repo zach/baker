@@ -12,8 +12,15 @@
 //      (reference "build/reference.json") ; for tools: where the build writes the reference
 //      (layers                            ; bottom to top
 //         (default "data/default.dta")
-//         (local "data/local.dta" optional)
-//         (agent "data/agent.dta" optional)))
+//         (local "data/local.dta" optional dev_only)
+//         (agent "data/agent.dta" optional dev_only)))
+//
+// A layer marked dev_only is for development only (a person's tuning, an agent's proposal
+// awaiting review): a shipping build never pushes it, even when its file is present, and a
+// packaging step reads the project to leave its file out:
+//
+//   for (const baker::ProjectLayer& l : project->layers)
+//       if (l.dev_only) exclude(l.path);   // as the project names it; not what it includes
 //
 // Paths are relative to the project file's directory unless absolute. Every part but
 // (layers ...) may be left out. A key the format does not know is an error, located, so a
@@ -61,6 +68,7 @@ struct ProjectLayer {
     Symbol path;            // joined with the project file's directory, unless absolute
     bool optional = false;  // a missing file is an empty layer (LayerOptions::optional)
     bool enabled = true;    // `disabled` in the file: in the stack, skipped by the merge
+    bool dev_only = false;  // `dev_only` in the file: never pushed under BAKER_SHIPPING
     ProjectPosition name_at{};
     ProjectPosition path_at{};
 };
@@ -139,6 +147,9 @@ struct ProjectOptions {
     // Layers to leave out, by name: a simulation or a check leaves out one person's own
     // tuning (`local`), so its results do not depend on whose machine runs it.
     LayerNames skip = LayerNames();
+    // Leave out every layer marked dev_only, as a shipping build always does: a check or a
+    // simulation that must not depend on anyone's development layers.
+    bool skip_dev_only = false;
     // Go on past a layer that does not read, as a tool that shows every problem at once
     // does; a game stops at the first.
     bool go_on = false;

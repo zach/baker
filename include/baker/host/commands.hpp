@@ -18,6 +18,8 @@
 //                                  each command's result on the game reset with seed N
 //                                  (default 1); --json: one baker.reply/1.1 line each
 //   every command: --project PATH  the stack: the nearest baker-project.dta from PATH
+//                  --output FILE   the output in FILE, not on stdout (a failure to write
+//                                  it is exit 2); the host may route it instead (`output`)
 //
 // Exit status: 0, kCommandFailed (1) when something failed, kCommandError (2) when it
 // could not run.
@@ -34,6 +36,7 @@
 #include <baker/config.hpp>
 #include <baker/expected.hpp>
 #include <baker/list.hpp>
+#include <baker/parse.hpp>
 #include <baker/project.hpp>
 #include <baker/script.hpp>
 
@@ -54,6 +57,7 @@ struct CommandLine {
     std::string_view layer = "agent";  // diff --layer, promote --from
     std::string_view to = "default";   // promote --to
     std::string_view patch;            // promote --patch FILE
+    std::string_view output;           // --output FILE: the command's output there
     uint64_t seed = 1;                 // eval --seed
     bool json = false;                 // --json
     bool write = false;                // promote --write
@@ -83,10 +87,17 @@ struct CommandHooks {
     // leaves out one person's own layer (`.skip = {"local"}`).
     const Project* built = nullptr;
     ProjectOptions open = ProjectOptions();
+    // Reads the project file, the layers and what a patch compares against, if not from the
+    // disk (an engine's virtual roots): the same reader Live and the Config take.
+    LoadSession::Reader reader{};
+    // Where the output goes when the command line names no --output file; empty: stdout.
+    // An engine that writes its own lines to stdout keeps the result apart from them.
+    Callback<void(std::string_view text)> output{};
 };
 
-// Runs `line.command` if it is one of the kit's, printing to stdout and stderr, and returns
-// its exit status; -1 if it is not one, for the host's own commands.
+// Runs `line.command` if it is one of the kit's and returns its exit status; -1 if it is
+// not one, for the host's own commands. Its output goes to `line.output`'s file, else to
+// `hooks.output`, else to stdout; messages for a person go to stderr.
 [[nodiscard]] int run_command(const CommandLine& line, const CommandHooks& hooks);
 
 // The commands and flags above, for a host's usage text. It leaves out --project, which a

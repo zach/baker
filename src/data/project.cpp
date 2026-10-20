@@ -145,8 +145,9 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
                 const Array* l = (*part)[j].try_array();
                 std::string_view file;
                 if (!l || l->size() < 2 || l->tag().empty() || !text_of((*l)[1], file))
-                    return Unexpected(places.at(
-                        l ? *l : *part, "a layer is (name \"path\" [optional] [disabled])"));
+                    return Unexpected(
+                        places.at(l ? *l : *part,
+                                  "a layer is (name \"path\" [optional] [disabled] [dev_only])"));
                 ProjectLayer layer{.name = l->tag(),
                                    .path = joined(dir, file),
                                    .name_at = places.of(*l, 0),
@@ -156,10 +157,12 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
                         layer.optional = true;
                     else if ((*l)[k].is(Symbol("disabled")))
                         layer.enabled = false;
+                    else if ((*l)[k].is(Symbol("dev_only")))
+                        layer.dev_only = true;
                     else
-                        return Unexpected(
-                            places.at(*l, "layer '" + Str(l->tag().str()) +
-                                              "': after the path, only optional and disabled"));
+                        return Unexpected(places.at(
+                            *l, "layer '" + Str(l->tag().str()) +
+                                    "': after the path, only optional, disabled and dev_only"));
                 }
                 for (const ProjectLayer& seen : layers)
                     if (seen.name == layer.name)
@@ -209,6 +212,8 @@ Expected<List<ProjectProblem>> open_project(Config& cfg, const Project& project,
     Vec<ProjectProblem> problems;  // allocates only for a problem
     for (const ProjectLayer& l : project.layers) {
         if (options.skip.contains(l.name.str())) continue;
+        // A development layer never reaches a shipping build, whatever its file says.
+        if (l.dev_only && (kShipping || options.skip_dev_only)) continue;
         if (auto r = cfg.push_layer(l.name.str(), l.path.str(),
                                     {.optional = l.optional, .enabled = l.enabled});
             !r) {

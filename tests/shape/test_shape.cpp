@@ -200,7 +200,13 @@ TEST_CASE("a softer pack may narrow a harder pack's shape, not loosen it") {
          "(player (speed 9))"},
         {"retype.dta", "(pack retype_mod (level mod))\n(shapes (player (speed float)))"},
         {"loose_base.dta", "(shapes (player (speed int (range 1 10))))\n(player (speed 5))"},
-        {"loose_mod.dta", "(shapes (player (speed int (range 1 1000))))\n(player (speed 900))"}};
+        {"loose_mod.dta", "(shapes (player (speed int (range 1 1000))))\n(player (speed 900))"},
+        {"buttons.dta",
+         "(pack game_rules (level game))\n"
+         "(shapes (move (button symbol (one_of light heavy))))\n(move (button light))"},
+        {"more_buttons.dta",
+         "(pack more_mod (level mod))\n(shapes (move (button symbol (one_of kick))))\n"
+         "(move (button kick))"}};
     struct Run {
         Config cfg{{.tweaks = nullptr}};
         std::vector<std::string> reported;
@@ -235,12 +241,56 @@ TEST_CASE("a softer pack may narrow a harder pack's shape, not loosen it") {
     // Another type is a loosening too.
     Run retype{"base.dta", "retype.dta"};
     CHECK(retype.has("'speed' is declared by a harder pack"));
+    // Adding a symbol to a harder pack's (one_of ...) loosens it too.
+    Run buttons{"buttons.dta", "more_buttons.dta"};
+    CHECK(buttons.has("'button' is declared by a harder pack"));
+    CHECK(buttons.has("'button' is 'kick', not one of light, heavy"));
     // Files that declare no pack are unconstrained, as before.
     Run loose{"loose_base.dta", "loose_mod.dta"};
     CHECK(loose.reported.empty());
 }
 
-// --- As JSON, baker.shapes/1. ---
+TEST_CASE("a symbol field lists the symbols it allows, (one_of ...)") {
+    const char* const kShapes =
+        "(shapes (move (button symbol (one_of light heavy kick special))"
+        " (combo (list symbol) (one_of light heavy)) (startup int (optional))))\n";
+    const shape::Report bad =
+        check_text(std::string(kShapes) + "(move (button lite) (combo light heavy kick))\n");
+    CHECK(texts(bad.errors) ==
+          std::vector<std::string>{
+              "baker: 'button' is 'lite', not one of light, heavy, kick, special  (t.dta:2, at "
+              "move/button)",
+              "baker: 'combo' is 'kick', not one of light, heavy  (t.dta:2, at move/combo)"});
+    CHECK(check_text(std::string(kShapes) + "(move (button kick) (combo heavy light))\n").ok());
+    CHECK(check_text(std::string(kShapes) + "(move (button {pick}) (combo light))\n")
+              .ok());  // known only when run
+
+    // Declared again, a field adds what the new list names, in the order written.
+    shape::Set set;
+    shape::Report report;
+    set.add(*ok(read_string("(shapes (move (button symbol (one_of light heavy))))", "a.dta")),
+            report);
+    set.add(*ok(read_string("(shapes (move (button symbol (one_of special light))))", "b.dta")),
+            report);
+    CHECK(report.ok());
+    const shape::Field* button = set.find(Symbol("move"))->field(Symbol("button"));
+    REQUIRE(button);
+    std::vector<std::string> names;
+    for (const Symbol s : button->one_of) names.emplace_back(s.str());
+    CHECK(names == std::vector<std::string>{"light", "heavy", "special"});
+    std::string json;
+    shape::write_json(set, string_out(json));
+    CHECK(json.find(R"j("one_of": ["light", "heavy", "special"])j") != std::string::npos);
+
+    // A list on a field that is not a symbol, or holding something else, is an error.
+    CHECK(texts(check_text("(shapes (s (n int (one_of a b))))").errors) ==
+          std::vector<std::string>{
+              "baker: field 'n' lists (one_of ...) symbols, so its type is symbol or (list "
+              "symbol)  (t.dta:1)"});
+    CHECK_FALSE(check_text("(shapes (s (n symbol (one_of a 2))))").ok());
+}
+
+// --- As JSON, baker.shapes/1.1. ---
 
 TEST_CASE("the shapes as JSON: each shape and its fields") {
     shape::Set shapes;
@@ -255,13 +305,15 @@ TEST_CASE("the shapes as JSON: each shape and its fields") {
     REQUIRE(report.errors.empty());
     std::string json;
     shape::write_json(shapes, string_out(json));
-    CHECK(json.rfind("{\n  \"schema\": \"baker.shapes/1\",\n  \"shapes\": [\n", 0) == 0);
+    CHECK(json.rfind("{\n  \"schema\": \"baker.shapes/1.1\",\n  \"shapes\": [\n", 0) == 0);
     CHECK(json.find(R"j({"name": "boss_phase", "at": ["bosses", "*", "phases"], "keyed": true, )j"
                     R"j("file": "shapes.dta", "line": 2, "fields": [)j") != std::string::npos);
-    CHECK(json.find(R"j({"name": "enter_at", "type": "float", "element": "", "shape": "", )j"
-                    R"j("optional": false, "range": [0.0, 1.0], "step": 0.05, "kind": "", )j"
-                    R"j("desc": "HP fraction", "note": "", "file": "shapes.dta", "line": 3})j") !=
-          std::string::npos);
+    CHECK(
+        json.find(
+            R"j({"name": "enter_at", "type": "float", "element": "", "shape": "", )j"
+            R"j("optional": false, "range": [0.0, 1.0], "step": 0.05, "kind": "", )j"
+            R"j("desc": "HP fraction", "note": "", "one_of": [], "file": "shapes.dta", "line": 3})j") !=
+        std::string::npos);
     CHECK(json.find(R"j({"name": "adds", "type": "list", "element": "symbol", )j"
                     R"j("shape": "", "optional": true, "range": null,)j") != std::string::npos);
 }

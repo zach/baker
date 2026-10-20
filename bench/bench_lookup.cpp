@@ -21,6 +21,8 @@
 
 namespace {
 
+using namespace baker::literals;
+
 volatile double g_sink;
 
 // Read through a volatile pointer, so the compiler cannot hoist a lookup with a constant
@@ -97,6 +99,8 @@ int main() {
         }));
     row("find_float(\"key19\") (interns each call)",
         ns_per_call([&](int) { return *obj.find_float("key19"); }));
+    row("find_float(\"key19\"_sym)",
+        ns_per_call([&](int) { return *obj.find_float("key19"_sym); }));
     row("get<int>(Path), 4 segments",
         ns_per_call([&](int) { return static_cast<double>(*(*root)->get<int>(opaque(path))); }));
     row("get<float>(Path), 4 segments with index",

@@ -157,6 +157,51 @@ TEST_CASE("a file whose directory does not exist yet is checked by its stamp") {
     }
 }
 
+TEST_CASE("a new list keeps an edit made since the last poll") {
+    if constexpr (!kShipping) {
+        SUBCASE("a file whose directory appeared, saved before the watch moved to it") {
+            TempDir dir;
+            const std::string base = dir.write("default.dta", "(speed 1)\n");
+            const std::string mine = dir.path("people/me/local.dta");
+            const std::string_view more[] = {mine};
+            Watcher w;
+            w.watch({}, more);
+            CHECK(w.by_stamp() == 1);
+            CHECK(stays_quiet(w));
+            // Between two frames: the file and its directory appear, and the list grows.
+            dir.write("people/me/local.dta", "(speed 2)\n");
+            const std::string_view both[] = {mine, base};
+            w.watch({}, both);
+            CHECK(w.by_stamp() == 0);  // its directory is watched through the system now
+            const Seen seen = next_change(w);
+            CHECK(has(seen, mine));
+            CHECK_FALSE(has(seen, base));  // new to the list: stamped as now
+        }
+        SUBCASE("a hooked path changed between the last poll and the new list") {
+            std::map<std::string, FileStamp> files = {{"user://a.dta", {100, 1, true}},
+                                                      {"user://b.dta", {100, 1, true}}};
+            Watcher w;
+            w.set_stamp_hook([&](std::string_view path, FileStamp& out) {
+                const auto it = files.find(std::string(path));
+                if (it == files.end()) return false;
+                out = it->second;
+                return true;
+            });
+            const std::string_view one[] = {"user://a.dta"};
+            w.watch({}, one);
+            CHECK(stays_quiet(w));
+            files["user://a.dta"] = {200, 2, true};
+            const std::string_view two[] = {"user://a.dta", "user://b.dta"};
+            w.watch({}, two);
+            REQUIRE(w.poll());  // at once: the change is pending, not waiting on the interval
+            REQUIRE(w.changed().size() == 1);
+            CHECK(w.changed()[0] == Symbol("user://a.dta"));
+            CHECK(w.newest_write_ns() == 200);
+            CHECK(stays_quiet(w));  // reported once
+        }
+    }
+}
+
 TEST_CASE("a path with a scheme is checked through the host's stamp hook") {
     if constexpr (!kShipping) {
         std::map<std::string, FileStamp> files = {{"user://baker/local.dta", {100, 10, true}}};

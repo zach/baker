@@ -73,7 +73,7 @@ def reference(s):
     names = [f["name"] for f in r["reference"]["functions"]]
     expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.1" and "spawn" in names,
            "reference --json: the game's functions")
-    expect(r["shapes"]["schema"] == "baker.shapes/1" and r["tweaks"]["schema"] == "baker.tweaks/1",
+    expect(r["shapes"]["schema"] == "baker.shapes/1.1" and r["tweaks"]["schema"] == "baker.tweaks/1.1",
            "reference --json: tweaks and shapes")
     code, out, _ = s.run("reference")
     expect(code == 0 and "spawn" in out, "reference: Markdown")
@@ -112,6 +112,33 @@ def shipping(s):
         expect(code == 2 and "shipping" in err, f"shipping: {command} refuses")
 
 
+def host_io(s):
+    """The stack read through the host's reader; the output where the host or the line says."""
+    code, out, _ = s.run("check", "--root", str(s.dir), agent="(player (speed 42))\n")
+    r = json.loads(out)
+    expect(code == 1 and len(r["shape_errors"]) == 1 and
+           r["shape_errors"][0]["file"] == "game://data/agent.dta",
+           "check reads the stack through the host's reader, named as the host names it")
+    code, out, _ = s.run("eval", "{config.get player.speed}", "--root", str(s.dir),
+                         agent="(player (speed 4.5))\n")
+    expect(code == 0 and out == "4.5\n", "eval reads through the host's reader")
+    if sys.argv[3:] != ["shipping"]:
+        code, _, _ = s.run("promote", "--patch", "p.diff", "--root", str(s.dir))
+        patch = (s.dir / "p.diff").read_text()
+        expect(code == 0 and "-   (speed 3.5)   ; how fast\n+   (speed 4.5)   ; how fast\n" in patch,
+               "promote --patch compares against what the reader reads")
+
+    code, out, _ = s.run("check", "--output", "report.json", agent="")
+    expect(code == 0 and out == "" and
+           json.loads((s.dir / "report.json").read_text())["passed"],
+           "--output FILE: the output in the file, nothing on stdout")
+    code, out, err = s.run("check", "--output", "no/such/dir/report.json")
+    expect(code == 2 and out == "" and "cannot write" in err,
+           "--output to a file that cannot be written: exit 2")
+    code, out, err = s.run("eval", "{+ 1 2}", "--to-stderr")
+    expect(code == 0 and out == "" and err == "3\n", "the host routes the output")
+
+
 def command_line(s):
     code, out, _ = s.run("hello")
     expect(code == 0 and out == "hello\n", "a command of the game's own")
@@ -126,7 +153,7 @@ def main():
         print(__doc__)
         return 2
     writes = shipping if sys.argv[3:] == ["shipping"] else diff_and_promote
-    for case in (check, reference, eval_json, writes, command_line):
+    for case in (check, reference, eval_json, writes, host_io, command_line):
         case(Stack(sys.argv[1], sys.argv[2]))
     print(f"{len(FAILURES)} failures" if FAILURES else "all passed")
     return 1 if FAILURES else 0

@@ -16,7 +16,8 @@ constinit TweakRegistry g_registry;
 
 // The metadata keys, interned once: a panel reads them for every tweak every frame.
 struct Keys {
-    Symbol range{"range"}, step{"step"}, desc{"desc"}, note{"note"}, kind{"kind"}, group{"group"};
+    Symbol range{"range"}, step{"step"}, desc{"desc"}, note{"note"}, kind{"kind"}, group{"group"},
+        one_of{"one_of"};
 };
 const Keys& keys() {
     static const Keys k;
@@ -34,7 +35,7 @@ Values without_metadata(const Values& v) {
         if (!a || a->empty()) break;
         const Node& tag = (*a)[0];
         if (!(tag.is(k.range) || tag.is(k.step) || tag.is(k.desc) || tag.is(k.note) ||
-              tag.is(k.kind) || tag.is(k.group)))
+              tag.is(k.kind) || tag.is(k.group) || tag.is(k.one_of)))
             break;
     }
     return Values(v.nodes().first(n), v.source());
@@ -70,6 +71,7 @@ size_t TweakRegistry::size() const noexcept {
 struct TweakBase::Extra {
     std::optional<Path> parsed;
     Vec<Callback<void()>> on_change;
+    bool notifying = false;  // a change made from inside a callback does not notify again
 };
 
 void TweakBase::attach() {
@@ -140,8 +142,13 @@ bool TweakBase::bind(const Array& root, const Callback<void(const Error&)>& warn
 }
 
 void TweakBase::notify() {
-    if (extra_)
-        for (const auto& f : extra_->on_change) f();
+    if (!extra_ || extra_->notifying) return;
+    extra_->notifying = true;
+    // By index, over the count at entry: a callback may add one (it runs next time), and
+    // the table may move when it does.
+    const size_t n = extra_->on_change.size();
+    for (size_t i = 0; i < n; ++i) extra_->on_change[i]();
+    extra_->notifying = false;
 }
 
 void TweakBase::on_change(Callback<void()> callback) {
@@ -235,6 +242,17 @@ std::string_view TweakBase::kind() const {
     return {};
 }
 
+List<Symbol> TweakBase::one_of() const {
+    Vec<Symbol> out;
+    if (const Array* a = meta_array(keys().one_of)) {
+        for (const Node& n : a->values())
+            if (const auto s = n.try_sym()) out.push_back(*s);
+    } else {
+        for (const std::string_view s : meta_.one_of) out.emplace_back(s);
+    }
+    return List<Symbol>({out.data(), out.size()});
+}
+
 std::string_view TweakBase::group() const {
     if (const auto g = text_value(meta_array(keys().group)); !g.empty()) return g;
     if (!meta_.group.empty()) return meta_.group;
@@ -243,7 +261,7 @@ std::string_view TweakBase::group() const {
     return cut == std::string_view::npos ? std::string_view() : p.substr(0, cut);
 }
 
-// --- As JSON (baker.tweaks/1) ---
+// --- As JSON (baker.tweaks/1.1) ---
 
 namespace {
 // The tweak's values as one text: a single value bare, several in parentheses.
@@ -263,7 +281,7 @@ void write_json(const TweakRegistry& tweaks, TextSink text) {
     tweaks.each([&](const TweakBase& t) { ts.push_back(&t); });
     std::sort(ts.begin(), ts.end(),
               [](const TweakBase* a, const TweakBase* b) { return a->path() < b->path(); });
-    Str out = "{\n  \"schema\": \"baker.tweaks/1\",\n  \"tweaks\": [";
+    Str out = "{\n  \"schema\": \"baker.tweaks/1.1\",\n  \"tweaks\": [";
     for (size_t i = 0; i < ts.size(); ++i) {
         const TweakBase& t = *ts[i];
         ValueList def, cur;
@@ -296,6 +314,9 @@ void write_json(const TweakRegistry& tweaks, TextSink text) {
         out += ", \"group\": ";
         detail::json_string(out, t.group());
         out += Str(", \"dev_only\": ") + (t.code_meta().dev_only ? "true" : "false");
+        out += ", \"one_of\": ";
+        const List<Symbol> one_of = t.one_of();
+        detail::json_names(out, one_of.items());
         out += ", \"source\": ";
         std::optional<Source> source;
         if (t.bound())

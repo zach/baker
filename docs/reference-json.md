@@ -1,4 +1,4 @@
-# The vocabulary as JSON: `baker.reference/1.1`, `baker.tweaks/1`, `baker.shapes/1`
+# The vocabulary as JSON: `baker.reference/1.1`, `baker.tweaks/1.1`, `baker.shapes/1.1`
 
 Three documents describe what a program's data and script may say, for editors, agents,
 and other tools that should not scrape the Markdown reference:
@@ -6,8 +6,8 @@ and other tools that should not scrape the Markdown reference:
 | Document | Written by | Library |
 |---|---|---|
 | `baker.reference/1.1` | `baker::write_reference_json(ctx, sink, &session)` | `baker::script` |
-| `baker.tweaks/1` | `baker::write_json(registry, sink)` | `baker::data` |
-| `baker.shapes/1` | `baker::shape::write_json(shapes, sink)` | `baker::shape` |
+| `baker.tweaks/1.1` | `baker::write_json(registry, sink)` | `baker::data` |
+| `baker.shapes/1.1` | `baker::shape::write_json(shapes, sink)` | `baker::shape` |
 
 They are separate so that a data-only program can write its tweaks and the script library
 does not depend on shapes. A tool that wants all three can wrap them in one object.
@@ -84,7 +84,7 @@ editor, a CI job) can register each function from its overloads with
 - A property has `name`, `type` and `doc`.
 - `handlers` names the script handlers that `{class}` or `{extend}` attached.
 
-## `baker.tweaks/1`
+## `baker.tweaks/1.1`
 
 `tweaks` lists every tweak in the registry, by path. Each one has:
 
@@ -98,9 +98,10 @@ editor, a CI job) can register each function from its overloads with
 | `range` | `[min, max]`, or `null` |
 | `step`, `desc`, `kind`, `group` | metadata; the data's wins over the code's |
 | `dev_only` | the code's flag: a shipping build keeps the default |
+| `one_of` | the symbols the value may be, in order: the data's `(one_of ...)`, else the code's; `[]`: any (added in 1.1) |
 | `source` | while bound: `{layer, file, line}`; otherwise `null` |
 
-## `baker.shapes/1`
+## `baker.shapes/1.1`
 
 `shapes` lists every shape in the set, by name. Each one has:
 
@@ -121,4 +122,5 @@ Each field has these entries:
 | `optional` | whether it may be absent |
 | `range` | `[min, max]`, or `null` |
 | `step`, `kind`, `desc`, `note` | as declared |
+| `one_of` | the symbols a symbol field's value may be, in the order written; `[]`: any (added in 1.1) |
 | `file`, `line` | where the field is declared |

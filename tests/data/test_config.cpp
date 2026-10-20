@@ -435,6 +435,79 @@ TEST_CASE("reload callbacks fire per group; punting rebuilds, migrating does not
 
 #endif
 
+TEST_CASE("callbacks may change the Config and their own lists while notified") {
+    if constexpr (kShipping) return;  // set() and reload() are refused
+    TweakRegistry reg;
+    Tweak<int> a{"t.a", 1, {}, reg};
+    Tweak<int> b{"t.b", 1, {}, reg};
+    Config cfg({.tweaks = &reg});
+    REQUIRE(cfg.push_layer("d", parse("(t (a 1) (b 1))")));
+
+    SUBCASE("a callback that sets another tweak notifies it, once") {
+        int b_changes = 0;
+        a.on_change([&] { REQUIRE(cfg.set("t.b", {Node(int64_t(a) * 10)})); });
+        b.on_change([&] { ++b_changes; });
+        REQUIRE(cfg.set("t.a", {Node(2)}));
+        CHECK(int(b) == 20);
+        CHECK(b_changes == 1);
+    }
+    SUBCASE("two tweaks whose callbacks set each other do not loop") {
+        int a_changes = 0, b_changes = 0;
+        a.on_change([&] {
+            ++a_changes;
+            REQUIRE(cfg.set("t.b", {Node(int64_t(a) + 1)}));
+        });
+        b.on_change([&] {
+            ++b_changes;
+            REQUIRE(cfg.set("t.a", {Node(int64_t(b) + 1)}));
+        });
+        REQUIRE(cfg.set("t.a", {Node(10)}));
+        CHECK(a_changes == 1);  // a's own change from b's callback does not notify again
+        CHECK(b_changes == 1);
+        CHECK(int(b) == 11);
+        CHECK(int(a) == 12);  // the value changed; only the notification was elided
+    }
+    SUBCASE("a callback added from inside a callback runs from the next change") {
+        int first = 0, second = 0;
+        a.on_change([&] {
+            ++first;
+            if (first == 1) a.on_change([&] { ++second; });
+        });
+        REQUIRE(cfg.set("t.a", {Node(2)}));
+        CHECK(first == 1);
+        CHECK(second == 0);
+        REQUIRE(cfg.set("t.a", {Node(3)}));
+        CHECK(first == 2);
+        CHECK(second == 1);
+    }
+    SUBCASE("a reload callback may remove itself and others while they are notified") {
+        TempDir dir;
+        Config files({.tweaks = nullptr});
+        REQUIRE(files.push_layer("d", dir.write("d.dta", "(g (v 1))\n")));
+        int one = 0, two = 0, done = 0;
+        Config::ReloadId id_one = 0, id_two = 0, id_done = 0;
+        id_one = files.on_reload("g", [&] {
+            ++one;
+            files.remove_on_reload(id_one);
+            files.remove_on_reload(id_two);
+        });
+        id_two = files.on_reload("g", [&] { ++two; });
+        id_done = files.on_reload_complete([&](const ReloadRecord&) {
+            ++done;
+            files.remove_on_reload(id_done);
+        });
+        dir.write("d.dta", "(g (v 2))\n");
+        REQUIRE(files.reload());
+        CHECK(one == 1);
+        CHECK(done == 1);
+        dir.write("d.dta", "(g (v 3))\n");
+        REQUIRE(files.reload());
+        CHECK(one == 1);  // removed
+        CHECK(two == 1);  // ran in the round it was removed in: the round walks a copy
+        CHECK(done == 1);
+    }
+}
+
 TEST_CASE("tweaks bind, rebind, and fall back to their defaults") {
     TweakRegistry reg;
     Tweak<float> width{"box.width", 2.0f, {.range = {0, 10}, .step = 1, .desc = "Box width"}, reg};

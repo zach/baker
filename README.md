@@ -94,7 +94,7 @@ restarted.
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.2.0)
+FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.2.1)
 FetchContent_MakeAvailable(baker)
 target_link_libraries(game PRIVATE baker::baker)
 ```

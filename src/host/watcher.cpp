@@ -86,7 +86,8 @@ struct Watcher::Impl {
         fs::path::string_type name;  // its file name, as the system reports it
         size_t dir = SIZE_MAX;       // its directory's watch; SIZE_MAX: by stamp
         bool hooked = false;         // through the stamp hook
-        FileStamp stamp;             // the last seen, for those checked by stamp
+        bool pending = false;        // changed before a watch() kept it: report at next poll
+        FileStamp stamp;             // the last seen
     };
     struct Dir {
         fs::path path;
@@ -104,6 +105,7 @@ struct Watcher::Impl {
     Vec<Entry> entries;
     Vec<Own<Dir>> dirs;
     Vec<Symbol> changed;
+    bool any_pending = false;  // an entry is pending
     uint64_t newest_ns = 0;
     uint64_t next_stamp_ns = 0;
 #if defined(__linux__)
@@ -188,12 +190,13 @@ struct Watcher::Impl {
     }
 
     void note(size_t i) {
-        const Entry& e = entries[i];
+        Entry& e = entries[i];
+        // What was seen, so a later watch() can tell an edit since from one reported.
+        if (!e.hooked) e.stamp = disk_stamp(e.file);
+        if (e.stamp.write_ns > newest_ns) newest_ns = e.stamp.write_ns;
         for (const Symbol s : changed)
             if (s == e.path) return;
         changed.push_back(e.path);
-        const FileStamp s = e.hooked ? e.stamp : disk_stamp(e.file);
-        if (s.write_ns > newest_ns) newest_ns = s.write_ns;
     }
 
     // A change the system reported: `name` in the directory watched as `dir`.
@@ -295,14 +298,21 @@ void Watcher::set_disk_path_hook(DiskPathHook hook) {
 
 void Watcher::watch(std::span<const StackFile> files, std::span<const std::string_view> more) {
     Impl& im = *impl_;
-    im.entries.clear();
     im.changed.clear();
-    if constexpr (!kShipping) im.watch(files, more);  // shipping: inert
+    if constexpr (kShipping) {
+        im.entries.clear();  // shipping: inert
+    } else {
+        im.watch(files, more);
+    }
 }
 
 void Watcher::Impl::watch(std::span<const StackFile> files,
                           std::span<const std::string_view> more) {
     Impl& im = *this;
+    // A file that stays in the list keeps what was last seen of it, so an edit since the
+    // last poll is still reported; a file new to the list is stamped as now.
+    Vec<Impl::Entry> before = std::move(im.entries);
+    im.entries.clear();
     Vec<Own<Impl::Dir>> kept;
     auto add = [&](Symbol path) {
         for (const Impl::Entry& e : im.entries)
@@ -328,6 +338,12 @@ void Watcher::Impl::watch(std::span<const StackFile> files,
             e.dir = im.dir_of(dir, kept);
             e.stamp = disk_stamp(e.file);
         }
+        for (const Impl::Entry& was : before)
+            if (was.path == path) {
+                e.pending = was.pending || !same(was.stamp, e.stamp);
+                im.any_pending = im.any_pending || e.pending;
+                break;
+            }
         im.entries.push_back(std::move(e));
     };
     for (const StackFile& f : files) add(f.path);
@@ -343,6 +359,14 @@ bool Watcher::poll() {
     im.changed.clear();
     im.newest_ns = 0;
     if constexpr (!kShipping) {  // shipping: inert
+        if (im.any_pending) {    // edits a watch() found unreported
+            im.any_pending = false;
+            for (size_t i = 0; i < im.entries.size(); ++i)
+                if (im.entries[i].pending) {
+                    im.entries[i].pending = false;
+                    im.note(i);
+                }
+        }
         im.poll_system();
         im.poll_stamps();
     }

@@ -17,7 +17,9 @@
 //
 //   (shapes (move (at fighters * moves) (keyed) (startup int (range 1 60)))) A field has a type
 // (int, float, bool, symbol, string, any, (list T), or another shape's name) and the tweak
-// metadata. check() reports a field of the wrong type or out of range, or a
+// metadata; a symbol field may list the symbols it allows,
+// (button symbol (one_of light heavy kick special)). check() reports a field of the wrong
+// type, out of range or outside its list, or a
 // required field that is missing, as an error; a field the shape does not declare is a
 // warning, so adding data never requires touching its shape first. Commands and variables
 // are not checked: their values are unknown until run.
@@ -53,6 +55,9 @@ struct Field {
     double step = 0;  // 0: none
     baker::Symbol kind;
     std::string_view desc, note;  // in the declaration, which the Set keeps
+    // (one_of light heavy kick): the symbols a symbol field's value may be, in the order
+    // written; a field declared again adds to it. Empty: any symbol.
+    List<baker::Symbol> one_of;
     baker::Symbol file;
     int32_t line = 0;
 };

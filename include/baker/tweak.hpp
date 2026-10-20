@@ -36,6 +36,7 @@
 #include <baker/path.hpp>
 
 #include <baker/callback.hpp>
+#include <baker/list.hpp>
 #include <baker/text.hpp>
 
 #include <atomic>
@@ -65,6 +66,12 @@ struct TweakMeta {
     std::string_view kind{};
     std::string_view group{};  // default: the path without its last segment
     bool dev_only = false;     // under BAKER_SHIPPING, ignore the data and keep the default
+    // The symbols a symbol tweak's value may be, for a panel or an editor to offer, in order:
+    //   static constexpr std::string_view kButtons[] = {"light", "heavy", "kick"};
+    //   Tweak<Symbol> button{"moves.jab.button", Symbol("light"), {.one_of = kButtons}};
+    // The data may give its own, (one_of ...) after the value. Metadata, as the range is:
+    // a shape's (one_of ...) is what check() enforces.
+    std::span<const std::string_view> one_of{};
 };
 
 class TweakBase {
@@ -87,6 +94,8 @@ public:
     [[nodiscard]] std::string_view note() const;
     [[nodiscard]] std::string_view kind() const;
     [[nodiscard]] std::string_view group() const;
+    // The symbols the value may be: the data's (one_of ...), else the code's; empty: any.
+    [[nodiscard]] List<Symbol> one_of() const;
 
     // Appends the current value as data to `out`, for a generic tuning panel (nothing if T
     // cannot be written).
@@ -101,7 +110,10 @@ public:
     // Writes the current value back to the file it came from (Config::write_back).
     [[nodiscard]] Expected<void> write_back();
 
-    // Called after the value changes, on the thread that changed it.
+    // Called after the value changes, on the thread that changed it. A callback may set
+    // other tweaks, whose callbacks run in turn; a change it makes to this tweak, or to one
+    // whose callback sets this tweak back, does not notify this tweak again, so callbacks
+    // cannot loop. A callback added from inside a callback runs from the next change.
     void on_change(Callback<void()> callback);
 
 protected:

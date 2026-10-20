@@ -68,10 +68,25 @@ private:
     const detail::SymbolEntry* e_;
 };
 
+namespace detail {
+// A string literal as a template argument, for the literal operator below.
+template <size_t N>
+struct SymbolLiteral {
+    constexpr SymbolLiteral(const char (&s)[N]) noexcept {  // NOLINT(google-explicit-constructor)
+        for (size_t i = 0; i < N; ++i) text[i] = s[i];
+    }
+    [[nodiscard]] constexpr std::string_view view() const noexcept { return {text, N - 1}; }
+    char text[N]{};
+};
+}  // namespace detail
+
 inline namespace literals {
-// "price"_sym
-inline Symbol operator""_sym(const char* s, size_t n) {
-    return Symbol(std::string_view(s, n));
+// "price"_sym: interned once per distinct literal, on its first call, then one load. A literal in a
+// hot loop costs what a Symbol held in a variable costs; Symbol("price") interns each call.
+template <detail::SymbolLiteral S>
+Symbol operator""_sym() {
+    static const Symbol symbol(S.view());
+    return symbol;
 }
 }  // namespace literals
 

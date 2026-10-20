@@ -131,7 +131,10 @@ opened as the game opens it, and, for `eval`, your state reset (`CommandHooks::r
 `extra_trees` adds files of your own to `check` (scenarios, say). The exit status is 0, 1
 when something failed, 2 when it could not run. In a shipping build, `diff` and `promote`
 refuse. A tool reads the commands' standard output as the document itself, so your
-functions and `#autorun` must print nothing there while a command runs.
+functions and `#autorun` must print nothing there while a command runs. Where that cannot
+be kept clean (an engine prints its own lines), `--output FILE` writes the output to a
+file instead, or `CommandHooks::output` routes it. `CommandHooks::reader` reads the stack
+through your file access, as `Live` does, for files under an engine's own roots.
 
 ## How an external tool talks to a game
 

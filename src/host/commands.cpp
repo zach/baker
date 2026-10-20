@@ -20,8 +20,11 @@ namespace fs = std::filesystem;
 namespace baker::host {
 namespace {
 
+// A command's output, gathered while it runs, then sent where the host asked (run_command).
+thread_local Str* t_output = nullptr;
+
 void out(std::string_view text) {
-    std::fwrite(text.data(), 1, text.size(), stdout);
+    if (t_output) t_output->append(text);
 }
 void err(std::string_view text) {
     std::fwrite(text.data(), 1, text.size(), stderr);
@@ -51,6 +54,7 @@ bool load(Loaded& l, const CommandLine& line) {
     LiveOptions o;
     o.project = line.project;
     o.built = l.hooks.built;
+    o.reader = l.hooks.reader;
     o.open = l.hooks.open;
     o.watch = false;
     o.changed = l.hooks.changed;
@@ -302,8 +306,10 @@ Str unified_diff(std::string_view before, std::string_view after, std::string_vi
     return text;
 }
 
-bool read_whole(const Str& path, Str& text) {
+// Through the host's reader when it gave one, as the stack was read.
+bool read_whole(const Str& path, Str& text, const LoadSession::Reader& reader) {
     text.clear();
+    if (reader) return reader(path.view(), detail::str_out(text));
     std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
     char buf[4096];
@@ -351,7 +357,7 @@ int promote(const CommandLine& line, const CommandHooks& hooks) {
         if (report->ok())  // all or nothing, as --write is
             for (const auto& [path, text] : captured) {
                 Str before;
-                (void)read_whole(path, before);
+                (void)read_whole(path, before, l.hooks.reader);
                 std::error_code ec;
                 const fs::path rel = fs::relative(fs::path(path.c_str()), root, ec);
                 patch += unified_diff(before, text,
@@ -412,6 +418,8 @@ Expected<CommandLine> parse_command_line(int argc, const char* const* argv) {
             if (!value(line.to)) return missing();
         } else if (a == "--patch") {
             if (!value(line.patch)) return missing();
+        } else if (a == "--output") {
+            if (!value(line.output)) return missing();
         } else if (a == "--seed") {
             std::string_view s;
             if (!value(s)) return missing();
@@ -436,7 +444,9 @@ Expected<CommandLine> parse_command_line(int argc, const char* const* argv) {
     return line;
 }
 
-int run_command(const CommandLine& line, const CommandHooks& hooks) {
+namespace {
+
+int dispatch(const CommandLine& line, const CommandHooks& hooks) {
     if (line.command == "check") return check(line, hooks);
     if (line.command == "reference") return reference(line, hooks);
     if (line.command == "eval") return eval(line, hooks);
@@ -451,6 +461,30 @@ int run_command(const CommandLine& line, const CommandHooks& hooks) {
     return -1;
 }
 
+}  // namespace
+
+int run_command(const CommandLine& line, const CommandHooks& hooks) {
+    Str output;
+    Str* const outer = t_output;
+    t_output = &output;
+    int status = dispatch(line, hooks);
+    t_output = outer;
+    if (status < 0) return status;
+    // The output goes to the file the command line names, else to the host's sink, else to
+    // stdout: an engine that owns stdout keeps the result apart from its own lines.
+    if (!line.output.empty()) {
+        if (!write_whole(line.output, output)) {
+            err("cannot write " + Str(line.output) + "\n");
+            status = kCommandError;
+        }
+    } else if (hooks.output) {
+        hooks.output(output.view());
+    } else {
+        std::fwrite(output.data(), 1, output.size(), stdout);
+    }
+    return status;
+}
+
 std::string_view command_help() noexcept {
     return "  check                          baker.check/1.2 JSON; exit 1 on an error, a load\n"
            "                                 problem, a shape error, or an undefined function\n"
@@ -463,7 +497,8 @@ std::string_view command_help() noexcept {
            "  eval [--seed N] [--json] \"{command}\"...\n"
            "                                 each command's result, one a line, on the game\n"
            "                                 reset with the seed (default 1); --json: one\n"
-           "                                 baker.reply/1.1 line each, as the console answers\n";
+           "                                 baker.reply/1.1 line each, as the console answers\n"
+           "every command also takes --output FILE: its output there, not on stdout\n";
 }
 
 }  // namespace baker::host
