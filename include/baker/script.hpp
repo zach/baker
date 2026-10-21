@@ -196,12 +196,23 @@ namespace detail {
 // Implicit: a parameter that takes no argument (Context&, the object of a method).
 enum class ParamKind : uint8_t { Value, Raw, Optional, Rest, Implicit };
 
+// What messages, the reference and check read of a parameter, and a call does not: kept
+// apart, so the table a call reads stays small.
+struct ParamText {
+    std::string_view type;
+    // Baker's type of each value the parameter reads (Convert<T>::values for a compound
+    // type), for the reference and for check without the game; empty when it does not say.
+    std::span<const std::string_view> values;
+};
 struct ParamInfo {
-    std::string_view type;  // for the reference and messages
+    const ParamText* text;
     ParamKind kind;
     // Whether an (evaluated, or literal) argument has the right node type; null: any.
     bool (*match)(const Node& n, bool promote) noexcept;
     bool raw;  // not evaluated before the call (Raw<T>, or an optional one)
+
+    [[nodiscard]] std::string_view type() const noexcept { return text->type; }
+    [[nodiscard]] std::span<const std::string_view> values() const noexcept { return text->values; }
 };
 
 template <class P>
@@ -542,6 +553,23 @@ Expected<Node> invoke(const void* callable, [[maybe_unused]] Args& args,
     return result;
 }
 
+// Baker's type of each value a parameter reads: an optional one's as its value's.
+template <class T>
+struct OptionalOf {
+    using type = T;
+};
+template <class T>
+struct OptionalOf<std::optional<T>> {
+    using type = T;
+};
+template <class P>
+[[nodiscard]] constexpr std::span<const std::string_view> param_values() noexcept {
+    return value_types<typename OptionalOf<std::remove_cvref_t<P>>::type>();
+}
+
+template <class P>
+inline constexpr ParamText kParamText{Param<P>::type(), param_values<P>()};
+
 // The parameter descriptions of a signature, built at compile time: no allocation.
 template <class... P>
 struct ParamTable {
@@ -555,7 +583,7 @@ struct ParamTable {
         (
             [&] {
                 if constexpr (Param<P>::kind != ParamKind::Implicit)
-                    s.items[i++] = {Param<P>::type(), Param<P>::kind, Param<P>::match, is_raw<P>};
+                    s.items[i++] = {&kParamText<P>, Param<P>::kind, Param<P>::match, is_raw<P>};
             }(),
             ...);
         return s;
@@ -694,10 +722,18 @@ struct ParamDescription {
     std::string_view type;
     std::string_view kind = "value";
     bool raw = false;
+    // Baker's type of each value, as the reference writes them: what lets a type of the
+    // game's own ("vec2") be checked without the game.
+    std::span<const std::string_view> values{};
 };
 struct OverloadDescription {
     std::span<const ParamDescription> params;
     std::string_view result = "value";
+};
+// A method of a type described as data, for Context::declare_type: its name and overloads.
+struct MethodDescription {
+    Symbol name;
+    std::span<const OverloadDescription> overloads;
 };
 
 // A call in progress, on the C++ stack: the frames of a Context form a list from the
@@ -768,6 +804,19 @@ public:
     // error naming the function, and nothing is registered; so is an unknown kind.
     [[nodiscard]] Expected<FuncRef> declare(Symbol name,
                                             std::span<const OverloadDescription> overloads);
+    // Declares a type from its description (the reference's `types`), for a tool that checks
+    // without the game: its bases, each a type this Context already knows (native or
+    // declared), and its methods. check() then holds a call on an object of the type to its
+    // methods and its bases', as it does a native type's. The Context owns it; its methods
+    // have no body. An error naming the type, and nothing declared, for a name that is
+    // already a type, a base it does not know, or a method declare() would refuse.
+    [[nodiscard]] Expected<void> declare_type(Symbol name, std::span<const Symbol> bases,
+                                              std::span<const MethodDescription> methods);
+    // Names an object of `type` (the reference's `objects`) for check(): {name method ...} is
+    // checked against the type. Nothing is added to run: a call on it fails as a call on an
+    // undefined name does. An error for a type it does not know, or a name that is already a
+    // function or an object.
+    [[nodiscard]] Expected<void> declare_object(Symbol name, Symbol type);
 
     // --- Variables. ---
 

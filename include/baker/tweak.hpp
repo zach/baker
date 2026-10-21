@@ -103,6 +103,9 @@ public:
     [[nodiscard]] TweakRegistry& registry() const noexcept { return *registry_; }
     // The value's type, as errors and the reference name it: "float32", "int", "vec2"...
     [[nodiscard]] std::string_view type_name() const noexcept { return info().name; }
+    // Baker's type of each of the value's values: {"float32"} for a float, {"float32",
+    // "float32"} for a vec2 whose Convert declares `values`; empty when the type does not say.
+    [[nodiscard]] std::span<const std::string_view> value_types() const noexcept { return types(); }
 
     // Metadata, the data file's winning over the code's.
     [[nodiscard]] TweakRange range() const;
@@ -152,6 +155,7 @@ private:
     virtual bool assign(const Values& values, bool apply) = 0;
     virtual void reset() = 0;  // back to the default
     [[nodiscard]] virtual detail::ConvertInfo info() const noexcept = 0;
+    [[nodiscard]] virtual std::span<const std::string_view> types() const noexcept = 0;
 
     // Rebinds against `root` (a Config's merged tree); true if the value changed. Reports
     // a value that does not convert through `warn`.
@@ -206,12 +210,54 @@ private:
     Config* config_ = nullptr;
 };
 
-// Every tweak in `tweaks` as JSON (schema baker.tweaks/1.1, docs/reference-json.md), sorted by
-// path: its type, default and current value, metadata (the data's winning over the code's),
-// and, while a config supplies it, where the value came from. For tools and agents.
+// Every tweak in `tweaks` as JSON (schema baker.tweaks/1.2, docs/reference-json.md), sorted by
+// path: its type and value types, default and current value, metadata (the data's winning
+// over the code's), and, while a config supplies it, where the value came from. For tools
+// and agents.
 void write_json(const TweakRegistry& tweaks, TextSink out);
 
+// A tweak as the reference describes it (baker.tweaks), for a tool that has the game's
+// reference but not its code.
+struct TweakDescription {
+    std::string_view path{};
+    std::string_view type{};  // Baker's ("float32", "symbol") or the game's own ("vec2")
+    // Baker's type of each value, as the reference's "values" lists them: needed for a type
+    // of the game's own, implied for one of Baker's.
+    std::span<const std::string_view> values{};
+    std::string_view default_text{};  // the code's default, as Baker text: "2.5", "(0 1)"
+    TweakRange range{};
+    double step = 0;
+    std::string_view desc{};
+    std::string_view kind{};
+    std::string_view group{};
+    bool dev_only = false;
+    std::span<const std::string_view> one_of{};
+};
+
+// Tweaks a tool makes from their descriptions, registered with `registry`, so that
+// check_tweaks holds data to them as the game holds data to its own: a language server, a CI
+// checker, an agent's pre-flight check. No code reads them; they hold copies of what they
+// are given, and unregister when the set goes.
+class DescribedTweaks {
+public:
+    explicit DescribedTweaks(TweakRegistry& registry);
+    ~DescribedTweaks();
+    DescribedTweaks(const DescribedTweaks&) = delete;
+    DescribedTweaks& operator=(const DescribedTweaks&) = delete;
+
+    // The same call for every type. An error naming the tweak if its type is not Baker's and
+    // it gives no value types, if a value type is not one of Baker's, or if its default does
+    // not read as them.
+    [[nodiscard]] Expected<void> add(const TweakDescription& tweak);
+    [[nodiscard]] size_t size() const noexcept;
+
+private:
+    struct Impl;
+    Impl* impl_;
+};
+
 namespace detail {
+
 template <class T>
 [[nodiscard]] constexpr bool atomic_tweak() noexcept {
     if constexpr (std::is_trivially_copyable_v<T>)
@@ -288,6 +334,9 @@ private:
     void reset() override { store(default_); }
     [[nodiscard]] detail::ConvertInfo info() const noexcept override {
         return detail::convert_info<T>();
+    }
+    [[nodiscard]] std::span<const std::string_view> types() const noexcept override {
+        return detail::value_types<T>();
     }
     void store(T v) {
         if constexpr (kAtomic)

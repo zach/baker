@@ -10,6 +10,11 @@
 
 namespace baker {
 namespace {
+// A script function's parameter: any value.
+constexpr detail::ParamText kScriptParam{"value", {}};
+}  // namespace
+
+namespace {
 
 // Ints wrap on overflow, as two's complement, rather than being undefined.
 int64_t wrap(uint64_t v) noexcept {
@@ -71,8 +76,9 @@ Expected<Node> define(Args a, bool override) {
     detail::Overload o;
     o.thunk = &run_script;
     o.min_args = o.max_args = static_cast<uint32_t>(body->params.size());
-    body->param_info.assign(body->params.size(),
-                            detail::ParamInfo{"value", detail::ParamKind::Value, nullptr, false});
+    body->param_info.assign(
+        body->params.size(),
+        detail::ParamInfo{&kScriptParam, detail::ParamKind::Value, nullptr, false});
     o.params = body->param_info;
     o.result = "value";
     o.callable = std::move(holder);

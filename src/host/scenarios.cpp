@@ -259,38 +259,55 @@ Expected<void> Book::read(std::string_view path, const LoadSession::Reader& read
 }
 
 bool Run::passed() const noexcept {
-    if (!errors.empty()) return false;
+    if (!finished || !errors.empty()) return false;
     for (const ObjectiveResult& o : objectives)
         if (!o.pass && (!o.over_median || o.failed)) return false;
     return true;
 }
 
-Run simulate(Context& ctx, const Game& game, const Book& book, const Scenario& scenario,
-             uint64_t seed, double step_hz) {
-    Run run{.scenario = scenario.name, .file = scenario.file, .line = scenario.line, .seed = seed};
-    ctx.var("seed") = Node(static_cast<int64_t>(seed));
-    if (game.reset) game.reset(ctx, seed);
-    auto run_commands = [&](const Vec<Node>& cmds) {
-        for (const Node& c : cmds)
-            if (auto r = ctx.eval(c); !r) run.errors.push_back(r.error());
-    };
-    run_commands(scenario.start);
-
+Stepper::Stepper(Context& ctx, const Book& book, const Scenario& scenario, uint64_t seed,
+                 double step_hz)
+    : ctx_(&ctx),
+      book_(&book),
+      scenario_(&scenario),
+      run_{.scenario = scenario.name, .file = scenario.file, .line = scenario.line, .seed = seed} {
     // Steps are counted, not timed: the same scenario takes the same steps everywhere.
     const auto step_ns = static_cast<uint64_t>(std::llround(1e9 / step_hz));
-    const double dt = static_cast<double>(step_ns) / 1e9;
-    const auto total = static_cast<uint64_t>(std::llround(scenario.seconds * step_hz));
-    size_t next_at = 0;
-    for (uint64_t i = 0; i < total; ++i) {
-        const double now = static_cast<double>(i) * dt;
-        while (next_at < scenario.at.size() && scenario.at[next_at].seconds <= now + dt * 0.5)
-            run_commands(scenario.at[next_at++].commands);
-        if (game.step) game.step(ctx, dt);
-        ctx.scheduler().tick(dt);
-        ++run.steps;
-    }
+    dt_ = static_cast<double>(step_ns) / 1e9;
+    total_ = static_cast<uint64_t>(std::llround(scenario.seconds * step_hz));
+    ctx.var("seed") = Node(static_cast<int64_t>(seed));
+}
 
-    for (const Objective& o : book.objectives) {
+void Stepper::begin() {
+    for (const Node& c : scenario_->start)
+        if (auto r = ctx_->eval(c); !r) run_.errors.push_back(r.error());
+    run_due();
+}
+
+// Each (at ...) whose time has come, at the step about to be taken.
+void Stepper::run_due() {
+    const double now = static_cast<double>(run_.steps) * dt_;
+    const Vec<Scenario::At>& at = scenario_->at;
+    while (next_at_ < at.size() && at[next_at_].seconds <= now + dt_ * 0.5)
+        for (const Node& c : at[next_at_++].commands)
+            if (auto r = ctx_->eval(c); !r) run_.errors.push_back(r.error());
+}
+
+void Stepper::advance() {
+    ctx_->scheduler().tick(dt_);
+    ++run_.steps;
+    if (!done()) run_due();
+}
+
+Run Stepper::stop() {
+    run_.finished = false;
+    return std::move(run_);
+}
+
+Run Stepper::judge() {
+    Context& ctx = *ctx_;
+    const Scenario& scenario = *scenario_;
+    for (const Objective& o : book_->objectives) {
         if (!scenario.objectives.empty() &&
             std::find(scenario.objectives.begin(), scenario.objectives.end(), o.name) ==
                 scenario.objectives.end())
@@ -307,16 +324,28 @@ Run simulate(Context& ctx, const Game& game, const Book& book, const Scenario& s
         } else {
             r.failed = true;
         }
-        run.objectives.push_back(std::move(r));
+        run_.objectives.push_back(std::move(r));
     }
     for (const Symbol name : scenario.objectives)
-        if (!objective_named(book, name))
-            run.errors.push_back(make_error(ErrorCode::NotFound,
-                                            "scenario '" + Str(scenario.name.str()) +
-                                                "' names objective '" + Str(name.str()) +
-                                                "', which no objective file declares",
-                                            scenario.file, scenario.line));
-    return run;
+        if (!objective_named(*book_, name))
+            run_.errors.push_back(make_error(ErrorCode::NotFound,
+                                             "scenario '" + Str(scenario.name.str()) +
+                                                 "' names objective '" + Str(name.str()) +
+                                                 "', which no objective file declares",
+                                             scenario.file, scenario.line));
+    return std::move(run_);
+}
+
+Run simulate(Context& ctx, const Game& game, const Book& book, const Scenario& scenario,
+             uint64_t seed, double step_hz) {
+    Stepper s(ctx, book, scenario, seed, step_hz);
+    if (game.reset) game.reset(ctx, seed);
+    s.begin();
+    while (!s.done()) {
+        if (game.step) game.step(ctx, s.dt());
+        s.advance();
+    }
+    return s.judge();
 }
 
 Vec<Median> judge_medians(Context& ctx, const Book& book, const Vec<Run>& runs) {
@@ -380,8 +409,10 @@ Str results_json(Vec<Run> runs, const Vec<Median>& medians) {
     std::sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) {
         return a.scenario != b.scenario ? by_text(a.scenario, b.scenario) : a.seed < b.seed;
     });
-    Str s = "{\n  \"schema\": \"baker.sim/1\",\n  \"status\": ";
-    s += all_passed(runs, medians) ? "\"passed\"" : "\"failed\"";
+    const bool stopped =
+        std::any_of(runs.begin(), runs.end(), [](const Run& r) { return !r.finished; });
+    Str s = "{\n  \"schema\": \"baker.sim/1.1\",\n  \"status\": ";
+    s += stopped ? "\"stopped\"" : all_passed(runs, medians) ? "\"passed\"" : "\"failed\"";
     s += ",\n  \"runs\": [";
     for (size_t i = 0; i < runs.size(); ++i) {
         const Run& r = runs[i];
@@ -390,7 +421,8 @@ Str results_json(Vec<Run> runs, const Vec<Median>& medians) {
         json_place(s, r.file, r.line);
         s += ", \"seed\": " + detail::decimal(static_cast<int64_t>(r.seed)) +
              ", \"steps\": " + detail::decimal(static_cast<int64_t>(r.steps)) +
-             ", \"passed\": " + json_bool(r.passed()) + ", \"errors\": [";
+             ", \"finished\": " + json_bool(r.finished) + ", \"passed\": " + json_bool(r.passed()) +
+             ", \"errors\": [";
         for (size_t e = 0; e < r.errors.size(); ++e) {
             if (e) s += ", ";
             json_problem(s, r.errors[e]);
@@ -444,7 +476,8 @@ Str results_dta(const Vec<Run>& runs, const Vec<Median>& medians) {
         s += "(run (scenario " + Str(r.scenario.str()) + ") (seed " +
              detail::decimal(static_cast<int64_t>(r.seed)) + ") (steps " +
              detail::decimal(static_cast<int64_t>(r.steps)) + ") (passed " +
-             (r.passed() ? "1" : "0") + ")" + place_dta(r.file, r.line);
+             (r.passed() ? "1" : "0") + ")" + (r.finished ? "" : " (finished 0)") +
+             place_dta(r.file, r.line);
         for (const ObjectiveResult& o : r.objectives) {
             s += "\n   (objective " + Str(o.name.str()) + " (value " + number_text(o.value) +
                  ") (pass " + (o.pass ? "1" : "0") + ")" + place_dta(o.file, o.line);
@@ -485,7 +518,9 @@ Expected<void> read_results(std::string_view file, Vec<Run>& runs, Vec<Median>& 
                   .file = place(form),
                   .line = static_cast<int32_t>(number(form.try_find(Symbol("line")))),
                   .seed = static_cast<uint64_t>(number(form.try_find(Symbol("seed")))),
-                  .steps = static_cast<uint64_t>(number(form.try_find(Symbol("steps"))))};
+                  .steps = static_cast<uint64_t>(number(form.try_find(Symbol("steps")))),
+                  .finished = !form.try_find(Symbol("finished")) ||
+                              number(form.try_find(Symbol("finished"))) != 0};
             for (const Array& part : form.subarrays()) {
                 if (part.empty()) continue;
                 if (part[0].is(Symbol("error")) && part.size() > 1) {

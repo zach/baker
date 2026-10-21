@@ -1,12 +1,12 @@
-# The vocabulary as JSON: `baker.reference/1.1`, `baker.tweaks/1.1`, `baker.shapes/1.1`
+# The vocabulary as JSON: `baker.reference/1.2`, `baker.tweaks/1.2`, `baker.shapes/1.1`
 
 Three documents describe what a program's data and script may say, for editors, agents,
 and other tools that should not scrape the Markdown reference:
 
 | Document | Written by | Library |
 |---|---|---|
-| `baker.reference/1.1` | `baker::write_reference_json(ctx, sink, &session)` | `baker::script` |
-| `baker.tweaks/1.1` | `baker::write_json(registry, sink)` | `baker::data` |
+| `baker.reference/1.2` | `baker::write_reference_json(ctx, sink, &session)` | `baker::script` |
+| `baker.tweaks/1.2` | `baker::write_json(registry, sink)` | `baker::data` |
 | `baker.shapes/1.1` | `baker::shape::write_json(shapes, sink)` | `baker::shape` |
 
 They are separate so that a data-only program can write its tweaks and the script library
@@ -29,11 +29,11 @@ They follow `check`'s rules (`check-json.md`):
   or changed only with a new major version.
 - **Numbers.** Ranges and steps are written as Baker prints floats (`0.5`, `10.0`).
 
-## `baker.reference/1.1`
+## `baker.reference/1.2`
 
 | Field | Contents |
 |---|---|
-| `schema` | `"baker.reference/1.1"` |
+| `schema` | `"baker.reference/1.2"` |
 | `functions` | every function with at least one overload |
 | `types` | every native type made known to the Context |
 | `script_classes` | classes only script defined (`{class Name ...}` with no native type) |
@@ -50,8 +50,10 @@ They follow `check`'s rules (`check-json.md`):
 - `doc`.
 - `file` and `line`: where a script function is defined; `""` and `0` for a native one.
 - `overloads`. Each overload has:
-  - `params`, each with `type`, `kind` (`"value"`, `"raw"`, `"optional"` or `"rest"`) and
-    `raw` (passed unevaluated);
+  - `params`, each with `type`, `kind` (`"value"`, `"raw"`, `"optional"` or `"rest"`),
+    `raw` (passed unevaluated) and `values`: Baker's type of each value the parameter reads,
+    `["int"]` for an `int`, `["float32", "float32"]` for a `vec2` whose `Convert` declares
+    `values`, `null` when the type does not say (added in 1.2);
   - `result`;
   - `min_args`;
   - `max_args`, which is `null` when the overload takes the rest of its arguments.
@@ -71,6 +73,18 @@ editor, a CI job) can register each function from its overloads with
   declared from its own reference.
   Any other type name is an error naming the function. The tool decides what to do then,
   for example to declare that parameter as `value`.
+- **A type of the game's own** as a parameter, such as a `vec2`, is checked by its
+  `values`: give them in the `ParamDescription`, and `check` holds a literal argument to
+  them as the game's converter reads it, so `{aim 1}` where a `vec2` is wanted is an error.
+- **Types and objects.** `Context::declare_type(name, bases, methods)` declares a type from
+  its entry in `types`: its bases (each a type the Context already knows, so declare bases
+  first) and each method as a `MethodDescription`, a name and its overloads.
+  `Context::declare_object(name, type)` declares an entry of `objects`. `check` then holds
+  `{tank fire 3}` to the type's methods and its bases' as it would for the game: a wrong
+  argument count or literal type is an error, and a method the type does not have is in
+  `demand`. Neither runs: a call on a declared object fails as a call on an undefined name
+  does. A description it cannot hold (an unknown base or type, a parameter type with no
+  `values`, a name already taken) is an error naming the type, method or object.
 - **The data's own vocabulary** comes from the load, not the reference:
   `session.macro_definitions()` lists every macro the session's reads defined, with its
   file and line, and `script_functions(session.autorun())` lists every `{func}` the load's
@@ -84,14 +98,15 @@ editor, a CI job) can register each function from its overloads with
 - A property has `name`, `type` and `doc`.
 - `handlers` names the script handlers that `{class}` or `{extend}` attached.
 
-## `baker.tweaks/1.1`
+## `baker.tweaks/1.2`
 
 `tweaks` lists every tweak in the registry, by path. Each one has:
 
 | Field | Contents |
 |---|---|
 | `path` | as the tweak was declared: `player.speed` |
-| `type` | the value's type as errors name it: `"float32"`, `"int32"`, `"bool"`... |
+| `type` | the value's type as errors name it: `"float32"`, `"int32"`, `"bool"`, or your own (`"vec2"`) |
+| `values` | Baker's type of each value: `["float32"]`, or `["float32", "float32"]` for a `vec2` whose `Convert` declares `values`; `null` when the type does not say (added in 1.2) |
 | `default` | the code's default, as Baker text |
 | `value` | the current value, as Baker text |
 | `bound` | whether the data supplies the value |
@@ -100,6 +115,41 @@ editor, a CI job) can register each function from its overloads with
 | `dev_only` | the code's flag: a shipping build keeps the default |
 | `one_of` | the symbols the value may be, in order: the data's `(one_of ...)`, else the code's; `[]`: any (added in 1.1) |
 | `source` | while bound: `{layer, file, line}`; otherwise `null` |
+
+### Checking data against tweaks without the game
+
+A tool that has the game's reference but not its code (a language server, a CI checker,
+an agent's pre-flight check) can hold data to the game's tweaks as `check` does. It
+registers each tweak from its description, then runs `check_tweaks`:
+
+```cpp
+baker::TweakRegistry registry;
+baker::DescribedTweaks tweaks(registry);
+for (const auto& t : reference_tweaks)   // read from the JSON by the tool
+    if (auto added = tweaks.add({.path = t.path, .type = t.type, .values = t.values,
+                                 .default_text = t.default_text, .range = t.range,
+                                 .one_of = t.one_of});
+        !added)
+        report(added.error());           // names the tweak
+const baker::TweakFindings found = baker::check_tweaks(*merged_tree, registry);
+```
+
+`add` is the same call for every type, Baker's or the game's. A type of the game's own needs
+its `values`, which the game gives by declaring them in its converter:
+
+```cpp
+template <> struct baker::Convert<Vec2> {
+    static constexpr std::string_view name = "vec2";
+    static constexpr std::string_view values[] = {"float32", "float32"};
+    // from, to ...
+};
+```
+
+A described tweak reads each value as the game's converter would with `Values::read`, so
+`(aim 1)` where a `vec2` is wanted fails in the tool as it fails in the game. A description
+it cannot hold is an error naming the tweak: a type of the game's own with no `values`, a
+value type that is not one of Baker's, or a default that does not read as its types. A type
+whose count of values is the data's (a list) has no `values` and cannot be described yet.
 
 ## `baker.shapes/1.1`
 

@@ -427,73 +427,39 @@ int promote(const CommandLine& line, const CommandHooks& hooks) {
     return 0;
 }
 
-// Runs the project's scenarios, each for each seed, and judges them by its objectives.
+// The output, sent where the command line or the host asked: the file --output names, else
+// the host's sink, else stdout, so an engine that owns stdout keeps the result apart.
+int send(const CommandLine& line, const CommandHooks& hooks, const Str& output, int status) {
+    if (!line.output.empty()) {
+        if (!write_whole(line.output, output)) {
+            err("cannot write " + Str(line.output) + "\n");
+            return kCommandError;
+        }
+    } else if (hooks.output) {
+        hooks.output(output.view());
+    } else {
+        std::fwrite(output.data(), 1, output.size(), stdout);
+    }
+    return status;
+}
+
+// sim, for a game that steps on demand: a SimRun driven with its reset and step.
 int run_scenarios(const CommandLine& line, const CommandHooks& hooks) {
     if (!hooks.step) {
         err("sim: this game gives no step (CommandHooks::step), so it cannot run scenarios\n");
         return kCommandError;
     }
-    Loaded l(hooks);
-    if (!load(l, line)) return kCommandError;
-    sim::Book book;
-    if (auto r = read_book(l, book); !r) {
-        err(describe(r.error()));
-        err("\n");
-        return kCommandError;
-    }
-    // --scenario picks by scenario name, or by its file's name without .dta.
-    Vec<const sim::Scenario*> chosen;
-    for (const sim::Scenario& s : book.scenarios) {
-        const Str stem(fs::path(Str(s.file.str()).c_str()).stem().generic_string());
-        bool wanted = line.scenarios.empty();
-        for (const std::string_view n : line.scenarios)
-            wanted = wanted || n == s.name.str() || n == stem.view();
-        if (wanted) chosen.push_back(&s);
-    }
-    if (chosen.empty()) {
-        err(book.scenarios.empty() ? "sim: the project names no scenarios (scenarios ...)\n"
-                                   : "sim: no scenario by that name\n");
-        return kCommandError;
-    }
-    const sim::Game game{.reset = hooks.reset, .step = hooks.step};
-    const uint64_t last = line.seed_last ? line.seed_last : line.seed;
-    Vec<sim::Run> runs;
-    for (const sim::Scenario* s : chosen)
-        for (uint64_t seed = line.seed; seed <= last; ++seed) {
-            sim::Run r = sim::simulate(l.ctx, game, book, *s, seed, line.step_hz);
-            if (!line.json) {  // a line a person reads; the JSON has the rest
-                Str t = Str(r.scenario.str()) + " seed " +
-                        detail::decimal(static_cast<int64_t>(seed)) + ": " +
-                        (r.passed() ? "passed" : "FAILED");
-                for (const sim::ObjectiveResult& o : r.objectives)
-                    t += "  " + Str(o.name.str()) + " " +
-                         (o.failed ? "(" + Str(to_string(o.error)) + ")"
-                                   : sim::number_text(o.value) + (o.pass ? "" : " (fail)"));
-                for (const Error& e : r.errors) t += "\n  error: " + Str(to_string(e));
-                out(t + "\n");
-            }
-            runs.push_back(std::move(r));
-        }
-    const Vec<sim::Median> medians = sim::judge_medians(l.ctx, book, runs);
-    if (!line.json)
-        for (const sim::Median& m : medians)
-            out(Str(m.scenario.str()) + " median of " + detail::decimal(m.seeds) +
-                " seeds: " + (m.pass ? "passed" : "FAILED") + "  " + Str(m.objective.str()) + " " +
-                sim::number_text(m.value) + (m.failed ? "  " + Str(m.error.message()) : Str()) +
-                "\n");
-    const Str json = sim::results_json(runs, medians);
-    if (line.json) out(json);
-    if (!line.results.empty()) {
-        std::error_code ec;
-        const fs::path dir(Str(line.results).c_str());
-        fs::create_directories(dir, ec);
-        if (!write_whole((dir / "results.json").generic_string(), json) ||
-            !write_whole((dir / "results.dta").generic_string(), sim::results_dta(runs, medians))) {
-            err("sim: cannot write to " + Str(line.results) + "\n");
-            return kCommandError;
+    SimRun run(line, hooks);
+    for (SimRun::Wants w; (w = run.wants()) != SimRun::Wants::Done;) {
+        if (w == SimRun::Wants::Reset) {
+            if (hooks.reset) hooks.reset(run.context(), run.seed());
+            run.ready();
+        } else {
+            hooks.step(run.context(), run.step_seconds());
+            run.step();
         }
     }
-    return sim::all_passed(runs, medians) ? 0 : kCommandFailed;
+    return run.status();
 }
 
 // Which objectives moved between two `sim --results` directories, without running anything.
@@ -519,6 +485,186 @@ int compare(const CommandLine& line) {
 }
 
 }  // namespace
+
+// A sim in progress: the stack, the scenarios chosen, the run being stepped, and the output so
+// far, which every call gathers while it runs.
+struct SimRun::Impl {
+    Impl(CommandLine l, const CommandHooks& h) : line(std::move(l)), loaded(h) {}
+    CommandLine line;
+    Loaded loaded;
+    sim::Book book;
+    Vec<const sim::Scenario*> chosen;
+    size_t scenario = 0;  // into chosen
+    uint64_t seed = 0, last = 0;
+    std::optional<sim::Stepper> stepper;
+    Vec<sim::Run> runs;
+    Str output;
+    Wants wants = Wants::Done;
+    int status = kCommandError;
+
+    // A line a person reads; the JSON has the rest.
+    void print(const sim::Run& r) const {
+        if (line.json) return;
+        Str t = Str(r.scenario.str()) + " seed " + detail::decimal(static_cast<int64_t>(r.seed)) +
+                ": " +
+                (!r.finished  ? "STOPPED"
+                 : r.passed() ? "passed"
+                              : "FAILED");
+        for (const sim::ObjectiveResult& o : r.objectives)
+            t += "  " + Str(o.name.str()) + " " +
+                 (o.failed ? "(" + Str(to_string(o.error)) + ")"
+                           : sim::number_text(o.value) + (o.pass ? "" : " (fail)"));
+        for (const Error& e : r.errors) t += "\n  error: " + Str(to_string(e));
+        out(t + "\n");
+    }
+    void start() {
+        stepper.emplace(loaded.ctx, book, *chosen[scenario], seed, line.step_hz);
+        wants = Wants::Reset;
+    }
+    // The run has its last step: judged, then the next, or the end.
+    void judge() {
+        runs.push_back(stepper->judge());
+        print(runs.back());
+        if (seed < last) {
+            ++seed;
+        } else if (++scenario < chosen.size()) {
+            seed = line.seed;
+        } else {
+            finish(false);
+            return;
+        }
+        start();
+    }
+    void finish(bool stopped) {
+        stepper.reset();
+        const Vec<sim::Median> medians = sim::judge_medians(loaded.ctx, book, runs);
+        if (!line.json)
+            for (const sim::Median& m : medians)
+                out(Str(m.scenario.str()) + " median of " + detail::decimal(m.seeds) +
+                    " seeds: " + (m.pass ? "passed" : "FAILED") + "  " + Str(m.objective.str()) +
+                    " " + sim::number_text(m.value) +
+                    (m.failed ? "  " + Str(m.error.message()) : Str()) + "\n");
+        const Str json = sim::results_json(runs, medians);
+        if (line.json) out(json);
+        status = stopped ? kCommandError : sim::all_passed(runs, medians) ? 0 : kCommandFailed;
+        if (!line.results.empty()) {
+            std::error_code ec;
+            const fs::path dir(Str(line.results).c_str());
+            fs::create_directories(dir, ec);
+            if (!write_whole((dir / "results.json").generic_string(), json) ||
+                !write_whole((dir / "results.dta").generic_string(),
+                             sim::results_dta(runs, medians))) {
+                err("sim: cannot write to " + Str(line.results) + "\n");
+                status = kCommandError;
+            }
+        }
+        done();
+    }
+    // The stack and the scenarios chosen; false, with the reason on stderr, if it cannot run.
+    bool open() {
+        if (line.command != "sim") {
+            err("SimRun runs sim alone\n");
+            return false;
+        }
+        if (!load(loaded, line)) return false;
+        if (auto e = read_book(loaded, book); !e) {
+            err(describe(e.error()));
+            err("\n");
+            return false;
+        }
+        // --scenario picks by scenario name, or by its file's name without .dta.
+        for (const sim::Scenario& s : book.scenarios) {
+            const Str stem(fs::path(Str(s.file.str()).c_str()).stem().generic_string());
+            bool wanted = line.scenarios.empty();
+            for (const std::string_view n : line.scenarios)
+                wanted = wanted || n == s.name.str() || n == stem.view();
+            if (wanted) chosen.push_back(&s);
+        }
+        if (chosen.empty()) {
+            err(book.scenarios.empty() ? "sim: the project names no scenarios (scenarios ...)\n"
+                                       : "sim: no scenario by that name\n");
+            return false;
+        }
+        seed = line.seed;
+        last = line.seed_last ? line.seed_last : line.seed;
+        return true;
+    }
+    // The end: the output sent, as run_command sends it.
+    void done() {
+        wants = Wants::Done;
+        status = send(line, loaded.hooks, output, status);
+    }
+};
+
+namespace {
+// The output a SimRun call prints goes to its run, while the call lasts.
+class Gather {
+public:
+    explicit Gather(Str& into) : outer_(t_output) { t_output = &into; }
+    ~Gather() { t_output = outer_; }
+    Gather(const Gather&) = delete;
+    Gather& operator=(const Gather&) = delete;
+
+private:
+    Str* outer_;
+};
+}  // namespace
+
+SimRun::SimRun(const CommandLine& line, const CommandHooks& hooks) : impl_(new Impl(line, hooks)) {
+    const Gather gather(impl_->output);
+    if (impl_->open())
+        impl_->start();
+    else
+        impl_->done();
+}
+
+SimRun::~SimRun() {
+    delete impl_;
+}
+
+SimRun::Wants SimRun::wants() const noexcept {
+    return impl_->wants;
+}
+uint64_t SimRun::seed() const noexcept {
+    return impl_->seed;
+}
+double SimRun::step_seconds() const noexcept {
+    return impl_->stepper ? impl_->stepper->dt() : 0.0;
+}
+Context& SimRun::context() noexcept {
+    return impl_->loaded.ctx;
+}
+int SimRun::status() const noexcept {
+    return impl_->status;
+}
+
+void SimRun::ready() {
+    Impl& r = *impl_;
+    if (r.wants != Wants::Reset) return;
+    const Gather gather(r.output);
+    r.stepper->begin();
+    r.wants = Wants::Steps;
+    if (r.stepper->done()) r.judge();
+}
+
+void SimRun::step() {
+    Impl& r = *impl_;
+    if (r.wants != Wants::Steps) return;
+    const Gather gather(r.output);
+    r.stepper->advance();
+    if (r.stepper->done()) r.judge();
+}
+
+void SimRun::stop() {
+    Impl& r = *impl_;
+    if (r.wants == Wants::Done) return;
+    const Gather gather(r.output);
+    if (r.wants == Wants::Steps) {  // a run waiting for its reset has not started
+        r.runs.push_back(r.stepper->stop());
+        r.print(r.runs.back());
+    }
+    r.finish(true);
+}
 
 namespace {
 // Where an option that takes text keeps it, or null.
@@ -597,7 +743,6 @@ int dispatch(const CommandLine& line, const CommandHooks& hooks) {
     if (line.command == "check") return check(line, hooks);
     if (line.command == "reference") return reference(line, hooks);
     if (line.command == "eval") return eval(line, hooks);
-    if (line.command == "sim") return run_scenarios(line, hooks);
     if (line.command == "compare") return compare(line);
     if (line.command == "diff" || line.command == "promote") {
         if constexpr (kShipping) {
@@ -613,25 +758,14 @@ int dispatch(const CommandLine& line, const CommandHooks& hooks) {
 }  // namespace
 
 int run_command(const CommandLine& line, const CommandHooks& hooks) {
+    if (line.command == "sim") return run_scenarios(line, hooks);  // a SimRun sends its own
     Str output;
-    Str* const outer = t_output;
-    t_output = &output;
-    int status = dispatch(line, hooks);
-    t_output = outer;
-    if (status < 0) return status;
-    // The output goes to the file the command line names, else to the host's sink, else to
-    // stdout: an engine that owns stdout keeps the result apart from its own lines.
-    if (!line.output.empty()) {
-        if (!write_whole(line.output, output)) {
-            err("cannot write " + Str(line.output) + "\n");
-            status = kCommandError;
-        }
-    } else if (hooks.output) {
-        hooks.output(output.view());
-    } else {
-        std::fwrite(output.data(), 1, output.size(), stdout);
+    int status = 0;
+    {
+        const Gather gather(output);
+        status = dispatch(line, hooks);
     }
-    return status;
+    return status < 0 ? status : send(line, hooks, output, status);
 }
 
 std::string_view command_help() noexcept {
@@ -649,7 +783,7 @@ std::string_view command_help() noexcept {
            "                                 baker.reply/1.1 line each, as the console answers\n"
            "  sim [--scenario NAME]... [--seed N | --seeds A-B] [--step-hz N] [--json]\n"
            "      [--results DIR]            the project's scenarios, judged by its objectives;\n"
-           "                                 --json: baker.sim/1; --results: what compare reads\n"
+           "                                 --json: baker.sim/1.1; --results: what compare reads\n"
            "  compare --before DIR --after DIR\n"
            "                                 which objectives moved: baker.compare/1\n"
            "every command also takes --output FILE: its output there, not on stdout\n";

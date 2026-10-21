@@ -1,4 +1,4 @@
-# Scenarios, `sim` and `compare`: schemas `baker.sim/1` and `baker.compare/1`
+# Scenarios, `sim` and `compare`: schemas `baker.sim/1.1` and `baker.compare/1`
 
 A scenario runs your game headless for a set number of seconds, then judges the run by its
 objectives. The host kit's `sim` command runs a project's scenarios and writes the results.
@@ -56,22 +56,55 @@ my_game compare --before DIR --after DIR
 ```
 
 - `--scenario` picks a scenario by its name, or by its file's name without `.dta`.
-- `sim` prints a line per run, or, with `--json`, the `baker.sim/1` document.
-- `--results DIR` also writes `results.json` (`baker.sim/1`) and `results.dta`, which is what
-  `compare` reads.
+- `sim` prints a line per run, or, with `--json`, the `baker.sim/1.1` document.
+- `--results DIR` also writes `results.json` (`baker.sim/1.1`) and `results.dta`, which is
+  what `compare` reads.
 - `compare` writes `baker.compare/1`.
 - Both exit 0 when everything passed (`sim`) or nothing broke (`compare`), 1 when something
   failed or broke, and 2 when they could not run.
 
-## `baker.sim/1`
+## A run your own loop advances
+
+`sim` steps your game through `CommandHooks::step`, many steps inside one call. An engine
+that owns its main loop advances its physics only inside that loop, a frame at a time, so
+its game cannot step on demand. Such a game drives a `baker::host::SimRun` from its frames
+instead, and the kit does the rest: it reads the scenarios, orders the runs, runs the
+commands when they are due, judges the objectives and writes the same output, with the same
+exit status, as `sim` through `run_command`.
+
+```cpp
+baker::host::SimRun run(line, hooks);           // line.command is "sim"
+// once a frame, on the thread that owns run.context():
+switch (run.wants()) {
+case baker::host::SimRun::Wants::Reset:         // reset your world with run.seed(),
+    if (world_ready()) run.ready();             // over as many frames as it takes
+    break;
+case baker::host::SimRun::Wants::Steps:         // your game took one fixed step of
+    run.step();                                 // run.step_seconds()
+    break;
+case baker::host::SimRun::Wants::Done:          // run.status() is the exit status, and
+    quit(run.status());                         // the output went where run_command sends it
+}
+```
+
+- The run counts steps, never time. Set your game's fixed rate to `step_seconds()`, which
+  is `--step-hz` in whole nanoseconds, and report one `step()` per fixed step.
+- `SimRun` sets `$seed`, then waits. It never calls `CommandHooks::reset` or `step`, and
+  frames spent waiting for a reset count no steps.
+- `stop()` ends early (a window closed, a timeout). The run in progress is kept as not
+  finished and not judged, runs not started are left out, the output is written so far, and
+  the status is 2.
+- A step with nothing due allocates nothing.
+
+## `baker.sim/1.1`
 
 ```json
 {
-  "schema": "baker.sim/1",
+  "schema": "baker.sim/1.1",
   "status": "passed",
   "runs": [
     {"scenario": "walk", "file": "sim/walk.dta", "line": 2, "seed": 0, "steps": 120,
-     "passed": true, "errors": [], "objectives": [
+     "finished": true, "passed": true, "errors": [], "objectives": [
        {"name": "scored", "file": "metrics/objectives.dta", "line": 4, "value": 0,
         "pass": false, "over": "median", "error": null},
        {"name": "steps", "file": "metrics/objectives.dta", "line": 2, "value": 120,
@@ -88,7 +121,10 @@ my_game compare --before DIR --after DIR
 }
 ```
 
-- `status` is `"passed"` or `"failed"`, as the exit code is 0 or 1.
+- `status` is `"passed"` or `"failed"`, as the exit code is 0 or 1, or `"stopped"` when a
+  `SimRun` was stopped before its last run ended (exit 2).
+- `finished` is false for a run that was stopped. It has the steps it took, no objectives,
+  and does not pass. (New in 1.1.)
 - `runs` are sorted by scenario, then seed. Each objective within a run is sorted by name.
   A run's `file` and `line` say where its scenario is declared. An objective's `file` and
   `line` say where the objective is declared.

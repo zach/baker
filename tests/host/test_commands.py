@@ -71,9 +71,9 @@ def reference(s):
     code, out, _ = s.run("reference", "--json", agent="")
     r = json.loads(out)
     names = [f["name"] for f in r["reference"]["functions"]]
-    expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.1" and "spawn" in names,
+    expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.2" and "spawn" in names,
            "reference --json: the game's functions")
-    expect(r["shapes"]["schema"] == "baker.shapes/1.1" and r["tweaks"]["schema"] == "baker.tweaks/1.1",
+    expect(r["shapes"]["schema"] == "baker.shapes/1.1" and r["tweaks"]["schema"] == "baker.tweaks/1.2",
            "reference --json: tweaks and shapes")
     code, out, _ = s.run("reference")
     expect(code == 0 and "spawn" in out, "reference: Markdown")
@@ -146,7 +146,7 @@ def scenarios(s):
     expect(code == 0 and "walk seed 1: passed" in out, "sim runs the project's scenarios")
     code, out, _ = s.run("sim", "--seeds", "0-2", "--json")
     r = json.loads(out)
-    expect(code == 0 and r["schema"] == "baker.sim/1" and len(r["runs"]) == 3 and
+    expect(code == 0 and r["schema"] == "baker.sim/1.1" and len(r["runs"]) == 3 and
            r["runs"][0]["file"].endswith("walk.dta") and r["runs"][0]["line"] == 2,
            "sim --json: every run, located")
     # The median of seeds 0-2 is 10: it passes, though seed 0 alone does not.

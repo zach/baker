@@ -192,6 +192,9 @@ private:
 //
 //   template <> struct baker::Convert<Vec2> {
 //       static constexpr std::string_view name = "vec2";   // optional; used in errors
+//       // optional: Baker's type of each value, for the reference and tools that check
+//       // data without the game (DescribedTweaks)
+//       static constexpr std::string_view values[] = {"float32", "float32"};
 //       static bool from(const baker::Values& v, Vec2& out) {
 //           return v.size() >= 2 && v.read(0, out.x) && v.read(1, out.y);
 //       }
@@ -260,6 +263,28 @@ template <class T>
         return {"the requested type", ConvertKind::Compound};
     }
 }
+
+template <class T>
+inline constexpr std::string_view kValueType[1] = {convert_info<T>().name};
+
+// Baker's type of each value a T is written as: Convert<T>::values if it declares them, the
+// type itself for one of Baker's single-value types, else none.
+template <class T>
+[[nodiscard]] constexpr std::span<const std::string_view> value_types() noexcept {
+    if constexpr (requires { std::span<const std::string_view>(Convert<T>::values); })
+        return Convert<T>::values;
+    else if constexpr (convert_info<T>().kind != ConvertKind::Compound)
+        return kValueType<T>;
+    else
+        return {};
+}
+
+// Whether `type` is one of Baker's single-value types: "int8" to "uint64", "int", "float32",
+// "float", "bool", "symbol", "string", or "value" (any one value).
+[[nodiscard]] bool value_type_known(std::string_view type) noexcept;
+// Whether `values` hold a value of each of `types` in order, as a Convert that reads them
+// with Values::read would take them; false if a type is not one of Baker's.
+[[nodiscard]] bool reads_as(std::span<const std::string_view> types, const Values& values);
 
 // The double nearest the shortest decimal that reads back as `f`: 0.7f gives 0.7.
 [[nodiscard]] double float_to_decimal_double(float f) noexcept;

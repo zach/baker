@@ -125,13 +125,14 @@ int main(int argc, char** argv) {
 | `eval [--seed N] [--json] "{command}"...` | each command's result on the game reset with the seed; `--json`: one reply line each |
 | `diff [--layer L]` | what layer L (default `agent`) changes, value by value |
 | `promote [--from L] [--to T] [--write \| --patch FILE]` | what promoting L into T would write; `--write` writes; `--patch` writes a unified diff and nothing else |
-| `sim [--scenario NAME]... [--seed N \| --seeds A-B] [--step-hz N] [--json] [--results DIR]` | the project's scenarios run and judged by its objectives ([`baker.sim/1`](sim-json.md)); exit 1 when one fails |
+| `sim [--scenario NAME]... [--seed N \| --seeds A-B] [--step-hz N] [--json] [--results DIR]` | the project's scenarios run and judged by its objectives ([`baker.sim/1.1`](sim-json.md)); exit 1 when one fails |
 | `compare --before DIR --after DIR` | which objectives broke or were fixed between two `sim --results` ([`baker.compare/1`](sim-json.md)) |
 
 Each runs on a fresh Context with your functions bound (`CommandHooks::bind`), the stack
 opened as the game opens it, and, for `eval`, your state reset (`CommandHooks::reset`).
 `sim` steps your game with `CommandHooks::step`, and `check` reads the project's scenarios
-and objectives with the data. `extra_trees` adds other files of your own to `check`. The exit status is 0, 1
+and objectives with the data. A game that can only step inside its engine's main loop
+drives a `SimRun` from its frames instead ([how](sim-json.md#a-run-your-own-loop-advances)). `extra_trees` adds other files of your own to `check`. The exit status is 0, 1
 when something failed, 2 when it could not run. In a shipping build, `diff` and `promote`
 refuse. A tool reads the commands' standard output as the document itself, so your
 functions and `#autorun` must print nothing there while a command runs. Where that cannot

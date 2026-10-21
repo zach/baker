@@ -1,6 +1,7 @@
 // baker::check and the generated reference (M4).
 #include <doctest.h>
 #include <baker/config.hpp>
+#include <baker/object.hpp>
 #include <baker/parse.hpp>
 #include <baker/script.hpp>
 #include <baker/std_interop.hpp>
@@ -525,7 +526,9 @@ TEST_CASE("a declared function keeps its status, and a description it cannot exp
     const OverloadDescription run[] = {{fast, "nothing"}};
     auto unknown = ctx.declare("run", run);
     REQUIRE_FALSE(unknown);
-    CHECK(unknown.error().message() == "cannot declare 'run': this Context has no type \"speed\"");
+    CHECK(unknown.error().message() ==
+          "cannot declare 'run': this Context has no type \"speed\", and its "
+          "description gives no value types of Baker's");
     CHECK_FALSE(ctx.has_func("run"));
     REQUIRE(ctx.func("walk", [](Speed) {}));
     REQUIRE(ctx.declare("run", run));
@@ -685,4 +688,110 @@ TEST_CASE("check of a Config holds its data to the tweaks it binds") {
     check(none, ctx, quiet);
     CHECK(quiet.tweak_errors.empty());
     CHECK(quiet.ok());
+}
+
+namespace {
+struct Vec2 {
+    float x = 0, y = 0;
+};
+}  // namespace
+
+template <>
+struct baker::Convert<Vec2> {
+    static constexpr std::string_view name = "vec2";
+    static constexpr std::string_view values[] = {"float32", "float32"};
+    static bool from(const Values& v, Vec2& out) {
+        return v.size() >= 2 && v.read(0, out.x) && v.read(1, out.y);
+    }
+};
+
+namespace {
+struct Unit : Object<Unit> {
+    static void bind(Binder<Unit>& b) {
+        b.name("Unit");
+        b.method("move", [](Unit&, Vec2) {});
+        b.method("hold", [](Unit&) {});
+    }
+};
+struct Tank : Object<Tank, Unit> {
+    static void bind(Binder<Tank>& b) {
+        b.name("Tank");
+        b.method("fire", [](Tank&, int64_t n) { return n; });
+    }
+};
+}  // namespace
+
+TEST_CASE("types, objects and game value types declared from the reference check as the game's") {
+    // The game: a type with a base, a named object of it, and a function taking a vec2.
+    Context game;
+    game.add_type<Tank>();
+    Tank tank;
+    REQUIRE(game.add(tank, "tank"));
+    REQUIRE(game.func("aim", [](Vec2) {}));
+
+    // A tool, from the reference's description of the same.
+    Context tool;
+    static constexpr std::string_view kVec2[] = {"float32", "float32"};
+    const ParamDescription move[] = {{.type = "vec2", .values = kVec2}};
+    const ParamDescription fire[] = {{"int"}};
+    const OverloadDescription move_o[] = {{move, "nothing"}};
+    const OverloadDescription hold_o[] = {{{}, "nothing"}};
+    const OverloadDescription fire_o[] = {{fire, "int"}};
+    const MethodDescription unit_methods[] = {{"move", move_o}, {"hold", hold_o}};
+    const MethodDescription tank_methods[] = {{"fire", fire_o}};
+    const Symbol tank_bases[] = {Symbol("Unit")};
+    REQUIRE(tool.declare_type("Unit", {}, unit_methods));
+    REQUIRE(tool.declare_type("Tank", tank_bases, tank_methods));
+    REQUIRE(tool.declare_object("tank", "Tank"));
+    const OverloadDescription aim_o[] = {{move, "nothing"}};
+    REQUIRE(tool.declare("aim", aim_o));
+
+    const auto tree = parse(
+        "{tank move (1 2)}\n{tank move 1}\n{tank hold}\n{tank hold 1}\n{tank fire 3}\n"
+        "{tank fire x}\n{tank flyy}\n{aim (0 1)}\n{aim 1}\n{aim (0 x)}\n{tank type}\n",
+        "level.dta");
+    const CheckReport a = check(*tree, game);
+    const CheckReport b = check(*tree, tool);
+    REQUIRE(a.errors.size() == 5);  // lines 2, 4, 6, 9 and 10
+    REQUIRE(b.errors.size() == a.errors.size());
+    for (size_t i = 0; i < a.errors.size(); ++i)
+        CHECK(to_string(b.errors[i]) == to_string(a.errors[i]));
+    // A method the type does not have is demand, as for the game: a gate fails on it.
+    REQUIRE(a.demand.size() == 1);
+    REQUIRE(b.demand.size() == 1);
+    CHECK(b.demand[0].name == a.demand[0].name);
+    CHECK(b.demand[0].on == a.demand[0].on);
+
+    // The value types are in the reference, and a declared method or object never runs.
+    std::string json;
+    write_reference_json(game, string_out(json));
+    CHECK(json.find(R"j({"type": "vec2", "kind": "value", "raw": false, )j"
+                    R"j("values": ["float32", "float32"]})j") != std::string::npos);
+    CHECK_FALSE(tool.eval("{tank hold}", "run.dta"));
+}
+
+TEST_CASE("a type or object description check cannot hold is refused, naming it") {
+    Context ctx;
+    const Symbol unknown_base[] = {Symbol("Vehicle")};
+    auto r = ctx.declare_type("Tank", unknown_base, {});
+    REQUIRE_FALSE(r);
+    CHECK(std::string(r.error().message()).find("'Tank'") != std::string::npos);
+    CHECK(std::string(r.error().message()).find("'Vehicle'") != std::string::npos);
+
+    const ParamDescription bad[] = {{"vec3"}};  // a game type with no value types
+    const OverloadDescription bad_o[] = {{bad, "nothing"}};
+    const MethodDescription methods[] = {{"move", bad_o}};
+    r = ctx.declare_type("Tank", {}, methods);
+    REQUIRE_FALSE(r);
+    CHECK(std::string(r.error().message()).find("'move'") != std::string::npos);
+
+    REQUIRE(ctx.declare_type("Tank", {}, {}));
+    CHECK_FALSE(ctx.declare_type("Tank", {}, {}));  // already a type
+    auto o = ctx.declare_object("tank", "Plane");
+    REQUIRE_FALSE(o);
+    CHECK(std::string(o.error().message()).find("'Plane'") != std::string::npos);
+    REQUIRE(ctx.func("boom", [] {}));
+    CHECK_FALSE(ctx.declare_object("boom", "Tank"));  // already a function
+    REQUIRE(ctx.declare_object("tank", "Tank"));
+    CHECK_FALSE(ctx.declare_object("tank", "Tank"));  // already an object
 }

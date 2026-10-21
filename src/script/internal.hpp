@@ -290,6 +290,15 @@ struct Context::Impl {
     Vec<uint32_t> free_slots{alloc};
     Vec<ObjectHandle> by_name{alloc};  // by Symbol::index()
     Vec<const detail::TypeRecord*> types{alloc};
+    // Types and objects a tool declared from the reference, for check(): the types are the
+    // Context's to free; an object is a name and its type.
+    Vec<detail::TypeRecord*> declared_types{alloc};
+    Vec<std::pair<Symbol, Symbol>> declared_objects{alloc};
+    [[nodiscard]] Symbol declared_object(Symbol name) const noexcept {
+        for (const auto& [n, type] : declared_objects)
+            if (n == name) return type;
+        return {};
+    }
     Vec<Own<ScriptClass>> classes{alloc};
     Vec<ScriptClass*> class_by_name{alloc};  // by Symbol::index()
     // Bit per Symbol::index(): some {class} has a handler of that name. The usual answer

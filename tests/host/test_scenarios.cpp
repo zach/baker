@@ -172,7 +172,7 @@ TEST_CASE("sim: results are data that reads back, located") {
     CHECK(back[0].errors[0].message() == runs[0].errors[0].message());
 
     const std::string json(sim::results_json(runs, {}).view());
-    CHECK(json.find("\"schema\": \"baker.sim/1\"") != std::string::npos);
+    CHECK(json.find("\"schema\": \"baker.sim/1.1\"") != std::string::npos);
 }
 
 TEST_CASE("sim: an objective (over median) is judged by its median over a scenario's seeds") {

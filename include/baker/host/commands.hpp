@@ -21,7 +21,7 @@
 //                                  runs the project's scenarios (all, or those named, by
 //                                  name or file name) for each seed, stepping the game
 //                                  (`step`) at N Hz (default 60), then judges them by its
-//                                  objectives; --json: baker.sim/1; --results: DIR gets
+//                                  objectives; --json: baker.sim/1.1; --results: DIR gets
 //                                  results.json and results.dta, what compare reads. Exit 1
 //                                  if an objective failed
 //   compare --before DIR --after DIR
@@ -119,6 +119,54 @@ struct CommandHooks {
 // not one, for the host's own commands. Its output goes to `line.output`'s file, else to
 // `hooks.output`, else to stdout; messages for a person go to stderr.
 [[nodiscard]] int run_command(const CommandLine& line, const CommandHooks& hooks);
+
+// A `sim` the host advances from its own loop, one fixed step per frame: for an engine that
+// steps its game only inside its main loop, where a call that runs one step and comes back
+// (`CommandHooks::step`) cannot be written. The kit does the rest of `sim` as run_command
+// does, and the runs, output and exit status are the same. Every call is made on the thread
+// that owns context(), between frames.
+//
+//   baker::host::SimRun run(line, hooks);   // line.command is "sim"
+//   // once a frame:
+//   if (run.wants() == SimRun::Wants::Reset && world_reset_with(run.seed())) run.ready();
+//   else if (run.wants() == SimRun::Wants::Steps) run.step();  // one step_seconds() passed
+//   else if (run.wants() == SimRun::Wants::Done) return run.status();
+class SimRun {
+public:
+    enum class Wants : uint8_t {
+        Reset,  // the game reset with seed(), over as many frames as it takes; then ready()
+        Steps,  // a fixed step of step_seconds() of the game, then step()
+        Done,   // status() is the exit status; the output went where run_command sends it
+    };
+    // Loads the stack as run_command does, binding the game's functions to context(), and
+    // reads the scenarios. Done at once if it cannot run (status() 2, the reason on stderr).
+    // `hooks` must outlive the run; it does not use `reset` or `step`.
+    SimRun(const CommandLine& line, const CommandHooks& hooks);
+    ~SimRun();
+    SimRun(const SimRun&) = delete;
+    SimRun& operator=(const SimRun&) = delete;
+
+    [[nodiscard]] Wants wants() const noexcept;
+    [[nodiscard]] uint64_t seed() const noexcept;  // the run's seed; $seed is set
+    // One step, as the run counts it: 1 / --step-hz, in whole nanoseconds. Set the game's
+    // fixed rate to match.
+    [[nodiscard]] double step_seconds() const noexcept;
+    [[nodiscard]] Context& context() noexcept;
+
+    // The game is reset: the start commands run, and what is due at 0.
+    void ready();
+    // One step passed: the scheduler ticks, what is due runs; at the scenario's end the run
+    // is judged and the next one wants its reset. A step with nothing due allocates nothing.
+    void step();
+    // Ends now (a window closed, a timeout): the run in progress is kept, not finished and
+    // not judged, and the output is written so far, with status 2.
+    void stop();
+    [[nodiscard]] int status() const noexcept;
+
+private:
+    struct Impl;
+    Impl* impl_;
+};
 
 // The commands and flags above, for a host's usage text. It leaves out --project, which a
 // host may read under a name of its own (a data directory, say) and set in CommandLine.

@@ -88,14 +88,24 @@ struct Checker {
         defined[*name] = {params->size(), stub, a.file()};
     }
 
+    // A literal argument against the value types of a parameter of a type only described,
+    // as Values::read reads a compound value: an array as its contents, else the one value.
+    static bool reads_values(std::span<const std::string_view> types, const Node& n) {
+        const Array* a = n.try_array();
+        return detail::reads_as(
+            types, a ? Values(a->nodes(), a) : Values(std::span<const Node>(&n, 1), nullptr));
+    }
+
     // Whether `o` accepts every literal argument of `command`, from index `first`.
     static bool fits(const detail::Overload& o, const Array& command, size_t first) {
         const size_t n = command.size() - first;
         for (size_t i = 0; i < n && i < o.params.size(); ++i) {
             const detail::ParamInfo& p = o.params[i];
             if (p.kind == detail::ParamKind::Rest) return true;
-            if (!p.match || evaluable(command[i + first])) continue;
-            if (!p.match(command[i + first], true)) return false;
+            if (evaluable(command[i + first])) continue;
+            if (p.match ? !p.match(command[i + first], true)
+                        : !p.values().empty() && !reads_values(p.values(), command[i + first]))
+                return false;
         }
         return true;
     }
@@ -189,6 +199,10 @@ struct Checker {
         }
         if (const Context::Impl::Slot* s = impl.slot(impl.named(*name))) {
             send(command, Symbol(impl.class_name(*s)), s->script ? nullptr : &s->object->type());
+            return;
+        }
+        if (const Symbol type = impl.declared_object(*name); !type.empty()) {
+            send(command, type, impl.type_named(type));
             return;
         }
         if (auto it = objects.find(*name); it != objects.end()) {
@@ -632,7 +646,7 @@ Str reference_text(const Context& ctx, const LoadSession* packs) {
     return out;
 }
 
-// --- The reference as JSON (baker.reference/1.1, docs/reference-json.md) ---
+// --- The reference as JSON (baker.reference/1.2, docs/reference-json.md) ---
 
 const char* param_kind_name(detail::ParamKind k) {
     switch (k) {
@@ -663,10 +677,21 @@ void json_overloads(Str& out, const Vec<detail::Overload>& overloads) {
         for (size_t j = 0; j < o.params.size(); ++j) {
             const detail::ParamInfo& p = o.params[j];
             out += j ? ", {\"type\": " : "{\"type\": ";
-            json_string(out, p.type);
+            json_string(out, p.type());
             out += ", \"kind\": ";
             json_string(out, param_kind_name(p.kind));
-            out += Str(", \"raw\": ") + (p.raw ? "true" : "false") + "}";
+            out += Str(", \"raw\": ") + (p.raw ? "true" : "false") + ", \"values\": ";
+            if (p.values().empty()) {
+                out += "null";
+            } else {
+                out += '[';
+                for (size_t k = 0; k < p.values().size(); ++k) {
+                    if (k) out += ", ";
+                    json_string(out, p.values()[k]);
+                }
+                out += ']';
+            }
+            out += '}';
         }
         out += "], \"result\": ";
         json_string(out, o.result);
@@ -688,7 +713,7 @@ void json_status(Str& out, Status status, Symbol replacement, std::string_view d
 
 Str reference_json(const Context& ctx, const LoadSession* packs) {
     const Context::Impl& impl = ctx.impl();
-    Str out = "{\n  \"schema\": \"baker.reference/1.1\",\n  \"functions\": [";
+    Str out = "{\n  \"schema\": \"baker.reference/1.2\",\n  \"functions\": [";
     Vec<const Function*> fs;
     for (const auto& f : impl.functions)
         if (!f->overloads.empty()) fs.push_back(f.get());

@@ -161,10 +161,10 @@ Str signature_text(const detail::Overload& o) {
         if (out.size() > 1) out += ' ';
         if (p.kind == detail::ParamKind::Optional) {
             out += '[';
-            out += p.type;
+            out += p.type();
             out += ']';
         } else {
-            out += p.type;
+            out += p.type();
         }
     }
     return out + ")";
@@ -202,6 +202,7 @@ Node* Context::Impl::cell(Symbol name) {
 }
 
 Context::Impl::~Impl() {
+    for (detail::TypeRecord* t : declared_types) detail::destroy(default_allocator(), t);
     constexpr size_t cells = size_t{1} << kPageBits;
     for (Node* p : pages) {
         if (!p) continue;
@@ -637,21 +638,44 @@ struct Declared {
     // `infos`: each parameter's kind, match, and raw, as checked; its type is `od`'s.
     Declared(const Allocator& a, Symbol n, const OverloadDescription& od,
              const detail::ParamInfo* infos)
-        : name(n), params(a), names(a), result(a) {
+        : name(n), params(a), names(a), values(a), texts(a), result(a) {
         result = od.result;
-        size_t length = 0;
-        for (const ParamDescription& p : od.params) length += p.type.size();
-        names.reserve(length);  // so the views below stay where they point
-        for (size_t i = 0; i < od.params.size(); ++i) {
-            const size_t at = names.size();
-            names += od.params[i].type;
-            params.push_back(infos[i]);
-            params.back().type = names.view().substr(at, od.params[i].type.size());
+        // A parameter's value types: the description's, or a type of Baker's own, as the
+        // game's native parameter has them.
+        auto given = [](const ParamDescription& p) {
+            return !p.values.empty() || !detail::value_type_known(p.type)
+                       ? p.values
+                       : std::span<const std::string_view>(&p.type, 1);
+        };
+        size_t length = 0, count = 0;
+        for (const ParamDescription& p : od.params) {
+            length += p.type.size();
+            for (const std::string_view v : given(p)) length += v.size();
+            count += given(p).size();
         }
+        names.reserve(length);  // so the views below stay where they point
+        values.reserve(count);
+        texts.reserve(od.params.size());
+        for (size_t i = 0; i < od.params.size(); ++i) {
+            const ParamDescription& p = od.params[i];
+            const std::string_view type = keep(p.type);
+            const size_t first = values.size();
+            for (const std::string_view v : given(p)) values.push_back(keep(v));
+            texts.push_back({type, {values.data() + first, given(p).size()}});
+            params.push_back(infos[i]);
+            params.back().text = &texts.back();
+        }
+    }
+    std::string_view keep(std::string_view text) {
+        const size_t at = names.size();
+        names += text;
+        return names.view().substr(at, text.size());
     }
     Symbol name;
     Vec<detail::ParamInfo> params;
-    Str names;  // every parameter's type name, one after the other
+    Str names;                     // every type name, one after the other
+    Vec<std::string_view> values;  // every parameter's value types, one after the other
+    Vec<detail::ParamText> texts;  // what params point to
     Str result;
 };
 
@@ -705,13 +729,19 @@ bool builtin_match(std::string_view type, Match& match) {
     return false;
 }
 
+// A type of the game's own the description gives the value types of: checked by them.
+bool described(const ParamDescription& p) {
+    return !p.values.empty() && std::all_of(p.values.begin(), p.values.end(),
+                                            [](auto v) { return detail::value_type_known(v); });
+}
+
 // A type a native function or method of this Context takes (a host's own, `vec2`), with
 // the check its parameter makes.
 bool registered_match(const Context::Impl& impl, std::string_view type, Match& match) {
     auto in = [&](const Vec<detail::Overload>& overloads) {
         for (const detail::Overload& o : overloads)
             for (const detail::ParamInfo& p : o.params)
-                if (p.type == type && p.match) {
+                if (p.type() == type && p.match) {
                     match = p.match;
                     return true;
                 }
@@ -725,24 +755,19 @@ bool registered_match(const Context::Impl& impl, std::string_view type, Match& m
     return false;
 }
 
-}  // namespace
-
-Expected<FuncRef> Context::declare(Symbol name, std::span<const OverloadDescription> overloads) {
-    auto refuse = [&](std::string_view why) {
-        return Unexpected(
-            make_error(ErrorCode::Type, "cannot declare " + quoted(name) + ": " + Str(why)));
-    };
-    if (overloads.empty()) return refuse("it has no overloads");
-    // Every overload is built before any is added, so a description with a mistake adds
-    // nothing.
-    Vec<detail::Overload> built(impl_->alloc);
-    Vec<detail::ParamInfo> infos(impl_->alloc);
+// Builds each overload of `name` from its description into `built`; why not, if one
+// cannot be, and then `built` is not to be added.
+std::optional<Str> build_described(Context::Impl& impl, Symbol name,
+                                   std::span<const OverloadDescription> overloads,
+                                   Vec<detail::Overload>& built) {
+    if (overloads.empty()) return Str("it has no overloads");
+    Vec<detail::ParamInfo> infos(impl.alloc);
     for (const OverloadDescription& od : overloads) {
         detail::Overload o;
         infos.clear();
         for (const ParamDescription& p : od.params) {
             detail::ParamInfo info{};
-            if (o.max_args == UINT32_MAX) return refuse("a parameter follows the rest parameter");
+            if (o.max_args == UINT32_MAX) return Str("a parameter follows the rest parameter");
             if (p.kind == "value")
                 info.kind = detail::ParamKind::Value;
             else if (p.kind == "raw")
@@ -752,10 +777,12 @@ Expected<FuncRef> Context::declare(Symbol name, std::span<const OverloadDescript
             else if (p.kind == "rest")
                 info.kind = detail::ParamKind::Rest;
             else
-                return refuse("a parameter's kind is \"" + Str(p.kind) +
-                              "\", not value, raw, optional, or rest");
-            if (!builtin_match(p.type, info.match) && !registered_match(*impl_, p.type, info.match))
-                return refuse("this Context has no type \"" + Str(p.type) + "\"");
+                return "a parameter's kind is \"" + Str(p.kind) +
+                       "\", not value, raw, optional, or rest";
+            if (!builtin_match(p.type, info.match) && !registered_match(impl, p.type, info.match) &&
+                !described(p))
+                return "this Context has no type \"" + Str(p.type) +
+                       "\", and its description gives no value types of Baker's";
             info.raw = p.raw || info.kind == detail::ParamKind::Raw;
             infos.push_back(info);
             if (info.kind == detail::ParamKind::Rest) {
@@ -766,17 +793,76 @@ Expected<FuncRef> Context::declare(Symbol name, std::span<const OverloadDescript
             }
         }
         o.callable =
-            detail::Shared::make_in<Declared>(impl_->alloc, impl_->alloc, name, od, infos.data());
+            detail::Shared::make_in<Declared>(impl.alloc, impl.alloc, name, od, infos.data());
         const auto& d = *static_cast<const Declared*>(o.callable.get());
         o.thunk = &call_declared;
         o.params = std::span<const detail::ParamInfo>(d.params.data(), d.params.size());
         o.result = d.result.view();
         built.push_back(std::move(o));
     }
+    return std::nullopt;
+}
+
+}  // namespace
+
+Expected<FuncRef> Context::declare(Symbol name, std::span<const OverloadDescription> overloads) {
+    auto refuse = [&](std::string_view why) {
+        return Unexpected(
+            make_error(ErrorCode::Type, "cannot declare " + quoted(name) + ": " + Str(why)));
+    };
+    // Every overload is built before any is added, so a description with a mistake adds
+    // nothing.
+    Vec<detail::Overload> built(impl_->alloc);
+    if (auto why = build_described(*impl_, name, overloads, built)) return refuse(*why);
     Expected<FuncRef> ref = refuse("unreachable");
     for (detail::Overload& o : built)
         if (ref = add_overload(name, std::move(o)); !ref) return ref;
     return ref;
+}
+
+Expected<void> Context::declare_type(Symbol name, std::span<const Symbol> bases,
+                                     std::span<const MethodDescription> methods) {
+    auto refuse = [&](std::string_view why) {
+        return Unexpected(
+            make_error(ErrorCode::Type, "cannot declare type " + quoted(name) + ": " + Str(why)));
+    };
+    if (name.empty()) return refuse("it has no name");
+    if (impl_->type_named(name)) return refuse("this Context already has a type of that name");
+    Vec<const detail::TypeRecord*> found(impl_->alloc);
+    for (const Symbol b : bases) {
+        const detail::TypeRecord* t = impl_->type_named(b);
+        if (!t) return refuse("its base " + quoted(b) + " is not a type this Context knows");
+        found.push_back(t);
+    }
+    Vec<Vec<detail::Overload>> built(impl_->alloc);
+    for (const MethodDescription& m : methods) {
+        built.emplace_back(impl_->alloc);
+        if (auto why = build_described(*impl_, m.name, m.overloads, built.back()))
+            return refuse("method " + quoted(m.name) + ": " + *why);
+    }
+    detail::TypeRecord* type = detail::new_type_record(name.str());
+    for (const detail::TypeRecord* b : found) detail::inherit(*type, *b);
+    for (size_t i = 0; i < methods.size(); ++i)
+        for (detail::Overload& o : built[i])
+            (void)detail::add_method(*type, methods[i].name, std::move(o));
+    type->sort();
+    impl_->declared_types.push_back(type);
+    add_type(*type);
+    return {};
+}
+
+Expected<void> Context::declare_object(Symbol name, Symbol type) {
+    auto refuse = [&](std::string_view why) {
+        return Unexpected(
+            make_error(ErrorCode::Type, "cannot declare object " + quoted(name) + ": " + Str(why)));
+    };
+    if (!impl_->type_named(type))
+        return refuse("its type " + quoted(type) + " is not a type this Context knows");
+    if (impl_->find(name) || impl_->slot(impl_->named(name)) ||
+        !impl_->declared_object(name).empty())
+        return refuse("it is already a function or an object");
+    impl_->declared_objects.emplace_back(name, type);
+    return {};
 }
 
 FuncRef& FuncRef::doc(std::string_view text) {

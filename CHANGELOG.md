@@ -3,6 +3,43 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.4.0 - 2026-10-21
+
+- **New in the host kit: a scenario run your own loop advances.** `sim` steps your game
+  through `CommandHooks::step`, many steps inside one call. An engine that owns its main loop
+  advances its physics only inside that loop, so its game cannot step on demand.
+  `baker::host::SimRun` lets such a game run the kit's scenarios from its frames.
+  - **How it works.** It asks for a reset with each run's seed, which your world may take
+    several frames to do; call `ready()` when it is done. Then call `step()` once per fixed
+    step of `step_seconds()`.
+  - **What the kit still does.** It runs the scenario's commands when they are due, judges
+    the objectives, and writes the same output, with the same exit status, as `sim`.
+  - **Stopping.** `stop()` ends early: the run in progress is kept as not finished, and the
+    exit status is 2.
+  - **Cost.** A step with nothing due allocates nothing.
+- **New: check data against the game's tweaks without the game.** A tool that has the game's
+  reference but not its code can now hold data to every tweak, including those of the game's
+  own types.
+  - **`DescribedTweaks`** (`<baker/tweak.hpp>`) registers a tweak from its description, as
+    `baker.tweaks` writes it, with one call for every type. `check_tweaks` then finds what
+    the game's own `check` finds: `(aim 1)` where a `vec2` is wanted fails in the tool too.
+  - **A type of your own** describes its values by declaring them in its converter:
+    `static constexpr std::string_view values[] = {"float32", "float32"};`.
+  - **`baker.tweaks/1.2`** adds `values`, Baker's type of each of a tweak's values, and
+    `TweakBase::value_types()` gives the same in code.
+- **New: check calls on objects, and values of game types, without the game.** A tool can
+  now declare the rest of the reference, as it declares functions with `Context::declare`.
+  - `Context::declare_type` declares a type with its bases and methods, and
+    `Context::declare_object` a named object of it. `check` then holds
+    `{tank fire 3}` to the type's methods as the game's `check` does.
+  - A parameter of a type of the game's own, such as a `vec2`, is checked by the value
+    types its converter declares, so `{aim 1}` where a `vec2` is wanted is an error.
+  - **`baker.reference/1.2`** adds `values` to each parameter. `ParamDescription` takes it.
+  - **What breaks:** `detail::ParamInfo` keeps its type name behind `text`; read it with
+    `type()`. Only code that reads the parameter tables directly is affected.
+- **Changed: `sim`'s JSON is `baker.sim/1.1`.** Each run gains `finished`, and the status may
+  be `"stopped"`. Readers of 1.0 keep working, since nothing was removed or renamed.
+
 ## 0.3.0 - 2026-10-21
 
 - **New: `check` holds the data to the tweaks your game declares.** A value a tweak cannot
