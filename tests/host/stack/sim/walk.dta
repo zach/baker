@@ -1,0 +1,5 @@
+; Two seconds of steps: the score is the seed's, ten each.
+(scenario walk (desc "Walk for two seconds")
+   (seconds 2)
+   (at 1 {spawn grunt 1})
+   (objectives steps scored))

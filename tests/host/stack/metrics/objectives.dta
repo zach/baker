@@ -1,0 +1,5 @@
+; What the test game's scenarios are judged by.
+(objective steps (desc "Every step is taken")
+   (measure {+ $ticks 0}) (pass {== $value 120}))
+(objective scored (over median)
+   (measure {+ $score 0}) (pass {>= $value 10}))

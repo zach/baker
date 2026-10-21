@@ -119,6 +119,9 @@ and the game and every tool read it.
    (include_dirs "data")              ; searched after an including file's directory
    (defines PC)                       ; flags, as #ifdef sees them
    (reference "build/reference.json") ; for tools: where the build writes the reference
+   (tool "build/bin/my_game")         ; for tools: the binary that answers the commands
+   (scenarios "sim")                  ; for sim: scenarios and objectives (docs/sim-json.md)
+   (objectives "metrics")
    (layers                            ; bottom to top
       (default "data/default.dta")
       (local "data/local.dta" optional dev_only)

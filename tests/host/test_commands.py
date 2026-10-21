@@ -40,7 +40,7 @@ class Stack:
 def check(s):
     code, out, _ = s.run("check")
     r = json.loads(out)
-    expect(code == 0 and r["passed"] and r["schema"] == "baker.check/1.2", "clean data passes")
+    expect(code == 0 and r["passed"] and r["schema"] == "baker.check/1.3", "clean data passes")
     code, out, err = s.run("check", agent="(waves {spawnn grunt 3})\n")
     r = json.loads(out)
     expect(code == 1 and [d["name"] for d in r["demand"]] == ["spawnn"] and "spawnn" in err,
@@ -54,11 +54,11 @@ def check(s):
            "data that does not load is a load problem, exit 2")
     # The game's own files, checked beside its data.
     (s.dir / "scenario.dta").write_text("(steps {spawn grunt})\n")
-    code, out, _ = s.run("check", "--scenario", "scenario.dta", agent="")
+    code, out, _ = s.run("check", "--extra", "scenario.dta", agent="")
     r = json.loads(out)
     expect(code == 1 and any("takes 2 arguments" in e["message"] for e in r["errors"]),
            "the game's extra trees are checked")
-    code, out, _ = s.run("check", "--scenario", "missing.dta", agent="")
+    code, out, _ = s.run("check", "--extra", "missing.dta", agent="")
     r = json.loads(out)
     expect(code == 2 and len(r["load"]) == 1, "an extra tree that does not read: exit 2")
     # local.dta is left out, as the game asked.
@@ -139,6 +139,51 @@ def host_io(s):
     expect(code == 0 and out == "" and err == "3\n", "the host routes the output")
 
 
+def scenarios(s):
+    if sys.argv[3:] == ["shipping"]:
+        return
+    code, out, err = s.run("sim", "--seed", "1")
+    expect(code == 0 and "walk seed 1: passed" in out, "sim runs the project's scenarios")
+    code, out, _ = s.run("sim", "--seeds", "0-2", "--json")
+    r = json.loads(out)
+    expect(code == 0 and r["schema"] == "baker.sim/1" and len(r["runs"]) == 3 and
+           r["runs"][0]["file"].endswith("walk.dta") and r["runs"][0]["line"] == 2,
+           "sim --json: every run, located")
+    # The median of seeds 0-2 is 10: it passes, though seed 0 alone does not.
+    code, out, _ = s.run("sim", "--seed", "0", "--json")
+    expect(code == 1 and json.loads(out)["status"] == "failed",
+           "an objective that fails its median: exit 1")
+    code, _, err = s.run("sim", "--scenario", "nosuch")
+    expect(code == 2 and "no scenario" in err, "a scenario that is not there: exit 2")
+    code, out, _ = s.run("sim", "--scenario", "walk", "--step-hz", "30", "--json")
+    expect(code == 1 and json.loads(out)["runs"][0]["steps"] == 60,
+           "--step-hz sets the step rate (the steps objective wants 120)")
+    # compare: the same results, then an objective that broke.
+    expect(s.run("sim", "--seeds", "1-2", "--results", "before")[0] == 0,
+           "--results DIR writes the results")
+    expect((s.dir / "before" / "results.json").exists() and
+           (s.dir / "before" / "results.dta").exists(), "results.json and results.dta")
+    (s.dir / "data" / "agent.dta").write_text("")
+    (s.dir / "metrics" / "objectives.dta").write_text(
+        (s.dir / "metrics" / "objectives.dta").read_text().replace("120", "121"))
+    s.run("sim", "--seeds", "1-2", "--results", "after")
+    code, out, _ = s.run("compare", "--before", "before", "--after", "after")
+    r = json.loads(out)
+    steps = [o for o in r["objectives"] if o["name"] == "steps"]
+    expect(code == 1 and r["schema"] == "baker.compare/1" and r["broke"] == 1 and
+           steps and steps[0]["moved"] == "broke" and steps[0]["line"] == 2,
+           "compare: an objective that broke, located: exit 1")
+    code, out, _ = s.run("compare", "--before", "before", "--after", "before")
+    expect(code == 0 and json.loads(out)["broke"] == 0, "compare: nothing moved: exit 0")
+    code, _, _ = s.run("compare", "--before", "before", "--after", "nosuch")
+    expect(code == 2, "compare: results that are not there: exit 2")
+    # check reads the scenarios and objectives with the data.
+    (s.dir / "sim" / "walk.dta").write_text("(scenario walk (seconds 1) (start {spawn grunt}))\n")
+    code, out, _ = s.run("check")
+    expect(code == 1 and any("takes 2 arguments" in e["message"] for e in json.loads(out)["errors"]),
+           "check checks the scenarios' commands")
+
+
 def command_line(s):
     code, out, _ = s.run("hello")
     expect(code == 0 and out == "hello\n", "a command of the game's own")
@@ -153,7 +198,7 @@ def main():
         print(__doc__)
         return 2
     writes = shipping if sys.argv[3:] == ["shipping"] else diff_and_promote
-    for case in (check, reference, eval_json, writes, host_io, command_line):
+    for case in (check, reference, eval_json, writes, host_io, scenarios, command_line):
         case(Stack(sys.argv[1], sys.argv[2]))
     print(f"{len(FAILURES)} failures" if FAILURES else "all passed")
     return 1 if FAILURES else 0

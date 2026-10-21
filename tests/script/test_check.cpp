@@ -307,9 +307,10 @@ TEST_CASE("check's JSON is versioned, sorted, and the same bytes on every run") 
 
     // Without the session, the packs list is empty; an empty report is still a whole one.
     CHECK(to_json(CheckReport{}) ==
-          "{\n  \"schema\": \"baker.check/1.2\",\n  \"passed\": true,\n  \"errors\": [],\n"
+          "{\n  \"schema\": \"baker.check/1.3\",\n  \"passed\": true,\n  \"errors\": [],\n"
           "  \"warnings\": [],\n  \"demand\": [],\n  \"repeats\": [],\n  \"findings\": [],\n"
           "  \"load\": [],\n  \"shape_errors\": [],\n  \"shape_warnings\": [],\n"
+          "  \"tweak_errors\": [],\n  \"tweak_warnings\": [],\n"
           "  \"packs\": []\n}\n");
 }
 
@@ -658,4 +659,30 @@ TEST_CASE("every function Baker binds can be declared from its own reference, an
         ++compared;
     }
     CHECK(compared > 100);
+}
+
+TEST_CASE("check of a Config holds its data to the tweaks it binds") {
+    TweakRegistry reg;
+    Tweak<float> height{"jump.height", 120.0f, {.range = {16, 320}}, reg};
+    Tweak<int> buffer{"jump.buffer", 3, {}, reg};
+    Context ctx;
+    Config cfg({.tweaks = &reg});
+    REQUIRE(cfg.push_layer(
+        "default", ok(read_string("(jump (height 1000) (hieght 120) (buffer 3))", "d.dta"))));
+    CheckReport report;
+    check(cfg, ctx, report);
+    CHECK(report.tweak_errors.size() == 1);
+    CHECK(report.tweak_warnings.size() == 1);
+    CHECK_FALSE(report.ok());
+    std::string json;
+    write_json(report, string_out(json));
+    CHECK(json.find("\"tweak_errors\": [\n    {\"code\": \"range\", \"file\": \"d.dta\", "
+                    "\"line\": 1") != std::string::npos);
+
+    Config none({.tweaks = nullptr});  // no registry: nothing to hold the data to
+    REQUIRE(none.push_layer("default", ok(read_string("(jump (height 1000))", "d.dta"))));
+    CheckReport quiet;
+    check(none, ctx, quiet);
+    CHECK(quiet.tweak_errors.empty());
+    CHECK(quiet.ok());
 }

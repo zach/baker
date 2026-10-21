@@ -287,6 +287,12 @@ void check(const Config& cfg, const Context& ctx, CheckReport& report, const Che
     CheckOptions o = options;
     if (!o.packs) o.packs = &cfg.read_session();
     check(std::span<const Array* const>(trees.data(), trees.size()), ctx, report, o);
+    // The data against the tweaks the Config binds: what the game declares tunable.
+    if (const TweakRegistry* tweaks = cfg.tweak_registry()) {
+        TweakFindings f = check_tweaks(*cfg.root(), *tweaks);
+        report.tweak_errors = std::move(f.errors);
+        report.tweak_warnings = std::move(f.warnings);
+    }
 }
 
 Callback<void(const ValidatorStack&, const Callback<void(const Error&)>&)> check_validator(
@@ -311,6 +317,9 @@ void write(const CheckReport& report, TextSink text) {
     for (const Error& e : report.shape_errors) out += "shape: " + Str(baker::to_string(e)) + "\n";
     for (const Error& e : report.shape_warnings)
         out += "shape warning: " + Str(baker::to_string(e)) + "\n";
+    for (const Error& e : report.tweak_errors) out += "tweak: " + Str(baker::to_string(e)) + "\n";
+    for (const Error& e : report.tweak_warnings)
+        out += "tweak warning: " + Str(baker::to_string(e)) + "\n";
     for (const Error& w : report.warnings) out += "warning: " + Str(baker::to_string(w)) + "\n";
     for (const CheckReport::Demand& d : report.demand) {
         out += "demand: " + quoted(d.name);
@@ -390,7 +399,7 @@ void json_errors(Str& out, const char* key, const List<Error>& errors) {
 }  // namespace
 
 void write_json(const CheckReport& report, TextSink text, const LoadSession* packs) {
-    Str out = "{\n  \"schema\": \"baker.check/1.2\",\n";
+    Str out = "{\n  \"schema\": \"baker.check/1.3\",\n";
     out += Str("  \"passed\": ") + (report.ok() ? "true" : "false") + ",\n";
     json_errors(out, "errors", report.errors);
     out += ",\n";
@@ -440,6 +449,10 @@ void write_json(const CheckReport& report, TextSink text, const LoadSession* pac
     json_errors(out, "shape_errors", report.shape_errors);
     out += ",\n";
     json_errors(out, "shape_warnings", report.shape_warnings);
+    out += ",\n";
+    json_errors(out, "tweak_errors", report.tweak_errors);
+    out += ",\n";
+    json_errors(out, "tweak_warnings", report.tweak_warnings);
     out += ",\n";
 
     // Packs: the session's, by name; their harness metadata is the harness register.

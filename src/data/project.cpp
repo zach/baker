@@ -128,10 +128,19 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
             auto list = entries(*part, places, dir, false);
             if (!list) return Unexpected(std::move(list).error());
             (key == Symbol("defines") ? p.defines : p.pack_levels) = std::move(*list);
-        } else if (key == Symbol("include_dirs")) {
+        } else if (key == Symbol("include_dirs") || key == Symbol("scenarios") ||
+                   key == Symbol("objectives")) {
             auto list = entries(*part, places, dir, true);
             if (!list) return Unexpected(std::move(list).error());
-            p.include_dirs = std::move(*list);
+            (key == Symbol("scenarios")    ? p.scenarios
+             : key == Symbol("objectives") ? p.objectives
+                                           : p.include_dirs) = std::move(*list);
+        } else if (key == Symbol("tool")) {
+            std::string_view file;
+            if (part->size() != 2 || !text_of((*part)[1], file))
+                return Unexpected(places.at(*part, "the tool is (tool \"path\")"));
+            p.tool = joined(dir, file);
+            p.tool_at = places.of(*part, 1);
         } else if (key == Symbol("reference")) {
             std::string_view file;
             if (part->size() != 2 || !text_of((*part)[1], file))
@@ -175,7 +184,8 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
         } else {
             return Unexpected(places.at(*part, "a project has no '" + Str(key.str()) +
                                                    "': it holds pack_levels, include_dirs, "
-                                                   "defines, reference, and layers"));
+                                                   "defines, reference, tool, scenarios, "
+                                                   "objectives, and layers"));
         }
     }
     if (!has_layers) return Unexpected(places.at(*root, "a project needs (layers ...)"));

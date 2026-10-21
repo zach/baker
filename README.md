@@ -94,7 +94,7 @@ restarted.
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.2.1)
+FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.3.0)
 FetchContent_MakeAvailable(baker)
 target_link_libraries(game PRIVATE baker::baker)
 ```
@@ -210,6 +210,7 @@ Android: CMake builds get C++20 from the targets; with `ndk-build`, add
 - [`docs/script-reference.md`](docs/script-reference.md): every built-in, generated.
 - [`docs/reply-json.md`](docs/reply-json.md): one-line JSON replies for tools and consoles.
 - [`docs/reference-json.md`](docs/reference-json.md): the vocabulary, tweaks and shapes as JSON.
+- [`docs/sim-json.md`](docs/sim-json.md): scenarios, objectives, and their results as JSON.
 - [`CHANGELOG.md`](CHANGELOG.md): what each release changed.
 
 ## License

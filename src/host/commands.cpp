@@ -6,10 +6,13 @@
 
 #include "common/containers.hpp"
 #include "data/text.hpp"
+#include "host/scenarios.hpp"
 
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <optional>
+#include <tuple>
 
 #if BAKER_HOST_SHAPE
 #include <baker/shape.hpp>
@@ -65,6 +68,34 @@ bool load(Loaded& l, const CommandLine& line) {
     return static_cast<bool>(l.live.open(o));
 }
 
+// A whole number written in decimal digits.
+std::optional<uint64_t> whole(std::string_view s) {
+    if (s.empty()) return std::nullopt;
+    uint64_t n = 0;
+    for (const char c : s) {
+        if (c < '0' || c > '9') return std::nullopt;
+        n = n * 10 + static_cast<uint64_t>(c - '0');
+    }
+    return n;
+}
+
+// The scenarios and objectives the project names (its file's, or the stack built in code).
+Expected<void> read_book(const Loaded& l, sim::Book& book) {
+    Project read;
+    const Project* project = l.hooks.built;
+    if (!l.live.project_file().empty()) {
+        auto p = read_project(l.live.project_file().str(), l.hooks.reader);
+        if (!p) return Unexpected(std::move(p).error());
+        read = std::move(*p);
+        project = &read;
+    }
+    if (!project) return {};
+    for (const List<ProjectEntry>* list : {&project->objectives, &project->scenarios})
+        for (const ProjectEntry& e : *list)
+            if (auto r = book.read(e.value.str(), l.hooks.reader); !r) return r;
+    return {};
+}
+
 int report_check(CheckReport& report, const Loaded& l, const LoadSession* packs) {
     report.load = List<Error>(l.live.load_errors());
     write_json(report, stdout_sink(), packs);
@@ -86,20 +117,26 @@ int check(const CommandLine& line, const CommandHooks& hooks) {
         return kCommandError;
     }
     const Config& cfg = l.live.config();
+    auto unreadable = [&](const Error& e) {
+        report.load = List<Error>(std::span<const Error>(&e, 1));
+        write_json(report, stdout_sink(), &cfg.read_session());
+        out("\n");
+        err(describe(e));
+        err("\n");
+        return kCommandError;
+    };
+    // The project's scenarios and objectives, which an agent writes as it writes data, and
+    // the game's own extra files.
+    sim::Book book;
+    if (auto r = read_book(l, book); !r) return unreadable(r.error());
     List<Ref<Array>> trees;
     if (hooks.extra_trees) {
         auto t = hooks.extra_trees(cfg);
-        if (!t) {
-            report.load = List<Error>(std::span<const Error>(&t.error(), 1));
-            write_json(report, stdout_sink(), &cfg.read_session());
-            out("\n");
-            err(describe(t.error()));
-            err("\n");
-            return kCommandError;
-        }
+        if (!t) return unreadable(t.error());
         trees = std::move(*t);
     }
     Vec<const Array*> extra;
+    for (const Ref<Array>& t : book.trees) extra.push_back(t.get());
     for (const Ref<Array>& t : trees) extra.push_back(t.get());
     check(cfg, l.ctx, report, {.unresolved_fails = true},
           std::span<const Array* const>(extra.data(), extra.size()));
@@ -390,12 +427,116 @@ int promote(const CommandLine& line, const CommandHooks& hooks) {
     return 0;
 }
 
+// Runs the project's scenarios, each for each seed, and judges them by its objectives.
+int run_scenarios(const CommandLine& line, const CommandHooks& hooks) {
+    if (!hooks.step) {
+        err("sim: this game gives no step (CommandHooks::step), so it cannot run scenarios\n");
+        return kCommandError;
+    }
+    Loaded l(hooks);
+    if (!load(l, line)) return kCommandError;
+    sim::Book book;
+    if (auto r = read_book(l, book); !r) {
+        err(describe(r.error()));
+        err("\n");
+        return kCommandError;
+    }
+    // --scenario picks by scenario name, or by its file's name without .dta.
+    Vec<const sim::Scenario*> chosen;
+    for (const sim::Scenario& s : book.scenarios) {
+        const Str stem(fs::path(Str(s.file.str()).c_str()).stem().generic_string());
+        bool wanted = line.scenarios.empty();
+        for (const std::string_view n : line.scenarios)
+            wanted = wanted || n == s.name.str() || n == stem.view();
+        if (wanted) chosen.push_back(&s);
+    }
+    if (chosen.empty()) {
+        err(book.scenarios.empty() ? "sim: the project names no scenarios (scenarios ...)\n"
+                                   : "sim: no scenario by that name\n");
+        return kCommandError;
+    }
+    const sim::Game game{.reset = hooks.reset, .step = hooks.step};
+    const uint64_t last = line.seed_last ? line.seed_last : line.seed;
+    Vec<sim::Run> runs;
+    for (const sim::Scenario* s : chosen)
+        for (uint64_t seed = line.seed; seed <= last; ++seed) {
+            sim::Run r = sim::simulate(l.ctx, game, book, *s, seed, line.step_hz);
+            if (!line.json) {  // a line a person reads; the JSON has the rest
+                Str t = Str(r.scenario.str()) + " seed " +
+                        detail::decimal(static_cast<int64_t>(seed)) + ": " +
+                        (r.passed() ? "passed" : "FAILED");
+                for (const sim::ObjectiveResult& o : r.objectives)
+                    t += "  " + Str(o.name.str()) + " " +
+                         (o.failed ? "(" + Str(to_string(o.error)) + ")"
+                                   : sim::number_text(o.value) + (o.pass ? "" : " (fail)"));
+                for (const Error& e : r.errors) t += "\n  error: " + Str(to_string(e));
+                out(t + "\n");
+            }
+            runs.push_back(std::move(r));
+        }
+    const Vec<sim::Median> medians = sim::judge_medians(l.ctx, book, runs);
+    if (!line.json)
+        for (const sim::Median& m : medians)
+            out(Str(m.scenario.str()) + " median of " + detail::decimal(m.seeds) +
+                " seeds: " + (m.pass ? "passed" : "FAILED") + "  " + Str(m.objective.str()) + " " +
+                sim::number_text(m.value) + (m.failed ? "  " + Str(m.error.message()) : Str()) +
+                "\n");
+    const Str json = sim::results_json(runs, medians);
+    if (line.json) out(json);
+    if (!line.results.empty()) {
+        std::error_code ec;
+        const fs::path dir(Str(line.results).c_str());
+        fs::create_directories(dir, ec);
+        if (!write_whole((dir / "results.json").generic_string(), json) ||
+            !write_whole((dir / "results.dta").generic_string(), sim::results_dta(runs, medians))) {
+            err("sim: cannot write to " + Str(line.results) + "\n");
+            return kCommandError;
+        }
+    }
+    return sim::all_passed(runs, medians) ? 0 : kCommandFailed;
+}
+
+// Which objectives moved between two `sim --results` directories, without running anything.
+int compare(const CommandLine& line) {
+    if (line.before.empty() || line.after.empty()) {
+        err("compare needs --before DIR --after DIR, each written by sim --results\n");
+        return kCommandError;
+    }
+    Vec<sim::Run> before, after;
+    Vec<sim::Median> medians_before, medians_after;
+    for (const auto& [dir, runs, medians] : {std::tuple{line.before, &before, &medians_before},
+                                             std::tuple{line.after, &after, &medians_after}}) {
+        const Str file((fs::path(Str(dir).c_str()) / "results.dta").generic_string());
+        if (auto r = sim::read_results(file.view(), *runs, *medians); !r) {
+            err(describe(r.error()));
+            err("\n");
+            return kCommandError;
+        }
+    }
+    bool broke = false;
+    out(sim::compare_json(before, medians_before, after, medians_after, broke));
+    return broke ? kCommandFailed : 0;
+}
+
+}  // namespace
+
+namespace {
+// Where an option that takes text keeps it, or null.
+std::string_view* text_option(CommandLine& line, std::string_view a) {
+    const std::pair<std::string_view, std::string_view*> options[] = {
+        {"--project", &line.project}, {"--layer", &line.layer},   {"--from", &line.layer},
+        {"--to", &line.to},           {"--patch", &line.patch},   {"--output", &line.output},
+        {"--results", &line.results}, {"--before", &line.before}, {"--after", &line.after}};
+    for (const auto& [name, into] : options)
+        if (a == name) return into;
+    return nullptr;
+}
 }  // namespace
 
 Expected<CommandLine> parse_command_line(int argc, const char* const* argv) {
     CommandLine line;
     if (argc > 1) line.command = argv[1];
-    Vec<std::string_view> commands, rest;
+    Vec<std::string_view> commands, rest, scenarios;
     for (int i = 2; i < argc; ++i) {
         const std::string_view a = argv[i];
         auto value = [&](std::string_view& into) -> bool {
@@ -410,28 +551,32 @@ Expected<CommandLine> parse_command_line(int argc, const char* const* argv) {
             line.json = true;
         } else if (a == "--write") {
             line.write = true;
-        } else if (a == "--project") {
-            if (!value(line.project)) return missing();
-        } else if (a == "--layer" || a == "--from") {
-            if (!value(line.layer)) return missing();
-        } else if (a == "--to") {
-            if (!value(line.to)) return missing();
-        } else if (a == "--patch") {
-            if (!value(line.patch)) return missing();
-        } else if (a == "--output") {
-            if (!value(line.output)) return missing();
-        } else if (a == "--seed") {
+        } else if (std::string_view* into = text_option(line, a)) {
+            if (!value(*into)) return missing();
+        } else if (a == "--seed" || a == "--step-hz") {
             std::string_view s;
             if (!value(s)) return missing();
-            uint64_t n = 0;
-            if (s.empty())
-                return Unexpected(make_error(ErrorCode::Syntax, "--seed needs a number"));
-            for (const char c : s) {
-                if (c < '0' || c > '9')
-                    return Unexpected(make_error(ErrorCode::Syntax, "--seed needs a number"));
-                n = n * 10 + static_cast<uint64_t>(c - '0');
-            }
-            line.seed = n;
+            const auto n = whole(s);
+            if (!n || (a == "--step-hz" && *n == 0))
+                return Unexpected(make_error(ErrorCode::Syntax, Str(a) + " needs a number"));
+            if (a == "--seed")
+                line.seed = *n;
+            else
+                line.step_hz = static_cast<double>(*n);
+        } else if (a == "--seeds") {
+            std::string_view s;
+            if (!value(s)) return missing();
+            const size_t dash = s.find('-');
+            const auto first = whole(s.substr(0, dash));
+            const auto last = dash == std::string_view::npos ? first : whole(s.substr(dash + 1));
+            if (!first || !last || *last < *first)
+                return Unexpected(make_error(ErrorCode::Syntax, "--seeds needs A-B, A <= B"));
+            line.seed = *first;
+            line.seed_last = *last;
+        } else if (a == "--scenario") {
+            std::string_view s;
+            if (!value(s)) return missing();
+            scenarios.push_back(s);
         } else if (!a.empty() && a.front() == '{') {
             commands.push_back(a);
         } else {
@@ -441,6 +586,8 @@ Expected<CommandLine> parse_command_line(int argc, const char* const* argv) {
     line.commands =
         List<std::string_view>(std::span<const std::string_view>(commands.data(), commands.size()));
     line.rest = List<std::string_view>(std::span<const std::string_view>(rest.data(), rest.size()));
+    line.scenarios = List<std::string_view>(
+        std::span<const std::string_view>(scenarios.data(), scenarios.size()));
     return line;
 }
 
@@ -450,6 +597,8 @@ int dispatch(const CommandLine& line, const CommandHooks& hooks) {
     if (line.command == "check") return check(line, hooks);
     if (line.command == "reference") return reference(line, hooks);
     if (line.command == "eval") return eval(line, hooks);
+    if (line.command == "sim") return run_scenarios(line, hooks);
+    if (line.command == "compare") return compare(line);
     if (line.command == "diff" || line.command == "promote") {
         if constexpr (kShipping) {
             err(Str(line.command) + ": not in a shipping build\n");
@@ -486,7 +635,7 @@ int run_command(const CommandLine& line, const CommandHooks& hooks) {
 }
 
 std::string_view command_help() noexcept {
-    return "  check                          baker.check/1.2 JSON; exit 1 on an error, a load\n"
+    return "  check                          baker.check/1.3 JSON; exit 1 on an error, a load\n"
            "                                 problem, a shape error, or an undefined function\n"
            "  reference [--json]             the script vocabulary, as Markdown; --json:\n"
            "                                 {reference, tweaks, shapes} as Baker's JSON\n"
@@ -498,6 +647,11 @@ std::string_view command_help() noexcept {
            "                                 each command's result, one a line, on the game\n"
            "                                 reset with the seed (default 1); --json: one\n"
            "                                 baker.reply/1.1 line each, as the console answers\n"
+           "  sim [--scenario NAME]... [--seed N | --seeds A-B] [--step-hz N] [--json]\n"
+           "      [--results DIR]            the project's scenarios, judged by its objectives;\n"
+           "                                 --json: baker.sim/1; --results: what compare reads\n"
+           "  compare --before DIR --after DIR\n"
+           "                                 which objectives moved: baker.compare/1\n"
            "every command also takes --output FILE: its output there, not on stdout\n";
 }
 

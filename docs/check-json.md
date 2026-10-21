@@ -36,7 +36,7 @@ reads `passed` and shows the lists:
   end. Strings escape `"`, `\`, and control characters (`\n`, `\t`, `\u00XX`); other
   characters are written as they are. Numbers are integers.
 - **Versioning.** `schema` is `baker.check/MAJOR` while the minor version is 0, then
-  `baker.check/MAJOR.MINOR` (now `baker.check/1.2`). A field is only ever added with a new minor version, which old
+  `baker.check/MAJOR.MINOR` (now `baker.check/1.3`). A field is only ever added with a new minor version, which old
   readers can ignore; a field is removed or renamed, or its meaning changed, only with a new
   major version.
 
@@ -44,8 +44,8 @@ reads `passed` and shows the lists:
 
 | Field | Type | Contents |
 |---|---|---|
-| `schema` | string | `"baker.check/1.2"` |
-| `passed` | boolean | `CheckReport::ok()`: no errors, no load problems, no shape errors, and, when unresolved calls fail, no unresolved demand (1.1) |
+| `schema` | string | `"baker.check/1.3"` |
+| `passed` | boolean | `CheckReport::ok()`: no errors, no load problems, no shape or tweak errors, and, when unresolved calls fail, no unresolved demand (1.1; tweak errors 1.3) |
 | `errors` | list of problems | calls with the wrong arguments for every overload |
 | `warnings` | list of problems | the one-way rule: a harder pack calling a softer one's function |
 | `demand` | list of demands | functions and methods called but not defined, or stubs |
@@ -54,6 +54,8 @@ reads `passed` and shows the lists:
 | `load` | list of problems | what loading the data reported: a file that did not parse, an `#autorun` command that failed. Filled by the host (1.1) |
 | `shape_errors` | list of problems | the data's shape check: values out of range or of the wrong type. Filled by the host (1.1) |
 | `shape_warnings` | list of problems | fields no shape declares; never a failure. Filled by the host (1.1) |
+| `tweak_errors` | list of problems | the data against the tweaks the Config binds: a value that does not convert to its tweak's type, a number outside its tweak's range, a symbol outside its `one_of`. Filled by `check` of a Config (1.3) |
+| `tweak_warnings` | list of problems | a tweak whose path the data lacks, so it keeps its default; a key beside a group's tweaks that no tweak reads, as a misspelled key looks. Never a failure (1.3) |
 | `packs` | list of packs | the session's packs and their harness metadata; empty without a session |
 
 **A problem** (in every list of problems), sorted by `file`, then `line`, then `column`,

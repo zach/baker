@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(baker VERSION 0.2.1 LANGUAGES CXX)
+project(baker VERSION 0.3.0 LANGUAGES CXX)
 
 option(BAKER_BUILD_SCRIPT     "Build baker::script (evaluation, objects, tasks)" ON)
 option(BAKER_BUILD_SHAPE      "Build baker::shape (data-declared shapes)" ON)
@@ -169,7 +169,7 @@ endif()
 #     read from, watched; the loopback console; the live loop; the tool commands. Beside the core, not in it: it touches the operating system. Needs
 #     baker::script; baker::baker does not link it.
 if(BAKER_BUILD_HOST AND BAKER_BUILD_SCRIPT)
-  add_library(baker_host src/host/commands.cpp src/host/console.cpp src/host/live.cpp
+  add_library(baker_host src/host/commands.cpp src/host/scenarios.cpp src/host/console.cpp src/host/live.cpp
               src/host/watcher.cpp)
   add_library(baker::host ALIAS baker_host)
   baker_configure_library(baker_host)

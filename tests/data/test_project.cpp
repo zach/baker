@@ -119,6 +119,33 @@ TEST_CASE("open_project sets the session and pushes the layers, leaving out what
     CHECK(shared.layers().size() == 3);
 }
 
+TEST_CASE("a project names the tool binary, its scenarios and objectives") {
+    TempDir dir;
+    const std::string file = dir.write("baker-project.dta",
+                                       "(project\n"
+                                       "   (tool \"build/bin/game\")\n"
+                                       "   (scenarios \"sim\" \"extra/boss.dta\")\n"
+                                       "   (objectives \"metrics\")\n"
+                                       "   (layers (default \"default.dta\")))\n");
+    const Project p = ok(read_project(file));  // none of them need exist
+    CHECK(p.tool == Symbol(dir.path("build/bin/game")));
+    CHECK(p.tool_at.line == 2);
+    REQUIRE(p.scenarios.size() == 2);
+    CHECK(p.scenarios[0].value == Symbol(dir.path("sim")));
+    CHECK(p.scenarios[1].value == Symbol(dir.path("extra/boss.dta")));
+    CHECK(p.scenarios[1].at.line == 3);
+    REQUIRE(p.objectives.size() == 1);
+    CHECK(p.objectives[0].value == Symbol(dir.path("metrics")));
+    // A game opens it as before: the entries are the tools' business.
+    dir.write("default.dta", "(speed 1)\n");
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(open_project(cfg, p));
+    CHECK(cfg.get<int>("speed") == 1);
+    const std::string bad = dir.write("bad.dta", "(project (tool) (layers (d \"d.dta\")))");
+    CHECK(std::string(read_project(bad).error().message()).find("(tool \"path\")") !=
+          std::string::npos);
+}
+
 TEST_CASE("a layer marked dev_only never reaches a shipping build") {
     TempDir dir;
     const std::string file = dir.write("baker-project.dta",

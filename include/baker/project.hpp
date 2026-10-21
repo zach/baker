@@ -10,6 +10,9 @@
 //      (include_dirs "data")              ; searched after an including file's directory
 //      (defines PC)                       ; flags, as #ifdef sees them
 //      (reference "build/reference.json") ; for tools: where the build writes the reference
+//      (tool "build/bin/game")            ; for tools: the binary that runs the tool commands
+//      (scenarios "sim")                  ; for tools: scenario files, or directories of them
+//      (objectives "metrics")             ; for tools: objective files, or directories
 //      (layers                            ; bottom to top
 //         (default "data/default.dta")
 //         (local "data/local.dta" optional dev_only)
@@ -84,6 +87,14 @@ struct Project {
     // without the game: a game ignores it, and nothing here reads it or asks that it exist.
     Symbol reference;
     ProjectPosition reference_at{};
+    // For tools that run the game's own commands (check, sim, ...): the binary that answers
+    // them, and the files, or directories of .dta files, that hold its scenarios and its
+    // objectives (the host kit's sim). Each joined with the project file's directory; empty
+    // if the file names none. A game ignores them, and nothing here asks that they exist.
+    Symbol tool;
+    ProjectPosition tool_at{};
+    List<ProjectEntry> scenarios;
+    List<ProjectEntry> objectives;
 };
 
 // Reads a project file, through `reader` if given (an editor's unsaved buffer), else from

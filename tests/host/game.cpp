@@ -15,18 +15,25 @@ int main(int argc, char** argv) {
                      baker::to_string(line.error()).data());
         return baker::host::kCommandError;
     }
-    // The game's own flag: --scenario FILE, checked beside its data.
+    // The game's own flag: --extra FILE, checked beside its data.
     std::string_view scenario;
     for (size_t i = 0; i + 1 < line->rest.size(); ++i)
-        if (line->rest[i] == "--scenario") scenario = line->rest[i + 1];
+        if (line->rest[i] == "--extra") scenario = line->rest[i + 1];
 
     baker::host::CommandHooks hooks;
     hooks.bind = [](baker::Context& ctx) {
         (void)ctx.func("spawn", [](baker::Symbol, int64_t n) { return n; });
         ctx.global("score", baker::Node(int64_t{0}), "The score.");
+        ctx.global("ticks", baker::Node(int64_t{0}), "The steps taken.");
     };
     hooks.reset = [](baker::Context& ctx, uint64_t seed) {
         ctx.var("score") = baker::Node(static_cast<int64_t>(seed * 10));
+        ctx.var("ticks") = baker::Node(int64_t{0});
+    };
+    // The game's fixed step, for sim: it counts.
+    hooks.step = [](baker::Context& ctx, double) {
+        auto ticks = ctx.var("ticks");
+        ticks = baker::Node(ticks->try_int().value_or(0) + 1);
     };
     hooks.extra_trees =
         [scenario](const baker::Config&) -> baker::Expected<baker::List<baker::Ref<baker::Array>>> {

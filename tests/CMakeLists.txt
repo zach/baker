@@ -67,11 +67,17 @@ if(BAKER_BUILD_SCRIPT)
 endif()
 
 if(TARGET baker::host)
-  add_executable(baker_host_tests host/test_console.cpp host/test_live.cpp host/test_watcher.cpp)
+  add_executable(baker_host_tests host/test_console.cpp host/test_live.cpp host/test_scenarios.cpp
+                                  host/test_watcher.cpp)
   target_link_libraries(baker_host_tests PRIVATE baker::host baker_doctest_main
                         baker_alloc_counter)
-  # White-box: the console's tests use its socket helpers for their client.
+  # White-box: the console's tests use its socket helpers for their client, and the scenario
+  # runner's tests its internal header, whose containers are src/'s.
   target_include_directories(baker_host_tests PRIVATE support ${PROJECT_SOURCE_DIR}/src)
+  if(BAKER_USE_EASTL)
+    target_compile_definitions(baker_host_tests PRIVATE BAKER_USE_EASTL=1)
+    target_link_libraries(baker_host_tests PRIVATE EASTL)
+  endif()
   if(WIN32)
     target_link_libraries(baker_host_tests PRIVATE ws2_32)
   endif()

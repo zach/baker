@@ -261,6 +261,137 @@ std::string_view TweakBase::group() const {
     return cut == std::string_view::npos ? std::string_view() : p.substr(0, cut);
 }
 
+// --- Holding data to the tweaks ---
+
+namespace {
+
+// The metadata array tagged `key` written after a value, as (range 0 10) in
+// (speed 4 (range 0 10)); null if none.
+const Array* trailing_meta(const Values& all, Symbol key) {
+    for (size_t n = all.size(); n > 0; --n) {
+        const Array* a = all[n - 1].try_array();
+        if (!a || a->empty()) break;
+        if ((*a)[0].is(key)) return a;
+    }
+    return nullptr;
+}
+
+// The path without its last segment, or empty for a top-level tweak; separators '.' and '/'.
+std::string_view parent_of(std::string_view path) {
+    const size_t cut = path.find_last_of("./");
+    return cut == std::string_view::npos ? std::string_view() : path.substr(0, cut);
+}
+
+// The segment of `path` right after `group` and its separator, or empty if `path` is not
+// under `group`.
+std::string_view child_under(std::string_view path, std::string_view group) {
+    if (path.size() <= group.size() + 1 || path.substr(0, group.size()) != group ||
+        (path[group.size()] != '.' && path[group.size()] != '/'))
+        return {};
+    const std::string_view rest = path.substr(group.size() + 1);
+    return rest.substr(0, rest.find_first_of("./"));
+}
+
+Error located(ErrorCode code, const Str& message, const Array* where) {
+    return where ? make_error(code, message, where->file(), where->line())
+                 : make_error(code, message);
+}
+
+}  // namespace
+
+TweakFindings check_tweaks(const Array& root, const TweakRegistry& tweaks) {
+    const Keys& k = keys();
+    Vec<Error> errors, warnings;
+    Vec<std::string_view> paths;
+    tweaks.each([&](TweakBase& t) {
+        paths.push_back(t.path());
+        const std::string_view path = t.path();
+        detail::Resolved r;
+        const auto status = detail::resolve(root, t.parsed(), r);
+        if (status == detail::ResolveStatus::Missing) {
+            warnings.push_back(
+                make_error(ErrorCode::NotFound,
+                           "the data has no '" + Str(path) + "': the tweak keeps its default"));
+            return;
+        }
+        if (status == detail::ResolveStatus::Malformed) {
+            errors.push_back(detail::get_error(root, t.parsed(), nullptr));
+            return;
+        }
+        const Values values = without_metadata(r.values);
+        const Array* where = values.source();
+        if (!t.assign(values, false)) {
+            const detail::ConvertInfo want = t.info();
+            errors.push_back(detail::get_error(root, t.parsed(), &want));
+            return;
+        }
+        // The range and the list: the data's metadata, else the code's.
+        TweakRange range = t.meta_.range;
+        if (const Array* a = trailing_meta(r.values, k.range); a && a->size() >= 3) {
+            const auto lo = (*a)[1].try_float(), hi = (*a)[2].try_float();
+            if (lo && hi) range = {*lo, *hi};
+        }
+        Vec<Symbol> one_of;
+        if (const Array* a = trailing_meta(r.values, k.one_of)) {
+            for (const Node& n : a->values())
+                if (const auto sym = n.try_sym()) one_of.push_back(*sym);
+        } else {
+            for (const std::string_view name : t.meta_.one_of) one_of.emplace_back(name);
+        }
+        for (const Node& v : values) {
+            const auto x = v.try_float();
+            if (!range.empty() && x && (*x < range.min || *x > range.max))
+                errors.push_back(located(ErrorCode::Range,
+                                         "'" + Str(path) + "' is " + detail::text_of(v) +
+                                             ", outside its tweak's range " +
+                                             detail::text_of(Node(range.min)) + " to " +
+                                             detail::text_of(Node(range.max)),
+                                         where));
+            const auto sym = v.try_sym();
+            if (!one_of.empty() && sym &&
+                std::find(one_of.begin(), one_of.end(), *sym) == one_of.end()) {
+                Str names;
+                for (const Symbol n : one_of) names += (names.empty() ? "" : ", ") + Str(n.str());
+                errors.push_back(located(ErrorCode::Range,
+                                         "'" + Str(path) + "' is '" + Str(sym->str()) +
+                                             "', not one of its tweak's " + names,
+                                         where));
+            }
+        }
+    });
+    // Keys beside a group's tweaks that no tweak reads: a misspelled key looks so.
+    Vec<std::string_view> groups;
+    for (const std::string_view p : paths) {
+        const std::string_view g = parent_of(p);
+        if (g.empty() || g.find('\'') != std::string_view::npos) continue;  // top level, or quoted
+        if (std::find(groups.begin(), groups.end(), g) == groups.end()) groups.push_back(g);
+    }
+    for (const std::string_view g : groups) {
+        detail::Resolved r;
+        if (detail::resolve(root, Path(g), r) != detail::ResolveStatus::Ok || !r.array) continue;
+        Vec<std::string_view> known;
+        for (const std::string_view p : paths)
+            if (const std::string_view c = child_under(p, g);
+                !c.empty() && std::find(known.begin(), known.end(), c) == known.end())
+                known.push_back(c);
+        std::sort(known.begin(), known.end());  // independent of registration order
+        for (const Node& n : r.array->values()) {
+            const Array* child = n.try_array();
+            if (!child || child->tag().empty()) continue;
+            const std::string_view tag = child->tag().str();
+            if (std::find(known.begin(), known.end(), tag) != known.end()) continue;
+            Str read;
+            for (const std::string_view c : known) read += (read.empty() ? "" : ", ") + Str(c);
+            warnings.push_back(located(ErrorCode::NotFound,
+                                       "'" + Str(tag) + "' in '" + Str(g) +
+                                           "' is read by no tweak; its tweaks read " + read,
+                                       child));
+        }
+    }
+    return {List<Error>({errors.data(), errors.size()}),
+            List<Error>({warnings.data(), warnings.size()})};
+}
+
 // --- As JSON (baker.tweaks/1.1) ---
 
 namespace {

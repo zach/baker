@@ -4,7 +4,7 @@
 // agent with a shell calls `mygame check`, and the game answers with Baker's JSON. They
 // live in the game's binary because only it has its script functions.
 //
-//   check                          baker.check/1.2 JSON; exit 1 on an error, a load
+//   check                          baker.check/1.3 JSON; exit 1 on an error, a load
 //                                  problem, a shape error, or a call to an undefined
 //                                  function
 //   reference [--json]             the script vocabulary, as Markdown; --json:
@@ -17,6 +17,16 @@
 //   eval [--seed N] [--json] "{command}"...
 //                                  each command's result on the game reset with seed N
 //                                  (default 1); --json: one baker.reply/1.1 line each
+//   sim [--scenario NAME]... [--seed N | --seeds A-B] [--step-hz N] [--json] [--results DIR]
+//                                  runs the project's scenarios (all, or those named, by
+//                                  name or file name) for each seed, stepping the game
+//                                  (`step`) at N Hz (default 60), then judges them by its
+//                                  objectives; --json: baker.sim/1; --results: DIR gets
+//                                  results.json and results.dta, what compare reads. Exit 1
+//                                  if an objective failed
+//   compare --before DIR --after DIR
+//                                  which objectives moved between two --results
+//                                  directories: baker.compare/1; exit 1 if one broke
 //   every command: --project PATH  the stack: the nearest baker-project.dta from PATH
 //                  --output FILE   the output in FILE, not on stdout (a failure to write
 //                                  it is exit 2); the host may route it instead (`output`)
@@ -58,7 +68,12 @@ struct CommandLine {
     std::string_view to = "default";   // promote --to
     std::string_view patch;            // promote --patch FILE
     std::string_view output;           // --output FILE: the command's output there
-    uint64_t seed = 1;                 // eval --seed
+    uint64_t seed = 1;                 // eval and sim --seed; sim --seeds A-B: A
+    uint64_t seed_last = 0;            // sim --seeds A-B: B; 0: seed alone
+    double step_hz = 60;               // sim --step-hz
+    List<std::string_view> scenarios;  // sim --scenario NAME, each
+    std::string_view results;          // sim --results DIR
+    std::string_view before, after;    // compare --before DIR --after DIR
     bool json = false;                 // --json
     bool write = false;                // promote --write
     List<std::string_view> commands;   // eval's {commands}
@@ -78,10 +93,15 @@ struct CommandHooks {
     Callback<void(Context&)> unbind{};
     // Reads the game's structured data, as Live's `changed`.
     Callback<void(const Config&)> changed{};
-    // Resets the game's state with a seed, before eval runs its commands.
+    // Resets the game's state with a seed, before eval runs its commands and before each
+    // run of a scenario.
     Callback<void(Context&, uint64_t seed)> reset{};
-    // Files the game wants checked beside its data (scenarios, objectives), read; or the
-    // located problem that stops them reading, which check reports as a load problem.
+    // One fixed step of the game, `dt` seconds, for sim; the game's systems and nothing
+    // drawn. A game without it cannot run scenarios.
+    Callback<void(Context&, double dt)> step{};
+    // Files the game wants checked beside its data, read; or the located problem that stops
+    // them reading, which check reports as a load problem. The project's scenarios and
+    // objectives are checked without it.
     Callback<Expected<List<Ref<Array>>>(const Config&)> extra_trees{};
     // The stack when there is no project file, and how it opens: a check or a simulation
     // leaves out one person's own layer (`.skip = {"local"}`).

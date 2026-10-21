@@ -511,6 +511,8 @@ public:
     // so it is the session to give check, check_validator, to_json, and reference:
     //   cfg.add_validator(baker::check_validator(ctx, {.packs = &cfg.read_session()}));
     [[nodiscard]] const LoadSession& read_session() const noexcept;
+    // The registry whose tweaks this Config binds (ConfigOptions::tweaks); null for none.
+    [[nodiscard]] const TweakRegistry* tweak_registry() const noexcept;
     // Replaces file writing for write-back (default: the local filesystem).
     void set_writer(Writer writer);
 

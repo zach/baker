@@ -624,13 +624,20 @@ struct CheckReport {
     List<Error> load;
     List<Error> shape_errors;
     List<Error> shape_warnings;
+    // The data against the registered tweaks (check_tweaks): filled by check() of a Config,
+    // from the registry it binds. A value its tweak cannot take is an error; a tweak the data
+    // lacks, or a key beside a group's tweaks that none reads, a warning.
+    List<Error> tweak_errors;
+    List<Error> tweak_warnings;
     // From CheckOptions: whether a call to a function nothing defines (not a stub) fails.
     bool unresolved_fails = false;
 
-    // Passes: no errors, no load problems, no shape errors, and under unresolved_fails, no
-    // unresolved demand. Warnings, findings, repeats, and stubs never fail it.
+    // Passes: no errors, no load problems, no shape or tweak errors, and under
+    // unresolved_fails, no unresolved demand. Warnings, findings, repeats, and stubs never
+    // fail it.
     [[nodiscard]] bool ok() const noexcept {
-        if (!errors.empty() || !load.empty() || !shape_errors.empty()) return false;
+        if (!errors.empty() || !load.empty() || !shape_errors.empty() || !tweak_errors.empty())
+            return false;
         if (unresolved_fails)
             for (const Demand& d : demand)
                 if (!d.stub) return false;
@@ -890,7 +897,8 @@ void check(const Array& tree, const Context& ctx, CheckReport& report,
 // Checks a Config's data as it loads: its merged tree, and the #autorun commands of its
 // enabled layers, which are not in the tree (so a {func} an #autorun defines is seen
 // too), with the Config's read session as `packs` unless options give one. `extra` adds
-// trees checked alongside, such as scenarios.
+// trees checked alongside, such as scenarios. The merged tree is also held to the tweaks
+// the Config binds (check_tweaks), into tweak_errors and tweak_warnings.
 void check(const Config& cfg, const Context& ctx, CheckReport& report,
            const CheckOptions& options = {}, std::span<const Array* const> extra = {});
 // For Config::add_validator (the same type as Config::Validator): checks the merged root

@@ -125,10 +125,13 @@ int main(int argc, char** argv) {
 | `eval [--seed N] [--json] "{command}"...` | each command's result on the game reset with the seed; `--json`: one reply line each |
 | `diff [--layer L]` | what layer L (default `agent`) changes, value by value |
 | `promote [--from L] [--to T] [--write \| --patch FILE]` | what promoting L into T would write; `--write` writes; `--patch` writes a unified diff and nothing else |
+| `sim [--scenario NAME]... [--seed N \| --seeds A-B] [--step-hz N] [--json] [--results DIR]` | the project's scenarios run and judged by its objectives ([`baker.sim/1`](sim-json.md)); exit 1 when one fails |
+| `compare --before DIR --after DIR` | which objectives broke or were fixed between two `sim --results` ([`baker.compare/1`](sim-json.md)) |
 
 Each runs on a fresh Context with your functions bound (`CommandHooks::bind`), the stack
 opened as the game opens it, and, for `eval`, your state reset (`CommandHooks::reset`).
-`extra_trees` adds files of your own to `check` (scenarios, say). The exit status is 0, 1
+`sim` steps your game with `CommandHooks::step`, and `check` reads the project's scenarios
+and objectives with the data. `extra_trees` adds other files of your own to `check`. The exit status is 0, 1
 when something failed, 2 when it could not run. In a shipping build, `diff` and `promote`
 refuse. A tool reads the commands' standard output as the document itself, so your
 functions and `#autorun` must print nothing there while a command runs. Where that cannot
@@ -138,10 +141,12 @@ through your file access, as `Live` does, for files under an engine's own roots.
 
 ## How an external tool talks to a game
 
-- **Files.** The project file (`baker-project.dta`) gives the stack, and names the
-  reference JSON your build writes (`(reference "build/reference.json")`).
-- **Documents.** [The reference](reference-json.md), [check's report](check-json.md) and
-  [the reply](reply-json.md) are versioned JSON. A field is added only with a new minor
+- **Files.** The project file (`baker-project.dta`) gives the stack. It names the reference
+  JSON your build writes (`(reference "build/reference.json")`), the game binary that answers
+  the commands (`(tool ...)`), and its scenarios and objectives (`(scenarios ...)`,
+  `(objectives ...)`).
+- **Documents.** [The reference](reference-json.md), [check's report](check-json.md),
+  [the reply](reply-json.md) and [sim's results](sim-json.md) are versioned JSON. A field is added only with a new minor
   version.
 - **The console.** One request per line, one JSON reply per line, to a running game.
 - **Commands.** Your game binary's own commands, run by the tool.

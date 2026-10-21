@@ -5,6 +5,7 @@
 #include <baker/std_interop.hpp>
 
 #include <string>
+#include <vector>
 #include "ok.hpp"
 
 using namespace baker;
@@ -50,4 +51,68 @@ TEST_CASE("a symbol tweak's allowed symbols, from the code or the data") {
     write_json(reg, string_out(json));
     CHECK(json.find(R"j("one_of": ["light", "heavy"], "source")j") != std::string::npos);
     CHECK(json.find(R"j("one_of": ["light", "heavy", "kick"], "source")j") != std::string::npos);
+}
+
+namespace {
+std::vector<std::string> messages(const List<Error>& list) {
+    std::vector<std::string> out;
+    for (const Error& e : list) out.emplace_back(e.message());
+    return out;
+}
+}  // namespace
+
+TEST_CASE("the data is held to the tweaks the game declares") {
+    TweakRegistry reg;
+    Tweak<float> height{"jump.height", 120.0f, {.range = {16, 320}}, reg};
+    Tweak<int> buffer{"jump.buffer", 3, {}, reg};
+    Tweak<float> air{"jump.air.time", 0.5f, {}, reg};
+    static constexpr std::string_view kSurfaces[] = {"stone", "ice"};
+    Tweak<Symbol> floor{"world.floor", Symbol("stone"), {.one_of = kSurfaces}, reg};
+    Tweak<float> gravity{"world.gravity", 9.8f, {}, reg};
+    const auto run = [&](const char* text) {
+        return check_tweaks(*ok(read_string(text, "d.dta")), reg);
+    };
+
+    // Clean data: nothing, and structured data at the top level is quiet.
+    const auto clean =
+        run("(jump (height 120) (buffer 3) (air (time 0.4)))\n"
+            "(world (floor ice) (gravity 9.8))\n(waves (wave 1) (wave 2))\n");
+    CHECK(clean.errors.empty());
+    CHECK(clean.warnings.empty());
+
+    // The note's three edits.
+    CHECK(messages(run("(jump (height \"tall\") (buffer 3) (air (time 0.4)))\n"
+                       "(world (floor ice) (gravity 9.8))")
+                       .errors)
+              .size() == 1);
+    const auto far =
+        run("(jump (height 1000) (buffer 3) (air (time 0.4)))\n(world (floor ice) (gravity 9.8))");
+    REQUIRE(far.errors.size() == 1);
+    CHECK(std::string(far.errors[0].message()) ==
+          "'jump.height' is 1000, outside its tweak's range 16.0 to 320.0");
+    CHECK(far.errors[0].line() == 1);
+    const auto typo =
+        run("(jump (hieght 120) (height 120) (buffer 3) (air (time 0.4)))\n"
+            "(world (floor ice) (gravity 9.8))");
+    CHECK(typo.errors.empty());
+    CHECK(messages(typo.warnings) ==
+          std::vector<std::string>{
+              "'hieght' in 'jump' is read by no tweak; its tweaks read air, buffer, height"});
+
+    // A tweak the data lacks keeps its default: a warning, never an error.
+    const auto missing =
+        run("(jump (height 120) (air (time 0.4)))\n(world (floor ice) (gravity 9.8))");
+    CHECK(missing.errors.empty());
+    CHECK(messages(missing.warnings) ==
+          std::vector<std::string>{"the data has no 'jump.buffer': the tweak keeps its default"});
+
+    // The data's own range and list win over the code's.
+    const auto own =
+        run("(jump (height 400 (range 16 500)) (buffer 3) (air (time 0.4)))\n"
+            "(world (floor sand (one_of stone sand)) (gravity 9.8))");
+    CHECK(own.errors.empty());
+    const auto list =
+        run("(jump (height 120) (buffer 3) (air (time 0.4)))\n(world (floor lava) (gravity 9.8))");
+    CHECK(messages(list.errors) ==
+          std::vector<std::string>{"'world.floor' is 'lava', not one of its tweak's stone, ice"});
 }

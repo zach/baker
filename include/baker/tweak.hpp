@@ -74,6 +74,23 @@ struct TweakMeta {
     std::span<const std::string_view> one_of{};
 };
 
+class TweakRegistry;
+
+// What check_tweaks found: values the tweaks cannot take (errors), and data the tweaks do not
+// match (warnings), each located where the data has a place.
+struct TweakFindings {
+    List<Error> errors;
+    List<Error> warnings;
+};
+
+// Holds `root` (a Config's merged tree) to the tweaks of `tweaks`, as check() holds data to
+// shapes; it changes no tweak. Errors: a value that does not convert to its tweak's type, a
+// number outside its range, a symbol outside its one_of (the data's metadata, else the
+// code's). Warnings: a tweak whose path the data lacks, so it keeps its default; a key no
+// tweak reads beside the tweaks of its group, as a misspelled key looks. Only groups below
+// the top level are read for unknown keys, so structured data beside them stays quiet.
+[[nodiscard]] TweakFindings check_tweaks(const Array& root, const TweakRegistry& tweaks);
+
 class TweakBase {
 public:
     TweakBase(const TweakBase&) = delete;
@@ -129,6 +146,7 @@ protected:
 private:
     friend class TweakRegistry;
     friend class Config;
+    friend TweakFindings check_tweaks(const Array& root, const TweakRegistry& tweaks);
 
     // Reads the values as T and, if `apply`, stores them; false if they do not convert.
     virtual bool assign(const Values& values, bool apply) = 0;
@@ -188,7 +206,7 @@ private:
     Config* config_ = nullptr;
 };
 
-// Every tweak in `tweaks` as JSON (schema baker.tweaks/1, docs/reference-json.md), sorted by
+// Every tweak in `tweaks` as JSON (schema baker.tweaks/1.1, docs/reference-json.md), sorted by
 // path: its type, default and current value, metadata (the data's winning over the code's),
 // and, while a config supplies it, where the value came from. For tools and agents.
 void write_json(const TweakRegistry& tweaks, TextSink out);

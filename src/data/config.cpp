@@ -475,6 +475,10 @@ const LoadSession& Config::read_session() const noexcept {
     return impl_->as_read;
 }
 
+const TweakRegistry* Config::tweak_registry() const noexcept {
+    return impl_->options.tweaks;
+}
+
 void Config::set_writer(Writer writer) {
     impl_->writer = writer ? std::move(writer) : Writer(write_disk_file);
 }

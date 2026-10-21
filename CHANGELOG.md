@@ -3,6 +3,37 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.3.0 - 2026-10-21
+
+- **New: `check` holds the data to the tweaks your game declares.** A value a tweak cannot
+  take was invisible to `check`: `(height "tall")` for a float tweak, a number outside its
+  range, or a symbol outside its `one_of`. The game then ran on a default without a word.
+  - `check_tweaks(root, registry)` (`<baker/tweak.hpp>`) checks a merged tree against the
+    registered tweaks without changing any of them. The data's own `(range ...)` and
+    `(one_of ...)` win over the code's, as they do for panels.
+  - `check()` of a Config fills the new `CheckReport::tweak_errors` and `tweak_warnings`
+    from the registry the Config binds (`Config::tweak_registry()`, new). Warnings are a
+    tweak the data gives no value, and a key beside a group's tweaks that no tweak reads, as
+    a misspelled key looks.
+  - **What breaks:** a tweak error fails the check, so data that passed before may fail now.
+    The JSON is `baker.check/1.3`, with the two new lists.
+- **New in the host kit: scenarios a tool can find and run.** A project file may name the
+  game binary that answers the commands, and the game's scenarios and objectives:
+  `(tool "build/bin/my_game") (scenarios "sim") (objectives "metrics")`.
+  - **Scenarios and objectives.** A `(scenario ...)` runs the game for set seconds from a
+    seed, with commands at its start and at set times. An `(objective ...)` measures the
+    run and judges the value, in each run or by its median over the seeds.
+  - **`sim`** steps your game through the new `CommandHooks::step` and judges each run. It
+    writes `baker.sim/1`, with every run, objective and failed command located by file and
+    line.
+  - **`compare --before DIR --after DIR`** reads two `sim --results DIR` directories and
+    writes `baker.compare/1`, naming each objective that broke or was fixed.
+  - **`check`** reads the scenarios and objectives with the data.
+  - `docs/sim-json.md` describes the forms, the commands and both schemas.
+  - **What breaks:** the kit now reads `--scenario`, `--seeds`, `--step-hz`, `--results`,
+    `--before` and `--after` itself. A game whose own commands used one of those names should
+    rename its flag.
+
 ## 0.2.1 - 2026-10-20
 
 - **New: a field's allowed symbols.** A `symbol` or `(list symbol)` shape field may list

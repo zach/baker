@@ -3,4 +3,7 @@
    (layers
       (default "data/default.dta")
       (local "data/local.dta" optional)
-      (agent "data/agent.dta" optional)))
+      (agent "data/agent.dta" optional))
+   (tool "build/game")
+   (scenarios "sim")
+   (objectives "metrics/objectives.dta"))
