@@ -110,6 +110,12 @@ struct CommandHooks {
     // Reads the project file, the layers and what a patch compares against, if not from the
     // disk (an engine's virtual roots): the same reader Live and the Config take.
     LoadSession::Reader reader{};
+    // Lists a directory of the host's own files (an archive, a virtual root): calls `file`
+    // with each entry's path and returns true, or returns false if `dir` is not one of its
+    // directories. The kit keeps the .dta files, in name order, and reads each through
+    // `reader`. Empty, or false: the disk's directory, as without it. For the project's
+    // scenarios and objectives.
+    Callback<bool(std::string_view dir, Callback<void(std::string_view path)> file)> list{};
     // Where the output goes when the command line names no --output file; empty: stdout.
     // An engine that writes its own lines to stdout keeps the result apart from them.
     Callback<void(std::string_view text)> output{};

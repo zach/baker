@@ -4,6 +4,7 @@
 #include <baker/parse.hpp>
 
 #include <cstdio>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -53,6 +54,16 @@ int main(int argc, char** argv) {
         if (line->rest[i] == "--root") root = std::string(line->rest[i + 1]) + "/";
     if (!root.empty()) {
         line->project = "game://data";
+        // The host lists its own directories, game://sim, as an engine lists an archive's.
+        hooks.list = [root](std::string_view dir, baker::Callback<void(std::string_view)> file) {
+            if (dir.substr(0, 7) != "game://") return false;
+            std::error_code ec;
+            const std::filesystem::path p = root + std::string(dir.substr(7));
+            if (!std::filesystem::is_directory(p, ec)) return false;
+            for (const auto& e : std::filesystem::directory_iterator(p, ec))
+                file(std::string(dir) + "/" + e.path().filename().string());
+            return true;
+        };
         hooks.reader = [root](std::string_view path, baker::TextSink out) {
             if (path.substr(0, 7) != "game://") return false;
             std::FILE* f = std::fopen((root + std::string(path.substr(7))).c_str(), "rb");

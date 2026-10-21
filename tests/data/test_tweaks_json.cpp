@@ -1,9 +1,11 @@
-// The tweaks as JSON, baker.tweaks/1.2.
+// The tweaks as JSON, baker.tweaks/1.3.
 #include <doctest.h>
 #include <baker/config.hpp>
 #include <baker/parse.hpp>
 #include <baker/std_interop.hpp>
 
+#include <algorithm>
+#include <array>
 #include <string>
 #include <vector>
 #include "ok.hpp"
@@ -21,16 +23,16 @@ TEST_CASE("the tweaks as JSON: type, default, value, metadata, and source") {
     std::string json;
     write_json(reg, string_out(json));
     CHECK(json ==
-          "{\n  \"schema\": \"baker.tweaks/1.2\",\n  \"tweaks\": [\n"
+          "{\n  \"schema\": \"baker.tweaks/1.3\",\n  \"tweaks\": [\n"
           R"j(    {"path": "player.lives", "type": "int32", "values": ["int32"], "default": "3", )j"
           R"j("value": "3", )j"
           R"j("bound": false, "range": null, "step": 0.0, "desc": "", "kind": "", )j"
-          R"j("group": "player", "dev_only": true, "one_of": [], "source": null},)j"
+          R"j("group": "player", "dev_only": true, "one_of": [], "choices": [], "source": null},)j"
           "\n"
           R"j(    {"path": "player.speed", "type": "float32", "values": ["float32"], )j"
           R"j("default": "4.0", "value": "6.0", )j"
           R"j("bound": true, "range": [0.0, 10.0], "step": 0.5, "desc": "Run speed", )j"
-          R"j("kind": "", "group": "player", "dev_only": false, "one_of": [], )j"
+          R"j("kind": "", "group": "player", "dev_only": false, "one_of": [], "choices": [], )j"
           R"j("source": {"layer": "default", "file": "d.dta", "line": 1}})j"
           "\n  ]\n}\n");
 }
@@ -51,8 +53,10 @@ TEST_CASE("a symbol tweak's allowed symbols, from the code or the data") {
     CHECK(kick.one_of().size() == 3);       // the data's
     std::string json;
     write_json(reg, string_out(json));
-    CHECK(json.find(R"j("one_of": ["light", "heavy"], "source")j") != std::string::npos);
-    CHECK(json.find(R"j("one_of": ["light", "heavy", "kick"], "source")j") != std::string::npos);
+    CHECK(json.find(R"j("one_of": ["light", "heavy"], "choices": [], "source")j") !=
+          std::string::npos);
+    CHECK(json.find(R"j("one_of": ["light", "heavy", "kick"], "choices": [], "source")j") !=
+          std::string::npos);
 }
 
 namespace {
@@ -212,4 +216,126 @@ TEST_CASE("a description the registry cannot hold is an error naming the tweak")
     CHECK(std::string(bad_default.error().message()).find("default") != std::string::npos);
     CHECK(described.size() == 0);
     CHECK(reg.size() == 0);
+}
+
+TEST_CASE("a fixed-size list declares its value types, and a tool checks it as the game") {
+    TweakRegistry game;
+    Tweak<std::array<float, 3>> color{"cube.color", {0.9f, 0.5f, 0.2f}, {}, game};
+    TweakRegistry nested;
+    Tweak<std::array<Vec2, 2>> path{"cube.path", {}, {}, nested};
+    REQUIRE(color.value_types().size() == 3);
+    CHECK(path.value_types().empty());  // values nested in each element: not listed flat
+    std::string json;
+    write_json(game, string_out(json));
+    CHECK(json.find(
+              R"j("type": "fixed-size list", "values": ["float32", "float32", "float32"], )j") !=
+          std::string::npos);
+
+    TweakRegistry tool;
+    DescribedTweaks described(tool);
+    REQUIRE(described.add({.path = "cube.color",
+                           .type = "fixed-size list",
+                           .values = color.value_types(),
+                           .default_text = "(0.9 0.5 0.2)"}));
+    for (const char* text : {"(cube (color 0.9 0.5 0.2))\n", "(cube (color 0.9 0.5))\n",
+                             "(cube (color red 0.5 0.2))\n"}) {
+        CAPTURE(text);
+        const Ref<Array> root = ok(read_string(text, "d.dta"));
+        CHECK(messages(check_tweaks(*root, tool).errors) ==
+              messages(check_tweaks(*root, game).errors));
+        CHECK(messages(check_tweaks(*root, tool).warnings) ==
+              messages(check_tweaks(*root, game).warnings));
+    }
+}
+
+TEST_CASE("string and integer tweaks take allowed values, checked and in the JSON") {
+    TweakRegistry reg;
+    static constexpr std::string_view kAttacks[] = {"light", "heavy", "kick"};
+    Tweak<std::string_view> attack{"fighter.attack", "light", {.one_of = kAttacks}, reg};
+    static constexpr TweakChoice kLevels[] = {{0, "easy"}, {1, "normal"}, {2, "hard"}};
+    Tweak<int> level{"fighter.level", 1, {.choices = kLevels}, reg};
+    Tweak<int> team{"fighter.team", 0, {}, reg};
+    const auto run = [&](const char* text) {
+        return messages(check_tweaks(*ok(read_string(text, "d.dta")), reg).errors);
+    };
+
+    CHECK(
+        run("(fighter (attack \"heavy\") (level 2) (team 0 (one_of (0 red) (1 blue))))\n").empty());
+    auto bad = run("(fighter (attack \"hevy\") (level 5) (team 3 (one_of (0 red) 1)))\n");
+    std::sort(bad.begin(), bad.end());  // in the registry's order otherwise
+    REQUIRE(bad.size() == 3);
+    CHECK(bad[0] == "'fighter.attack' is 'hevy', not one of its tweak's light, heavy, kick");
+    CHECK(bad[1] == "'fighter.level' is 5, not one of its tweak's 0 (easy), 1 (normal), 2 (hard)");
+    CHECK(bad[2] == "'fighter.team' is 3, not one of its tweak's 0 (red), 1");  // the data's
+    // The data's own list wins over the code's.
+    CHECK(run("(fighter (attack \"punch\" (one_of \"punch\" \"kick\")) (level 7 (one_of 7)))\n")
+              .empty());
+    CHECK(attack.one_of().size() == 3);
+    REQUIRE(level.choices().size() == 3);
+    CHECK(level.choices()[2].name == "hard");
+
+    std::string json;
+    write_json(reg, string_out(json));
+    CHECK(json.find(R"j("one_of": ["light", "heavy", "kick"], "choices": [])j") !=
+          std::string::npos);
+    CHECK(
+        json.find(R"j("choices": [{"value": 0, "name": "easy"}, {"value": 1, "name": "normal"}, )j"
+                  R"j({"value": 2, "name": "hard"}])j") != std::string::npos);
+
+    // A tool's described copy finds the same.
+    TweakRegistry tool;
+    DescribedTweaks described(tool);
+    REQUIRE(described.add({.path = "fighter.attack",
+                           .type = "string",
+                           .default_text = "\"light\"",
+                           .one_of = kAttacks}));
+    REQUIRE(described.add(
+        {.path = "fighter.level", .type = "int32", .default_text = "1", .choices = kLevels}));
+    const Ref<Array> root = ok(read_string("(fighter (attack \"hevy\") (level 5))\n", "d.dta"));
+    TweakRegistry only;  // the game's two, without team
+    Tweak<std::string_view> attack2{"fighter.attack", "light", {.one_of = kAttacks}, only};
+    Tweak<int> level2{"fighter.level", 1, {.choices = kLevels}, only};
+    CHECK(messages(check_tweaks(*root, tool).errors) == messages(check_tweaks(*root, only).errors));
+}
+
+TEST_CASE("the metadata split and the color rule, for any value") {
+    const Ref<Array> root = ok(read_string(
+        "(width 2 (range 0 10) (desc \"w\"))\n(ball (kind ball) (pos 1 2))\n"
+        "(tint 1 0.5 0 (range 0 1))\n(sky 0.2 0.4 0.9)\n(spot 1 0.5 0 (kind angle) (range 0 1))\n",
+        "d.dta"));
+    auto values = [&](const char* key) { return root->try_find(Symbol(key))->values(); };
+    const ValueMetadata width = split_metadata(values("width"));
+    REQUIRE(width.values.size() == 1);
+    CHECK(width.values[0].try_int() == 2);
+    CHECK(width.metadata.size() == 2);
+    const ValueMetadata ball = split_metadata(values("ball"));  // (pos 1 2) is no metadata
+    CHECK(ball.values.size() == 2);
+    CHECK(ball.metadata.empty());
+
+    CHECK(presented_kind(values("tint")) == "color");
+    CHECK(presented_kind(values("sky")).empty());                 // no range 0..1
+    CHECK(presented_kind(values("sky"), {}, {0, 1}) == "color");  // the code's range
+    CHECK(presented_kind(values("spot")) == "angle");             // a kind given wins
+    CHECK(presented_kind(values("width"), "length") == "length");
+
+    // The same rule a tweak applies.
+    TweakRegistry reg;
+    Tweak<std::array<float, 3>> tint{"tint", {}, {}, reg};
+    Config cfg({.tweaks = &reg});
+    REQUIRE(cfg.push_layer("d", root));
+    CHECK(tint.kind() == presented_kind(values("tint")));
+}
+
+TEST_CASE("each tweak finding carries its subject as its path") {
+    TweakRegistry reg;
+    Tweak<float> gravity{"world.gravity", 9.8f, {.range = {0, 20}}, reg};
+    Tweak<float> wind{"world.wind", 0.f, {}, reg};
+    const TweakFindings f =
+        check_tweaks(*ok(read_string("(world (gravity 30) (gravty 9))\n", "d.dta")), reg);
+    REQUIRE(f.errors.size() == 1);
+    CHECK(f.errors[0].path() == "world.gravity");
+    std::vector<std::string> paths;
+    for (const Error& w : f.warnings) paths.emplace_back(w.path());
+    std::sort(paths.begin(), paths.end());
+    CHECK(paths == std::vector<std::string>{"world.gravty", "world.wind"});  // stray, missing
 }

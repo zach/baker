@@ -56,6 +56,8 @@ reads `passed` and shows the lists:
 | `shape_warnings` | list of problems | fields no shape declares; never a failure. Filled by the host (1.1) |
 | `tweak_errors` | list of problems | the data against the tweaks the Config binds: a value that does not convert to its tweak's type, a number outside its tweak's range, a symbol outside its `one_of`. Filled by `check` of a Config (1.3) |
 | `tweak_warnings` | list of problems | a tweak whose path the data lacks, so it keeps its default; a key beside a group's tweaks that no tweak reads, as a misspelled key looks. Never a failure (1.3) |
+
+Each tweak finding's `path` is its subject: the tweak's path, or for a key no tweak reads, the key's own path (`world.gravty`, the group then the key). A tool groups and locates findings by it rather than by their words.
 | `packs` | list of packs | the session's packs and their harness metadata; empty without a session |
 
 **A problem** (in every list of problems), sorted by `file`, then `line`, then `column`,

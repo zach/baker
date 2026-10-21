@@ -57,6 +57,12 @@ struct TweakRange {
     [[nodiscard]] bool empty() const noexcept { return !(min < max); }
 };
 
+// One value an integer tweak may take, and its name for a panel: {0, "easy"}.
+struct TweakChoice {
+    int64_t value = 0;
+    std::string_view name{};
+};
+
 // Every member has its own initializer, so that clang's -Wmissing-field-initializers
 // accepts a designated initializer naming only some: {.range = {0, 10}, .step = 1}.
 struct TweakMeta {
@@ -69,9 +75,15 @@ struct TweakMeta {
     // The symbols a symbol tweak's value may be, for a panel or an editor to offer, in order:
     //   static constexpr std::string_view kButtons[] = {"light", "heavy", "kick"};
     //   Tweak<Symbol> button{"moves.jab.button", Symbol("light"), {.one_of = kButtons}};
-    // The data may give its own, (one_of ...) after the value. Metadata, as the range is:
-    // a shape's (one_of ...) is what check() enforces.
+    // A string tweak takes a list too, of the strings it may be. The data may give its own,
+    // (one_of ...) after the value: symbols, or strings for a string tweak. check_tweaks
+    // holds the data to it, and a shape's (one_of ...) is what check() enforces on a field.
     std::span<const std::string_view> one_of{};
+    // The values an integer tweak may take, each with a name for a panel:
+    //   static constexpr baker::TweakChoice kLevels[] = {{0, "easy"}, {1, "normal"}};
+    //   Tweak<int> difficulty{"game.difficulty", 1, {.choices = kLevels}};
+    // The data may give its own: (one_of (0 easy) (1 normal)), or bare numbers.
+    std::span<const TweakChoice> choices{};
 };
 
 class TweakRegistry;
@@ -85,11 +97,28 @@ struct TweakFindings {
 
 // Holds `root` (a Config's merged tree) to the tweaks of `tweaks`, as check() holds data to
 // shapes; it changes no tweak. Errors: a value that does not convert to its tweak's type, a
-// number outside its range, a symbol outside its one_of (the data's metadata, else the
-// code's). Warnings: a tweak whose path the data lacks, so it keeps its default; a key no
-// tweak reads beside the tweaks of its group, as a misspelled key looks. Only groups below
-// the top level are read for unknown keys, so structured data beside them stays quiet.
+// number outside its range, a symbol or string outside its one_of, an integer outside its
+// choices (the data's metadata, else the code's). Warnings: a tweak whose path the data lacks, so
+// it keeps its default; a key no tweak reads beside the tweaks of its group, as a misspelled key
+// looks. Only groups below the top level are read for unknown keys, so structured data beside them
+// stays quiet.
 [[nodiscard]] TweakFindings check_tweaks(const Array& root, const TweakRegistry& tweaks);
+
+// A value written with metadata after it, read as a tweak's is: (width 2 (range 0 10)
+// (desc "w")) is the value 2 and the metadata (range 0 10) (desc "w"). Only the trailing
+// arrays tagged range, step, desc, note, kind, group or one_of are metadata, so in
+// (ball (kind ball) (pos 1 2)) everything is value: its last array is not one of them.
+// For a tool presenting data as Baker presents tweaks; it allocates nothing.
+struct ValueMetadata {
+    Values values;
+    std::span<const Node> metadata;  // each an array, in the order written
+};
+[[nodiscard]] ValueMetadata split_metadata(const Values& all) noexcept;
+// The kind a value is presented as: its (kind ...) metadata, else `kind`; else "color" for 3
+// or 4 numbers whose range, the metadata's (range ...) else `range`, is 0 to 1; else empty.
+// The rule TweakBase::kind() applies, for any value.
+[[nodiscard]] std::string_view presented_kind(const Values& all, std::string_view kind = {},
+                                              TweakRange range = {}) noexcept;
 
 class TweakBase {
 public:
@@ -114,8 +143,12 @@ public:
     [[nodiscard]] std::string_view note() const;
     [[nodiscard]] std::string_view kind() const;
     [[nodiscard]] std::string_view group() const;
-    // The symbols the value may be: the data's (one_of ...), else the code's; empty: any.
+    // The symbols or strings the value may be: the data's (one_of ...), else the code's;
+    // empty: any.
     [[nodiscard]] List<Symbol> one_of() const;
+    // The integers the value may be, with their names: the data's (one_of ...), else the
+    // code's; empty: any. A name is interned, so it lives as long as the program.
+    [[nodiscard]] List<TweakChoice> choices() const;
 
     // Appends the current value as data to `out`, for a generic tuning panel (nothing if T
     // cannot be written).
@@ -210,7 +243,7 @@ private:
     Config* config_ = nullptr;
 };
 
-// Every tweak in `tweaks` as JSON (schema baker.tweaks/1.2, docs/reference-json.md), sorted by
+// Every tweak in `tweaks` as JSON (schema baker.tweaks/1.3, docs/reference-json.md), sorted by
 // path: its type and value types, default and current value, metadata (the data's winning
 // over the code's), and, while a config supplies it, where the value came from. For tools
 // and agents.
@@ -232,6 +265,7 @@ struct TweakDescription {
     std::string_view group{};
     bool dev_only = false;
     std::span<const std::string_view> one_of{};
+    std::span<const TweakChoice> choices{};
 };
 
 // Tweaks a tool makes from their descriptions, registered with `registry`, so that

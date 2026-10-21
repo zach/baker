@@ -795,3 +795,72 @@ TEST_CASE("a type or object description check cannot hold is refused, naming it"
     REQUIRE(ctx.declare_object("tank", "Tank"));
     CHECK_FALSE(ctx.declare_object("tank", "Tank"));  // already an object
 }
+
+TEST_CASE("a function with a body and a described signature checks and runs") {
+    Context ctx;
+    int moves = 0;
+    int64_t last = 0;
+    const ParamDescription move[] = {{"int"}};
+    const OverloadDescription move_o[] = {{move, "int"}};
+    REQUIRE(ctx.declare("player.move", move_o, [&](Args& a) -> Expected<Node> {
+        ++moves;
+        last = a.raw(0).try_int().value_or(-1);  // evaluated already: the value, not {...}
+        return Node(last);
+    }));
+    const OverloadDescription hold_o[] = {{{}, "nothing"}};
+    REQUIRE(
+        ctx.declare("player.hold_jump", hold_o, [](Args&) -> Expected<Node> { return Node(); }));
+    const ParamDescription later[] = {{"unevaluated", "raw", true}};
+    const OverloadDescription later_o[] = {{later, "value"}};
+    REQUIRE(ctx.declare("later", later_o, [](Args& a) -> Expected<Node> {
+        return Node(int64_t{a.raw(0).type() == Type::Command ? 1 : 0});  // as written
+    }));
+
+    // check holds calls to the description, as for a native.
+    const auto tree = parse(
+        "{player.move}\n{player.hold_jump 1 2 3}\n{player.move fast}\n"
+        "{player.move 2}\n",
+        "scenario.dta");
+    const CheckReport r = check(*tree, ctx);
+    REQUIRE(r.errors.size() == 3);
+    CHECK(r.errors[0].line() == 1);
+    CHECK(r.errors[2].line() == 3);
+
+    // A call runs the body, with its arguments evaluated and held to their types.
+    REQUIRE(ctx.eval("{set $n 4}", "t"));
+    auto ran = ctx.eval("{player.move {+ $n 1}}", "t");
+    REQUIRE(ran);
+    CHECK(last == 5);
+    CHECK(moves == 1);
+    auto wrong = ctx.eval("{player.move fast}", "t");
+    REQUIRE_FALSE(wrong);
+    CHECK(std::string(wrong.error().message()).find("argument 1 of 'player.move' is symbol") !=
+          std::string::npos);
+    CHECK(moves == 1);  // the body did not run
+    CHECK(ok(ctx.eval("{later {player.move 1}}", "t")).try_int() == 1);
+    CHECK(moves == 1);  // a raw argument is passed as written, not run
+
+    // The reference lists the described parameters.
+    std::string json;
+    write_reference_json(ctx, string_out(json));
+    CHECK(json.find(R"j({"name": "player.move", "tier": "native")j") != std::string::npos);
+    CHECK(json.find(R"j({"type": "int", "kind": "value", "raw": false, "values": ["int"]})j") !=
+          std::string::npos);
+}
+
+TEST_CASE("a tool tells a type already known from a refusal without reading words") {
+    Context ctx;
+    CHECK(ctx.has_type("Scheduler"));  // Baker's own, as every Context has it
+    CHECK_FALSE(ctx.has_type("Tank"));
+    const auto again = ctx.declare_type("Scheduler", {}, {});
+    REQUIRE_FALSE(again);
+    CHECK(again.error().code() == ErrorCode::Refused);
+    const Symbol unknown[] = {Symbol("Vehicle")};
+    const auto base = ctx.declare_type("Tank", unknown, {});
+    REQUIRE_FALSE(base);
+    CHECK(base.error().code() == ErrorCode::Type);
+    REQUIRE(ctx.declare_type("Tank", {}, {}));
+    CHECK(ctx.has_type("Tank"));
+    CHECK(ctx.declare_object("scheduler", "Tank").error().code() == ErrorCode::Refused);
+    CHECK(ctx.declare_object("t", "Plane").error().code() == ErrorCode::Type);
+}

@@ -232,11 +232,16 @@ Str quoted(std::string_view s) {
 
 }  // namespace
 
-Expected<void> Book::read(std::string_view path, const LoadSession::Reader& reader) {
+Expected<void> Book::read(std::string_view path, const LoadSession::Reader& reader,
+                          const Lister& list) {
     std::error_code ec;
     Vec<Str> files;
     const fs::path p(Str(path).c_str());
-    if (fs::is_directory(p, ec)) {
+    if (list && list(path, [&](std::string_view f) {
+            if (f.size() > 4 && f.substr(f.size() - 4) == ".dta") files.emplace_back(f);
+        })) {
+        std::sort(files.begin(), files.end());
+    } else if (fs::is_directory(p, ec)) {
         for (const auto& entry : fs::directory_iterator(p, ec))
             if (entry.path().extension() == ".dta")
                 files.emplace_back(entry.path().generic_string());

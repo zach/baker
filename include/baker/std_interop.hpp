@@ -96,10 +96,28 @@ struct Convert<std::vector<T>> {
     }
 };
 
+namespace detail {
+// N of T's value type, for a T of one value of Baker's type; none for any other T, whose
+// values nest in each element and cannot be listed flat.
+template <class T, size_t N>
+[[nodiscard]] constexpr auto repeated_value_types() noexcept {
+    if constexpr (convert_info<T>().kind != ConvertKind::Compound && value_types<T>().size() == 1) {
+        std::array<std::string_view, N> types{};
+        for (std::string_view& t : types) t = value_types<T>()[0];
+        return types;
+    } else {
+        return std::array<std::string_view, 0>{};
+    }
+}
+}  // namespace detail
+
 // Exactly N values, each read as T: (color 1 0.5 0) as std::array<float, 3>.
 template <class T, size_t N>
 struct Convert<std::array<T, N>> {
     static constexpr std::string_view name = "fixed-size list";
+    // {"float32", "float32", "float32"} for std::array<float, 3>: the reference writes them,
+    // and a tool checks without the game by them.
+    static constexpr auto values = detail::repeated_value_types<T, N>();
     static bool from(const Values& v, std::array<T, N>& out) {
         if (v.size() != N) return false;
         for (size_t i = 0; i < N; ++i)

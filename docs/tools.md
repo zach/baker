@@ -41,6 +41,26 @@ network store. Nothing here costs anything until you call it.
 of text into one line of JSON (see [the reply format](reply-json.md)). Together they let any
 transport you choose carry Baker's tools: a socket, a pipe, an in-game console.
 
+### Text as a person types it
+
+An editor works on text that rarely parses, and checks it on every pause:
+
+- **Its structure.** `read_structure(text)` reads the text with the parser's own lexer and
+  gives back every token (with its kind and byte span), every bracket (its parent and its
+  tag) and every comment, even when the text does not parse. An unclosed bracket runs to the
+  end of the text, an unterminated string or comment ends there, and the problems are listed
+  beside the rest. It reads 2 MB in about 25 ms. The outline, folding, completion, hover, a
+  rename and a highlighter can all work from it, with no lexer of the tool's own.
+- **Values as Baker presents them.** `split_metadata(values)` separates a value from the
+  metadata after it, `(width 2 (range 0 10))`, and `presented_kind(values)` gives the kind a
+  value is shown as (its `(kind ...)`, or "color" for 3 or 4 numbers ranged 0 to 1). These
+  are the rules tweaks follow.
+- **Checking again after an edit.** Keep one Config, reading through a reader that serves
+  the open editors' text, and call `reload()` after each edit. It compares each layer's text
+  by hash and reads again only from the first layer whose text changed, upward, so an edit
+  to a small top layer above a 2 MB one reloads in about 2 ms where a fresh load takes about
+  57. The result, its errors included, is what a fresh load gives.
+
 ## What the host does
 
 Each of these has a ready-made form in [the host kit](#the-host-kit); a host with its own
@@ -88,6 +108,9 @@ built, the shape validator, binds the Config's tools, and runs every layer's `#a
 `changed` is called after the load, after each change to the stack once `#autorun` has
 run again, and after a live edit. The Config's clock is the files', so `loop_stats()`
 measures from the save to the frame that showed it. A quiet frame allocates nothing.
+`.console_any_port = true` serves the console on a free port instead, which
+`console_port()` reports: a tool that starts several instances of the game reads each one's
+port from it rather than choosing one first.
 
 ### `Watcher`: the files the stack was read from
 
@@ -144,12 +167,16 @@ through your file access, as `Live` does, for files under an engine's own roots.
 
 - **Files.** The project file (`baker-project.dta`) gives the stack. It names the reference
   JSON your build writes (`(reference "build/reference.json")`), the game binary that answers
-  the commands (`(tool ...)`), and its scenarios and objectives (`(scenarios ...)`,
-  `(objectives ...)`).
+  the commands (`(tool ...)`, then any arguments the binary takes first, such as an engine's
+  `(tool "engine" "--path" "." "--")`, which a tool runs from the project file's directory),
+  the port its console listens on (`(console 4555)`, which
+  the game may use as its default while its own command line wins), and its scenarios and
+  objectives (`(scenarios ...)`, `(objectives ...)`).
 - **Documents.** [The reference](reference-json.md), [check's report](check-json.md),
   [the reply](reply-json.md) and [sim's results](sim-json.md) are versioned JSON. A field is added only with a new minor
   version.
 - **The console.** One request per line, one JSON reply per line, to a running game.
+  `{config.epoch}` says whether anything changed since a tool last asked.
 - **Commands.** Your game binary's own commands, run by the tool.
 
 A tool that checks data without the game reads the project file, then the reference, and

@@ -58,10 +58,13 @@ struct Book {
     Vec<Scenario> scenarios{};
     Vec<Ref<Array>> trees{};
 
+    using Lister = Callback<bool(std::string_view dir, Callback<void(std::string_view path)>)>;
     // Reads `path`: a file, or every .dta file of a directory in name order (a directory is
-    // listed on the disk; a file is read through `reader` if given). A path that does not
-    // exist reads nothing. An error for a file that does not parse, or a malformed form.
-    [[nodiscard]] Expected<void> read(std::string_view path, const LoadSession::Reader& reader);
+    // listed by `list` if it has it, else on the disk; a file is read through `reader` if
+    // given). A path that does not exist reads nothing. An error for a file that does not
+    // parse, or a malformed form.
+    [[nodiscard]] Expected<void> read(std::string_view path, const LoadSession::Reader& reader,
+                                      const Lister& list = {});
 };
 
 struct ObjectiveResult {

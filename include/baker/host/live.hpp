@@ -22,7 +22,7 @@
 //     `console_write`;
 //   - runs every enabled layer's #autorun commands, then calls `changed`;
 //   - watches the stack's files and the project file, and serves the console on
-//     `console_port` if one is given.
+//     `console_port` if one is given, or on a free port with `console_any_port`.
 // After any change to the stack (a reload, a toggle from a panel, a layer pushed through
 // the console) it runs #autorun again at the next begin_frame, then calls `changed`, where
 // the game reads its structured data; after a live edit (epoch() moved) it calls `changed`
@@ -63,8 +63,11 @@ struct LiveOptions {
     LoadSession::Reader reader{};
     DiskPathHook disk_path{};
     StampHook stamp{};
-    bool watch = true;           // false: reload only when asked (tests, a headless runner)
-    uint16_t console_port = 0;   // 0: no console
+    bool watch = true;          // false: reload only when asked (tests, a headless runner)
+    uint16_t console_port = 0;  // 0: no console
+    // A console on a free port instead, for a tool that starts the game and must not collide
+    // with another instance: console_port() then says which.
+    bool console_any_port = false;
     bool console_write = false;  // also bind config.write_back and config.promote
     // After the load, after each change to the stack once #autorun has run, and at the
     // next begin_frame after a live edit (a set(), from the game, a bound tweak, or the

@@ -120,6 +120,7 @@ and the game and every tool read it.
    (defines PC)                       ; flags, as #ifdef sees them
    (reference "build/reference.json") ; for tools: where the build writes the reference
    (tool "build/bin/my_game")         ; for tools: the binary that answers the commands
+   (console 4555)                     ; for tools: the port the game's console listens on
    (scenarios "sim")                  ; for sim: scenarios and objectives (docs/sim-json.md)
    (objectives "metrics")
    (layers                            ; bottom to top
@@ -587,7 +588,10 @@ people. Two calls give it what it needs:
     `{config.snapshot a}`: live edits and A/B;
   - `{config.clear player.speed}`: drops that one live edit, so the value is the files'
     again. It returns 1 if there was an edit, 0 if not;
-  - `{config.journal}` and `{config.unsaved}`: what was tuned, and what was not kept.
+  - `{config.journal}` and `{config.unsaved}`: what was tuned, and what was not kept;
+  - `{config.epoch}`: a number that moves on every reload, layer change and live edit. A
+    tool showing the game's values asks for it, and for the values again only when it
+    moved.
 
   They are documented, so `reference` lists them and `check` checks calls to them. A
   shipping build binds only the reading tools. `config.write_back` and `config.promote`

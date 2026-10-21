@@ -28,6 +28,7 @@ add_executable(baker_data_tests
   data/test_project.cpp
   data/test_parse.cpp
   data/test_preprocessor.cpp
+  data/test_structure.cpp
   data/test_version.cpp
   data/test_write.cpp
   readiness_loop.cpp)

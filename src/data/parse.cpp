@@ -65,11 +65,31 @@ public:
         return true;
     }
 
+    // Tolerant: each problem goes to `errors` and the lexing goes on (read_structure), and
+    // each comment's span to `comments`.
+    void tolerate(Vec<Error>& errors, Vec<TextComment>& comments) noexcept {
+        soft_ = &errors;
+        comments_ = &comments;
+    }
+
 private:
     bool fail(Error& err, ErrorCode code, std::string_view msg, int32_t line, size_t at) {
         err = make_error(code, msg, file_, line);
         err.set_column(column_at(at));
         return false;
+    }
+    // A problem the lexer goes on past when tolerant; false, as fail, when not.
+    bool soft(Error& err, ErrorCode code, std::string_view msg, int32_t line, size_t at) {
+        if (!soft_) return fail(err, code, msg, line, at);
+        Error e;
+        (void)fail(e, code, msg, line, at);
+        soft_->push_back(std::move(e));
+        return true;
+    }
+    void comment(int32_t line, size_t begin, bool block) {
+        if (comments_)
+            comments_->push_back(
+                {line, static_cast<uint32_t>(begin), static_cast<uint32_t>(pos_), block});
     }
 
 public:
@@ -113,17 +133,24 @@ private:
                 if (c == '\n') ++line_;
                 ++pos_;
             } else if (c == ';') {
+                const size_t opened = pos_;
                 pos_ = std::min(src_.find('\n', pos_), n);  // to the newline, as memchr
+                comment(line_, opened, false);
             } else if (c == '/' && pos_ + 1 < n && src_[pos_ + 1] == '*') {
                 const int32_t start = line_;
                 const size_t opened = pos_;
                 pos_ += 2;
                 for (;;) {
-                    if (pos_ + 1 >= n)
-                        return fail(err, ErrorCode::Syntax, "unterminated /* comment", start,
-                                    opened);
+                    if (pos_ + 1 >= n) {
+                        if (!soft(err, ErrorCode::Syntax, "unterminated /* comment", start, opened))
+                            return false;
+                        pos_ = n;  // the comment runs to the end
+                        comment(start, opened, true);
+                        break;
+                    }
                     if (src_[pos_] == '*' && src_[pos_ + 1] == '/') {
                         pos_ += 2;
+                        comment(start, opened, true);
                         break;
                     }
                     if (src_[pos_] == '\n') ++line_;
@@ -164,12 +191,15 @@ private:
         const int32_t start_line = line_;
         const size_t begin = ++pos_;
         // Neither escape contains a quote, so the string ends at the first one.
-        const size_t i = src_.find('"', begin);
-        if (i == std::string_view::npos)
-            return fail(err, ErrorCode::Syntax, "unterminated string", start_line, begin - 1);
+        size_t i = src_.find('"', begin);
+        if (i == std::string_view::npos) {
+            if (!soft(err, ErrorCode::Syntax, "unterminated string", start_line, begin - 1))
+                return false;
+            i = src_.size();  // the string runs to the end
+        }
         const std::string_view raw = src_.substr(begin, i - begin);
         line_ += count_lines(raw);
-        pos_ = i + 1;
+        pos_ = std::min(i + 1, src_.size());
         t.kind = Tok::String;
         if (raw.find('\\') == std::string_view::npos) {
             t.text = raw;
@@ -191,15 +221,18 @@ private:
     bool lex_quoted_symbol(Token& t, Error& err) {
         const int32_t start_line = line_;
         const size_t begin = ++pos_;
-        const size_t end = src_.find('\'', begin);
-        if (end == std::string_view::npos)
-            return fail(err, ErrorCode::Syntax, "unterminated 'quoted symbol'", start_line,
-                        begin - 1);
+        size_t end = src_.find('\'', begin);
+        if (end == std::string_view::npos) {
+            if (!soft(err, ErrorCode::Syntax, "unterminated 'quoted symbol'", start_line,
+                      begin - 1))
+                return false;
+            end = src_.size();  // runs to the end
+        }
         t.kind = Tok::Symbol;
         t.quoted = true;
         t.text = src_.substr(begin, end - begin);
         line_ += count_lines(t.text);
-        pos_ = end + 1;
+        pos_ = std::min(end + 1, src_.size());
         return true;
     }
 
@@ -213,8 +246,9 @@ private:
             return true;
         }
         if (atom[0] == '$') {
-            if (atom.size() == 1)
-                return fail(err, ErrorCode::Syntax, "'$' without a variable name", t.line, begin);
+            if (atom.size() == 1 &&
+                !soft(err, ErrorCode::Syntax, "'$' without a variable name", t.line, begin))
+                return false;
             t.kind = Tok::Var;
             t.text = atom.substr(1);
             return true;
@@ -230,10 +264,12 @@ private:
                 t.f = num.f;
                 return true;
             case NumberKind::IntOutOfRange:
-                return fail(err, ErrorCode::Range,
+                t.kind = Tok::Int;
+                return soft(err, ErrorCode::Range,
                             "integer " + Str(atom) + " is out of 64-bit range", t.line, begin);
             case NumberKind::FloatOutOfRange:
-                return fail(err, ErrorCode::Range, "float " + Str(atom) + " is out of double range",
+                t.kind = Tok::Float;
+                return soft(err, ErrorCode::Range, "float " + Str(atom) + " is out of double range",
                             t.line, begin);
             case NumberKind::NotNumber: break;
         }
@@ -249,6 +285,8 @@ private:
     Str buf_;  // decoded string with escapes; valid until the next string token
     bool has_peek_ = false;
     Token peeked_;
+    Vec<Error>* soft_ = nullptr;            // tolerant: the problems gone past
+    Vec<TextComment>* comments_ = nullptr;  // tolerant: the comments' spans
 };
 
 bool read_disk_file(std::string_view path, TextSink out) {
@@ -1293,6 +1331,103 @@ Expected<Ref<Array>> read_file(std::string_view path, LoadSession& session) {
 Expected<Ref<Array>> read_file(std::string_view path) {
     LoadSession session;
     return read_file(path, session);
+}
+
+}  // namespace baker
+
+// --- What a text holds, for tools ---
+
+namespace baker {
+
+TextStructure read_structure(std::string_view text, Symbol file) {
+    using detail::Tok;
+    Vec<Error> errors;
+    Vec<TextComment> comments;
+    Vec<TextToken> tokens;
+    Vec<TextBracket> brackets;
+    Vec<int32_t> open;    // the brackets not yet closed, innermost last
+    Vec<Symbol> macros;   // the names [name ...] at the top level defines, in order
+    int32_t fresh = -1;   // a bracket just opened, whose first token may be its tag
+    bool naming = false;  // the next symbol names a macro
+    detail::Lexer lexer(text, file);
+    lexer.tolerate(errors, comments);
+    auto problem = [&](const Str& message, int32_t line, uint32_t at) {
+        Error e = make_error(ErrorCode::Syntax, message, file, line);
+        e.set_column(lexer.column_at(at));
+        errors.push_back(std::move(e));
+    };
+    for (;;) {
+        detail::Token t;
+        Error ignored;
+        (void)lexer.next(t, ignored);  // tolerant: it goes on past every problem
+        if (t.kind == Tok::End) break;
+        TextToken out{.bracket = t.bracket, .line = t.line, .begin = t.begin, .end = t.end};
+        const auto index = static_cast<int32_t>(tokens.size());
+        switch (t.kind) {
+            case Tok::Open: {
+                out.kind = TextTokenKind::Open;
+                const int32_t parent = open.empty() ? -1 : open.back();
+                naming = t.bracket == '[' && parent == -1;
+                fresh = static_cast<int32_t>(brackets.size());
+                brackets.push_back({.open = t.bracket,
+                                    .line = t.line,
+                                    .begin = t.begin,
+                                    .end = static_cast<uint32_t>(text.size()),
+                                    .parent = parent});
+                open.push_back(fresh);
+                tokens.push_back(out);
+                continue;
+            }
+            case Tok::Close: {
+                out.kind = TextTokenKind::Close;
+                fresh = -1;
+                if (open.empty()) {
+                    problem("unexpected " + Str(detail::bracket_name(t.bracket)), t.line, t.begin);
+                    continue;  // a stray close is left out
+                }
+                TextBracket& b = brackets[open.back()];
+                const char want = b.open == '(' ? ')' : b.open == '{' ? '}' : ']';
+                if (t.bracket != want)
+                    problem(Str(detail::bracket_name(t.bracket)) + " closes " +
+                                Str(detail::bracket_name(b.open)) + " opened on line " +
+                                detail::decimal(b.line),
+                            t.line, t.begin);
+                b.end = t.end;
+                b.closed = t.bracket == want;
+                open.pop_back();
+                tokens.push_back(out);
+                continue;
+            }
+            case Tok::Int: out.kind = TextTokenKind::Int; break;
+            case Tok::Float: out.kind = TextTokenKind::Float; break;
+            case Tok::String: out.kind = TextTokenKind::String; break;
+            case Tok::Var: out.kind = TextTokenKind::Variable; break;
+            case Tok::Directive: out.kind = TextTokenKind::Directive; break;
+            case Tok::Symbol: {
+                out.kind = t.quoted ? TextTokenKind::QuotedSymbol : TextTokenKind::Symbol;
+                const Symbol name(t.text);
+                if (!t.quoted && naming && fresh >= 0) {
+                    macros.push_back(name);
+                } else if (!t.quoted &&
+                           std::find(macros.begin(), macros.end(), name) != macros.end()) {
+                    out.kind = TextTokenKind::Macro;
+                }
+                if (fresh >= 0) brackets[fresh].tag = index;
+                break;
+            }
+            case Tok::End: break;
+        }
+        fresh = -1;
+        naming = false;
+        tokens.push_back(out);
+    }
+    for (const int32_t b : open)
+        problem("unclosed " + Str(detail::bracket_name(brackets[b].open)), brackets[b].line,
+                brackets[b].begin);
+    return {List<TextToken>({tokens.data(), tokens.size()}),
+            List<TextBracket>({brackets.data(), brackets.size()}),
+            List<TextComment>({comments.data(), comments.size()}),
+            List<Error>({errors.data(), errors.size()})};
 }
 
 }  // namespace baker

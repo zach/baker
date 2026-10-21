@@ -141,9 +141,46 @@ TEST_CASE("a project names the tool binary, its scenarios and objectives") {
     Config cfg({.tweaks = nullptr});
     REQUIRE(open_project(cfg, p));
     CHECK(cfg.get<int>("speed") == 1);
+    CHECK(p.console_port == 0);  // none named
     const std::string bad = dir.write("bad.dta", "(project (tool) (layers (d \"d.dta\")))");
-    CHECK(std::string(read_project(bad).error().message()).find("(tool \"path\")") !=
+    CHECK(
+        std::string(read_project(bad).error().message()).find("(tool \"path\" \"argument\"...)") !=
+        std::string::npos);
+}
+
+TEST_CASE("a project's tool may take arguments of its own") {
+    TempDir dir;
+    const std::string file =
+        dir.write("baker-project.dta",
+                  "(project\n   (tool \"bin/engine\" \"--path\" \".\" \"--headless\" \"--\")\n"
+                  "   (layers (d \"d.dta\")))\n");
+    const Project p = ok(read_project(file));
+    CHECK(p.tool == Symbol(dir.path("bin/engine")));  // the binary is joined, as before
+    REQUIRE(p.tool_args.size() == 4);                 // the arguments are as written
+    CHECK(p.tool_args[0] == Symbol("--path"));
+    CHECK(p.tool_args[1] == Symbol("."));
+    CHECK(p.tool_args[3] == Symbol("--"));
+    const std::string bad =
+        dir.write("bad.dta", "(project (tool \"bin/engine\" 3) (layers (d \"d.dta\")))");
+    CHECK(std::string(read_project(bad).error().message()).find("arguments are strings") !=
           std::string::npos);
+}
+
+TEST_CASE("a project names its console's port, for tools") {
+    TempDir dir;
+    const std::string file =
+        dir.write("baker-project.dta", "(project\n   (console 4556)\n   (layers (d \"d.dta\")))\n");
+    const Project p = ok(read_project(file));
+    CHECK(p.console_port == 4556);
+    CHECK(p.console_at.line == 2);
+    for (const char* bad : {"(console)", "(console 0)", "(console 70000)", "(console \"4556\")"}) {
+        CAPTURE(bad);
+        const std::string f =
+            dir.write("bad.dta", "(project " + std::string(bad) + " (layers (d \"d.dta\")))");
+        const auto r = read_project(f);
+        REQUIRE_FALSE(r);
+        CHECK(std::string(r.error().message()).find("(console PORT)") != std::string::npos);
+    }
 }
 
 TEST_CASE("a layer marked dev_only never reaches a shipping build") {

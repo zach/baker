@@ -134,6 +134,18 @@ TEST_CASE("config.clear drops one path's live edit, and says whether there was o
     CHECK(eval(f.ctx, "{config.unsaved}") == "(box/height)");
 }
 
+TEST_CASE("config.epoch moves on every change, and only then") {
+    Fixture f;
+    const std::string before = eval(f.ctx, "{config.epoch}");
+    CHECK(before == std::to_string(f.cfg.epoch()));
+    CHECK(eval(f.ctx, "{config.epoch}") == before);  // asking changes nothing
+    REQUIRE(f.ctx.eval("{config.set box.width 4.5}", "test"));
+    const std::string after = eval(f.ctx, "{config.epoch}");
+    CHECK(after != before);
+    CHECK(eval(f.ctx, "{config.toggle local}") == "0");
+    CHECK(eval(f.ctx, "{config.epoch}") != after);
+}
+
 TEST_CASE("the writers are bound only when allowed, and write through the Config") {
     {
         Fixture f;

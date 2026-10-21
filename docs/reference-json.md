@@ -1,4 +1,4 @@
-# The vocabulary as JSON: `baker.reference/1.2`, `baker.tweaks/1.2`, `baker.shapes/1.1`
+# The vocabulary as JSON: `baker.reference/1.2`, `baker.tweaks/1.3`, `baker.shapes/1.1`
 
 Three documents describe what a program's data and script may say, for editors, agents,
 and other tools that should not scrape the Markdown reference:
@@ -6,7 +6,7 @@ and other tools that should not scrape the Markdown reference:
 | Document | Written by | Library |
 |---|---|---|
 | `baker.reference/1.2` | `baker::write_reference_json(ctx, sink, &session)` | `baker::script` |
-| `baker.tweaks/1.2` | `baker::write_json(registry, sink)` | `baker::data` |
+| `baker.tweaks/1.3` | `baker::write_json(registry, sink)` | `baker::data` |
 | `baker.shapes/1.1` | `baker::shape::write_json(shapes, sink)` | `baker::shape` |
 
 They are separate so that a data-only program can write its tweaks and the script library
@@ -76,6 +76,11 @@ editor, a CI job) can register each function from its overloads with
 - **A type of the game's own** as a parameter, such as a `vec2`, is checked by its
   `values`: give them in the `ParamDescription`, and `check` holds a literal argument to
   them as the game's converter reads it, so `{aim 1}` where a `vec2` is wanted is an error.
+- **A function with a body.** A host whose functions come from a scripting language of its
+  own, with no C++ signature, registers each with `Context::declare(name, overloads, body)`:
+  `check` and the reference see the described parameters, and a call runs `body`. When no
+  parameter is raw, each argument is evaluated once and held to its parameter's type
+  first, as a native's is.
 - **Types and objects.** `Context::declare_type(name, bases, methods)` declares a type from
   its entry in `types`: its bases (each a type the Context already knows, so declare bases
   first) and each method as a `MethodDescription`, a name and its overloads.
@@ -98,7 +103,7 @@ editor, a CI job) can register each function from its overloads with
 - A property has `name`, `type` and `doc`.
 - `handlers` names the script handlers that `{class}` or `{extend}` attached.
 
-## `baker.tweaks/1.2`
+## `baker.tweaks/1.3`
 
 `tweaks` lists every tweak in the registry, by path. Each one has:
 
@@ -113,7 +118,8 @@ editor, a CI job) can register each function from its overloads with
 | `range` | `[min, max]`, or `null` |
 | `step`, `desc`, `kind`, `group` | metadata; the data's wins over the code's |
 | `dev_only` | the code's flag: a shipping build keeps the default |
-| `one_of` | the symbols the value may be, in order: the data's `(one_of ...)`, else the code's; `[]`: any (added in 1.1) |
+| `one_of` | the symbols, or a string tweak's strings, the value may be, in order: the data's `(one_of ...)`, else the code's; `[]`: any (added in 1.1; strings in 1.3) |
+| `choices` | the integers an integer tweak may be, each `{"value", "name"}`: the data's `(one_of (0 easy) (1 normal))`, else the code's `TweakMeta::choices`; `[]`: any (added in 1.3) |
 | `source` | while bound: `{layer, file, line}`; otherwise `null` |
 
 ### Checking data against tweaks without the game
@@ -149,7 +155,9 @@ A described tweak reads each value as the game's converter would with `Values::r
 `(aim 1)` where a `vec2` is wanted fails in the tool as it fails in the game. A description
 it cannot hold is an error naming the tweak: a type of the game's own with no `values`, a
 value type that is not one of Baker's, or a default that does not read as its types. A type
-whose count of values is the data's (a list) has no `values` and cannot be described yet.
+whose count of values is the data's (a `std::vector`) has no `values` and cannot be
+described yet. A fixed-size list of one of Baker's single-value types (`std::array<float, 3>`)
+declares its own: three `float32`s.
 
 ## `baker.shapes/1.1`
 

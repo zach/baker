@@ -3,6 +3,44 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.5.0 - 2026-10-21
+
+- **New for tools that check without the game:**
+  - **`read_structure(text)`** reads text with the parser's own lexer even when it does not
+    parse. It gives every token, bracket and comment with byte spans, and lists the problems
+    beside them, for an editor while a person types, a formatter or a highlighter.
+  - **`split_metadata` and `presented_kind`** are the rules a tweak follows, callable on any
+    value. The first separates a value from the metadata after it; the second gives the kind
+    a value is shown as, "color" for 3 or 4 numbers ranged 0 to 1.
+  - **`Context::has_type(name)`**, and `declare_type` and `declare_object` refuse a name
+    already taken with `ErrorCode::Refused`.
+  - **Checking again after an edit:** keep one Config, read through a reader that serves the
+    open editors' text, and call `reload()`. It reads again only from the first layer whose
+    text changed. `docs/tools.md` describes it.
+  - **Fixed-size lists** (`std::array<float, 3>`) declare their value types, so a tool can
+    describe such a tweak or parameter.
+- **New for hosts with a scripting language or engine of their own:**
+  - **`Context::declare(name, overloads, body)`** registers a function built at runtime with
+    a described signature. `check` counts its arguments and checks their types, and a call
+    holds each argument to its type before the body runs.
+  - **`CommandHooks::list`** lists a directory of the host's own files, such as an archive's,
+    so `sim` finds scenario directories wherever the stack's files live.
+  - **`LiveOptions::console_any_port`** serves the console on a free port, which
+    `console_port()` reports.
+  - **`{config.epoch}`** says whether anything changed since a tool last asked.
+  - **The project file** may name the console's port, `(console 4555)`, and the tool's
+    arguments, `(tool "engine" "--path" "." "--")`.
+- **New: allowed values for string and integer tweaks.** A string tweak takes `one_of`; an
+  integer tweak takes named choices, `TweakMeta::choices` or `(one_of (0 easy) (1 normal))`
+  in the data. `check` holds the data to both.
+- **What breaks:**
+  - `baker.tweaks/1.3` adds `choices`, and `one_of` also lists a string tweak's strings.
+  - Each `check_tweaks` finding carries its tweak's path, or a stray key's own path, as its
+    error path, so `to_string` of one now ends with that path.
+  - `declare_type` and `declare_object` report a name already taken as `ErrorCode::Refused`,
+    where it was `ErrorCode::Type`.
+  - Code that reads `detail::ParamInfo` directly reads its type name with `type()`.
+
 ## 0.4.0 - 2026-10-21
 
 - **New in the host kit: a scenario run your own loop advances.** `sim` steps your game

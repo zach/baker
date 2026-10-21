@@ -7,6 +7,7 @@
 
 #include "temp_dir.hpp"
 
+#include <map>
 #include <string>
 
 namespace sim = baker::host::sim;
@@ -228,4 +229,31 @@ TEST_CASE("sim: an objective (over median) is judged by its median over a scenar
     CHECK(broke);
     CHECK(json.find("\"over\": \"median\"") != std::string::npos);
     CHECK(json.find("\"line\": 2") != std::string::npos);  // counter.typical, located
+}
+
+TEST_CASE("sim: a directory the host lists is read in name order, through its reader") {
+    std::map<std::string, std::string> files = {
+        {"pak://sim/b.dta", "(scenario second (seconds 1))"},
+        {"pak://sim/a.dta", "(scenario first (seconds 1))"},
+        {"pak://sim/notes.txt", "not data"}};
+    const baker::LoadSession::Reader reader = [&](std::string_view path, baker::TextSink out) {
+        const auto it = files.find(std::string(path));
+        if (it == files.end()) return false;
+        out(it->second);
+        return true;
+    };
+    const sim::Book::Lister list = [&](std::string_view dir,
+                                       baker::Callback<void(std::string_view)> file) {
+        if (dir != "pak://sim") return false;
+        for (const auto& [name, text] : files) file(name);  // in any order: the kit sorts
+        return true;
+    };
+    sim::Book book;
+    REQUIRE(book.read("pak://sim", reader, list));
+    REQUIRE(book.scenarios.size() == 2);
+    CHECK(book.scenarios[0].name.str() == "first");
+    CHECK(book.scenarios[1].name.str() == "second");
+    sim::Book unlisted;  // without the lister, a directory only the host has reads nothing
+    REQUIRE(unlisted.read("pak://sim", reader));
+    CHECK(unlisted.scenarios.empty());
 }

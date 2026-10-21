@@ -73,7 +73,7 @@ def reference(s):
     names = [f["name"] for f in r["reference"]["functions"]]
     expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.2" and "spawn" in names,
            "reference --json: the game's functions")
-    expect(r["shapes"]["schema"] == "baker.shapes/1.1" and r["tweaks"]["schema"] == "baker.tweaks/1.2",
+    expect(r["shapes"]["schema"] == "baker.shapes/1.1" and r["tweaks"]["schema"] == "baker.tweaks/1.3",
            "reference --json: tweaks and shapes")
     code, out, _ = s.run("reference")
     expect(code == 0 and "spawn" in out, "reference: Markdown")
@@ -158,6 +158,11 @@ def scenarios(s):
     code, out, _ = s.run("sim", "--scenario", "walk", "--step-hz", "30", "--json")
     expect(code == 1 and json.loads(out)["runs"][0]["steps"] == 60,
            "--step-hz sets the step rate (the steps objective wants 120)")
+    # Through the host's reader and lister: game://sim is a directory only the host knows.
+    code, out, _ = s.run("sim", "--seed", "1", "--json", "--root", str(s.dir))
+    r = json.loads(out)
+    expect(code == 0 and len(r["runs"]) == 1 and r["runs"][0]["file"] == "game://sim/walk.dta",
+           "sim lists a scenario directory through the host, and reads it through its reader")
     # compare: the same results, then an objective that broke.
     expect(s.run("sim", "--seeds", "1-2", "--results", "before")[0] == 0,
            "--results DIR writes the results")

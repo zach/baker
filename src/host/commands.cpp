@@ -92,7 +92,7 @@ Expected<void> read_book(const Loaded& l, sim::Book& book) {
     if (!project) return {};
     for (const List<ProjectEntry>* list : {&project->objectives, &project->scenarios})
         for (const ProjectEntry& e : *list)
-            if (auto r = book.read(e.value.str(), l.hooks.reader); !r) return r;
+            if (auto r = book.read(e.value.str(), l.hooks.reader, l.hooks.list); !r) return r;
     return {};
 }
 

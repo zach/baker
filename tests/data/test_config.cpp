@@ -1124,3 +1124,47 @@ TEST_CASE("write-back keeps an integer token's form when a float value is whole"
     CHECK(dir.read("default.dta").rfind("(player (height 150) (speed 3.0)", 0) == 0);
 }
 #endif
+
+TEST_CASE(
+    "a tool keeps a Config and reloads: unchanged layers are kept, the result a fresh load's "
+    "") {
+    if constexpr (kShipping) return;  // reload() is refused
+    std::map<std::string, std::string> files = {{"mem/default.dta", "(a 1)\n(b 2)\n"},
+                                                {"mem/local.dta", "(b 3)\n"}};
+    const LoadSession::Reader reader = [&](std::string_view p, TextSink out) {
+        const auto it = files.find(std::string(p));
+        if (it == files.end()) return false;
+        out(it->second);
+        return true;
+    };
+    auto open = [&](Config& cfg) -> Expected<void> {
+        cfg.session().set_reader(reader);
+        if (auto r = cfg.push_layer("default", "mem/default.dta"); !r) return r;
+        return cfg.push_layer("local", "mem/local.dta");
+    };
+    Config kept({.tweaks = nullptr});
+    REQUIRE(open(kept));
+    const Ref<Array> below = kept.layer_root("default");
+
+    // An edit to the top layer, by its text alone: no file times.
+    files["mem/local.dta"] = "(b 4)\n(c 5)\n";
+    REQUIRE(ok(kept.reload()));
+    CHECK(kept.layer_root("default").get() == below.get());  // not read again
+    Config fresh({.tweaks = nullptr});
+    REQUIRE(open(fresh));
+    CHECK(to_string(*kept.root()) == to_string(*fresh.root()));
+    CHECK(kept.source("b")->line == fresh.source("b")->line);
+
+    // Text that does not parse: the same error a fresh load gives, and the next edit reads.
+    files["mem/local.dta"] = "(b 4\n";
+    const auto broken = kept.reload();
+    REQUIRE_FALSE(broken);
+    Config fresh_broken({.tweaks = nullptr});
+    const auto fresh_error = open(fresh_broken);
+    REQUIRE_FALSE(fresh_error);
+    CHECK(to_string(broken.error()) == to_string(fresh_error.error()));
+    files["mem/local.dta"] = "(b 6)\n";
+    REQUIRE(ok(kept.reload()));
+    CHECK(kept.get<int>("b") == 6);
+    CHECK(kept.layer_root("default").get() == below.get());
+}

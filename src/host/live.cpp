@@ -126,9 +126,9 @@ Expected<void> Live::open(const LiveOptions& options) {
             im.watching = true;
             im.rewatch();
         }
-        if (options.console_port) {
+        if (options.console_port || options.console_any_port) {
             im.console = Own<Console>::make(default_allocator(), im.ctx);
-            if (!im.console->listen(options.console_port)) {
+            if (!im.console->listen(options.console_any_port ? 0 : options.console_port)) {
                 im.log(make_error(ErrorCode::Io, "the console cannot listen on 127.0.0.1:" +
                                                      detail::decimal(options.console_port)));
                 im.console = Own<Console>();

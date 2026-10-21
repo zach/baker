@@ -804,19 +804,31 @@ public:
     // error naming the function, and nothing is registered; so is an unknown kind.
     [[nodiscard]] Expected<FuncRef> declare(Symbol name,
                                             std::span<const OverloadDescription> overloads);
+    // As declare, with a body the host builds at runtime (a function of an embedded
+    // scripting language): check and the reference see the described parameters, and a call
+    // runs `body`. When no parameter is raw, each argument is evaluated once and held to its
+    // parameter's type before the body runs, as a native's would be, and the body reads them
+    // from `Args` already evaluated; with a raw one, the body gets them as written and
+    // evaluates what it needs.
+    [[nodiscard]] Expected<FuncRef> declare(Symbol name,
+                                            std::span<const OverloadDescription> overloads,
+                                            const Callback<Expected<Node>(Args&)>& body);
     // Declares a type from its description (the reference's `types`), for a tool that checks
     // without the game: its bases, each a type this Context already knows (native or
     // declared), and its methods. check() then holds a call on an object of the type to its
     // methods and its bases', as it does a native type's. The Context owns it; its methods
     // have no body. An error naming the type, and nothing declared, for a name that is
-    // already a type, a base it does not know, or a method declare() would refuse.
+    // already a type (ErrorCode::Refused), a base it does not know, or a method declare()
+    // would refuse (ErrorCode::Type).
     [[nodiscard]] Expected<void> declare_type(Symbol name, std::span<const Symbol> bases,
                                               std::span<const MethodDescription> methods);
     // Names an object of `type` (the reference's `objects`) for check(): {name method ...} is
     // checked against the type. Nothing is added to run: a call on it fails as a call on an
-    // undefined name does. An error for a type it does not know, or a name that is already a
-    // function or an object.
+    // undefined name does. An error for a type it does not know (ErrorCode::Type), or a name
+    // that is already a function or an object (ErrorCode::Refused).
     [[nodiscard]] Expected<void> declare_object(Symbol name, Symbol type);
+    // Whether this Context knows a type of that name: native, or declared.
+    [[nodiscard]] bool has_type(Symbol name) const noexcept;
 
     // --- Variables. ---
 

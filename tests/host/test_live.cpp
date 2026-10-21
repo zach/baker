@@ -287,6 +287,21 @@ TEST_CASE("Live serves the console, writing files only when asked") {
     }
 }
 
+TEST_CASE("the console on a free port, which console_port() reports") {
+    if constexpr (!kShipping) {
+        Stack st;
+        Context ctx;
+        Live live(ctx);
+        REQUIRE(live.open({.project = st.dir.path("data"), .console_any_port = true}));
+        CHECK(live.console_port() != 0);
+        Context ctx2;
+        Live other(ctx2);  // a second instance takes another free port
+        REQUIRE(other.open({.project = st.dir.path("data"), .console_any_port = true}));
+        CHECK(other.console_port() != 0);
+        CHECK(other.console_port() != live.console_port());
+    }
+}
+
 TEST_CASE("a quiet frame allocates nothing") {
     if constexpr (!kShipping) {
         Stack st;

@@ -258,6 +258,11 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             },
             "Re-reads changed files now; returns 1 if anything changed.");
         bind(
+            "config.epoch",
+            [tools]() -> Node { return Node(static_cast<int64_t>(tools->cfg.epoch())); },
+            "A number that moves on every reload, layer change and live edit: a tool asks for "
+            "it, and for the values again only when it moved.");
+        bind(
             "config.unsaved",
             [tools]() -> Node {
                 Vec<Node> out;

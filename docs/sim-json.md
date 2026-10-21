@@ -17,7 +17,10 @@ and read a located result, without knowing anything about the game.
 ```
 
 Each path is relative to the project file. A path that does not exist reads nothing. A
-directory is read file by file, in name order.
+directory is read file by file, in name order. An entry may name several files,
+`(scenarios "sim/a.dta" "sim/b.dta")`. A game whose files are in an archive or a virtual
+file system lists its own directories with `CommandHooks::list`, and reads them with
+`CommandHooks::reader`.
 
 ## Scenarios and objectives
 
