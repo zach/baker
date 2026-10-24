@@ -26,7 +26,8 @@ struct Stack {
         dir.write("data/default.dta", "(rate 1)\n");
         dir.write("sim/count.dta", R"((scenario count (seconds 2)
    (start {counter.rate $seed})
-   (at 1 {counter.rate {* 2 $seed}})))");
+   (at 1 {counter.rate {* 2 $seed}})
+   (every 0.5 {counter.total})))");
         dir.write("metrics/m.dta", R"((objective counter.total
    (measure {counter.total}) (pass {>= $value 2.9})))");
     }
@@ -59,7 +60,7 @@ host::CommandLine sim_line(const Stack& st, std::initializer_list<const char*> f
     static std::string project;
     project = st.dir.path("data");
     static std::vector<const char*> argv;
-    argv = {"game", "sim", "--project", project.c_str()};
+    argv = {"game", "sim", "--baker-project", project.c_str()};
     argv.insert(argv.end(), flags.begin(), flags.end());
     auto line = host::parse_command_line(static_cast<int>(argv.size()), argv.data());
     REQUIRE(line);
@@ -70,7 +71,7 @@ host::CommandLine sim_line(const Stack& st, std::initializer_list<const char*> f
 
 TEST_CASE("SimRun: the host advances each run; the output is sim's") {
     Stack st;
-    const host::CommandLine line = sim_line(st, {"--seeds", "1-2", "--json"});
+    const host::CommandLine line = sim_line(st, {"--baker-seeds", "1-2", "--baker-json"});
 
     Host sync;
     CHECK(host::run_command(line, sync.hooks) == 0);
@@ -99,14 +100,14 @@ TEST_CASE("SimRun: the host advances each run; the output is sim's") {
     CHECK(resets == 2);
     CHECK(steps == 240);  // two seconds at 60 Hz, twice: waiting on a reset counts nothing
     CHECK(frames.output == sync.output);
-    CHECK(frames.output.find("\"schema\": \"baker.sim/1.1\"") != std::string::npos);
+    CHECK(frames.output.find("\"schema\": \"baker.sim/1.3\"") != std::string::npos);
 }
 
 TEST_CASE("SimRun: stopping keeps the run so far, not finished, and exits 2") {
     Stack st;
     const std::string out = st.dir.path("out");
     const host::CommandLine line =
-        sim_line(st, {"--seeds", "1-3", "--json", "--results", out.c_str()});
+        sim_line(st, {"--baker-seeds", "1-3", "--baker-json", "--baker-results", out.c_str()});
     Host h;
     host::SimRun run(line, h.hooks);
     run.ready();
@@ -131,7 +132,7 @@ TEST_CASE("SimRun: a command that is not sim, or a stack that cannot run, ends a
     CHECK(not_sim.wants() == Wants::Done);
     CHECK(not_sim.status() == host::kCommandError);
 
-    const host::SimRun no_scenario(sim_line(st, {"--scenario", "nosuch"}), h.hooks);
+    const host::SimRun no_scenario(sim_line(st, {"--baker-scenario", "nosuch"}), h.hooks);
     CHECK(no_scenario.wants() == Wants::Done);
     CHECK(no_scenario.status() == host::kCommandError);
 }
@@ -143,6 +144,6 @@ TEST_CASE("SimRun: a step with nothing due allocates nothing") {
     run.ready();
     for (int i = 0; i < 3; ++i) run.step();
     const baker::test::AllocationScope scope;
-    for (int i = 0; i < 10; ++i) run.step();  // before the (at 1 ...) at step 60
+    for (int i = 0; i < 10; ++i) run.step();  // before the (every 0.5 ...) at step 30
     CHECK(scope.count() == 0);
 }

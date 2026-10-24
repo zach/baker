@@ -1,6 +1,7 @@
 #include "panels.hpp"
 
 #include <baker/std_script.hpp>
+#include <baker/tools/layers.hpp>
 
 #include <imgui.h>
 
@@ -542,7 +543,7 @@ void layers_panel(baker::Config& cfg, LayersState& state) {
             if (ImGui::Checkbox("##on", &on)) state.toggle = name;
             ImGui::SameLine();
             if (ImGui::TreeNode(name.c_str())) {
-                if (auto effect = cfg.layer_effect(name)) {
+                if (auto effect = baker::tools::layer_effect(cfg, name)) {
                     if (effect->empty()) ImGui::TextDisabled("changes nothing");
                     for (const baker::LayerEffectEntry& e : *effect) {
                         ImGui::Text("%s%s: %s -> %s", e.shadowed ? "(shadowed) " : "",

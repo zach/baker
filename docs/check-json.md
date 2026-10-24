@@ -1,7 +1,7 @@
 # `check`'s JSON output: schema `baker.check/1`
 
-`baker::write_json(report, sink, &session)` (or `to_json(report, &session)` with
-`<baker/std_script.hpp>`) writes a `CheckReport` as one JSON object, so a studio can keep it
+`baker::tools::write_json(report, sink, &session)` (or `to_json(report, &session)` with
+`<baker/tools/std_tools.hpp>`) writes a `CheckReport` as one JSON object, so a studio can keep it
 as a build artifact and diff it from one milestone to the next. The text form
 (`write(report, sink)`) holds the same data for people.
 
@@ -9,7 +9,7 @@ as a build artifact and diff it from one milestone to the next. The text form
 baker::CheckReport report;
 const baker::Array* trees[] = {game.get(), level.get()};
 baker::check(trees, ctx, report, {.packs = &cfg.read_session()});
-std::ofstream("check.json") << baker::to_json(report, &cfg.read_session());
+std::ofstream("check.json") << baker::tools::to_json(report, &cfg.read_session());
 ```
 
 `tests/script/check_expected.json` is a complete example, checked byte for byte by the test
@@ -36,7 +36,7 @@ reads `passed` and shows the lists:
   end. Strings escape `"`, `\`, and control characters (`\n`, `\t`, `\u00XX`); other
   characters are written as they are. Numbers are integers.
 - **Versioning.** `schema` is `baker.check/MAJOR` while the minor version is 0, then
-  `baker.check/MAJOR.MINOR` (now `baker.check/1.3`). A field is only ever added with a new minor version, which old
+  `baker.check/MAJOR.MINOR` (now `baker.check/1.4`). A field is only ever added with a new minor version, which old
   readers can ignore; a field is removed or renamed, or its meaning changed, only with a new
   major version.
 
@@ -44,7 +44,7 @@ reads `passed` and shows the lists:
 
 | Field | Type | Contents |
 |---|---|---|
-| `schema` | string | `"baker.check/1.3"` |
+| `schema` | string | `"baker.check/1.4"` |
 | `passed` | boolean | `CheckReport::ok()`: no errors, no load problems, no shape or tweak errors, and, when unresolved calls fail, no unresolved demand (1.1; tweak errors 1.3) |
 | `errors` | list of problems | calls with the wrong arguments for every overload |
 | `warnings` | list of problems | the one-way rule: a harder pack calling a softer one's function |
@@ -59,6 +59,7 @@ reads `passed` and shows the lists:
 
 Each tweak finding's `path` is its subject: the tweak's path, or for a key no tweak reads, the key's own path (`world.gravty`, the group then the key). A tool groups and locates findings by it rather than by their words.
 | `packs` | list of packs | the session's packs and their harness metadata; empty without a session |
+| `defines` | list of defines | the flags that stood for the read, in the order made: `name`, `origin` (`"host"`, `"project"` or `"file"`), and for a file's `#define` its `file` and `line`; empty without a session (1.4) |
 
 **A problem** (in every list of problems), sorted by `file`, then `line`, then `column`,
 then `message`:

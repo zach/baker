@@ -94,7 +94,7 @@ restarted.
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.5.0)
+FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.6.0)
 FetchContent_MakeAvailable(baker)
 target_link_libraries(game PRIVATE baker::baker)
 ```
@@ -149,8 +149,9 @@ save, see it.
   [language guide](docs/language.md#checking-before-running).
 
 Public headers include no standard containers or strings (an engine that bans the STL can
-use them); text comes out through a `TextSink`. `<baker/std_interop.hpp>` and
-`<baker/std_script.hpp>` add `std::string` forms for hosts that want them.
+use them); text comes out through a `TextSink`. `<baker/std_interop.hpp>`,
+`<baker/std_script.hpp>` and `<baker/tools/std_tools.hpp>` add `std::string` forms for
+hosts that want them.
 
 ## Measured
 
@@ -179,9 +180,11 @@ ctest --test-dir build --output-on-failure
 
 Targets: `baker::data` (data, lookup, config, tweaks, the cache; usable alone),
 `baker::script` (evaluation, objects, tasks), `baker::shape` (shapes), and `baker::baker`
-(all of them). `baker::host`, the host kit, is a separate library over them: the file
-watcher, the remote console, the edit-to-see loop, and the tool commands a game runs from
-its `main` ([Baker and your tools](docs/tools.md#the-host-kit)).
+(all of them). `baker::tools` holds what only tools call (the reference, the layer tools,
+the console's commands, checking without the game), and `baker::host`, the host kit, is a
+separate library over them: the file watcher, the remote console, the edit-to-see loop,
+and the tool commands a game runs from its `main`
+([Baker and your tools](docs/tools.md#the-host-kit)).
 
 | Option | Default | Effect |
 |--------|---------|--------|

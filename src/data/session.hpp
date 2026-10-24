@@ -15,14 +15,30 @@ namespace baker::detail {
 // A file a recorded load read, or looked for and did not find (size -1).
 struct CacheFile {
     Str path;
-    int64_t size = 0;
+    int64_t size = 0;  // -1: looked for and absent; or a directory's, below
     uint64_t hash = 0;
 };
+// A directory a load listed (#include_dir): `hash` is its listing's; one it could not list.
+inline constexpr int64_t kListedDirectory = -2;
+inline constexpr int64_t kUnlistedDirectory = -3;
 
 // The cache's checksum, also of the files a load read (cache.cpp).
 [[nodiscard]] uint64_t content_hash(std::string_view bytes) noexcept;
 // Reads `path` through `reader` into `text`, replacing what it held (parse.cpp).
 bool read_with(const LoadSession::Reader& reader, std::string_view path, Str& text);
+// The disk's directory listing, LoadSession's default lister (list_dir.cpp).
+bool list_disk_dir(std::string_view dir, Callback<void(std::string_view path)> entry);
+// Lists `dir` through `lister` into `entries`, sorted, and returns a hash of them, or 0 if
+// it cannot be listed (parse.cpp).
+uint64_t list_with(const LoadSession::Lister& lister, std::string_view dir, Vec<Str>& entries,
+                   const Allocator& alloc = default_allocator());
+// The order a directory's order.dta (`text`, read from `file`) gives `names`, which are in
+// name order: in `order`, the indices of the names it lists, in its order, then the rest's.
+// A name it lists that `names` lacks is a warning, located in it. An error if it does not
+// parse, or holds anything but (order NAME ...).
+Expected<void> directory_order(std::string_view text, std::string_view file,
+                               std::span<const std::string_view> names, Vec<uint32_t>& order,
+                               Vec<Error>& warnings);
 
 // The cache at `path`, replayed on the session, if it loads and is fresh; else null.
 // `from_disk`: the cache file is read from disk straight into its arena, whatever reader the
@@ -45,6 +61,10 @@ struct SessionAccess {
     [[nodiscard]] static std::span<const CacheFile> files(const LoadSession& s) noexcept;
     [[nodiscard]] static const Defines& defines(const LoadSession& s) noexcept;
     [[nodiscard]] static const Defines& defines_before(const LoadSession& s) noexcept;
+    // Each name an #ifdef, #ifndef, #define or #undef named, in the order read; and the
+    // files parsed, which a cache's replay leaves as they were.
+    [[nodiscard]] static std::span<const Symbol> tested(const LoadSession& s) noexcept;
+    [[nodiscard]] static uint64_t parses(const LoadSession& s) noexcept;
     // The #autorun commands the last top-level read added.
     [[nodiscard]] static std::span<const Node> new_autorun(const LoadSession& s) noexcept;
     static void add_autorun(LoadSession& s, Node command);

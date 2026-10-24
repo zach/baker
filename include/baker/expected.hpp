@@ -1,7 +1,8 @@
 #pragma once
 
 // baker::expected / baker::unexpected: std::expected when the standard library has it,
-// otherwise a minimal shim with the subset of the interface Baker uses.
+// otherwise a minimal shim with the subset of the interface Baker uses: has_value, value,
+// operator*, value_or, error, and_then, and comparison with a value.
 //
 // Compiled Baker functions return Expected<T>, so the library and every translation unit
 // using it must make the same choice. CMake decides once, when configuring the library,
@@ -142,6 +143,27 @@ public:
     [[nodiscard]] E& error() & noexcept { return e_; }
     [[nodiscard]] E&& error() && noexcept { return std::move(e_); }
 
+    // As std::expected: f(value) when there is one, an expected with the same error type;
+    // otherwise the error, passed on.
+    template <class F>
+    auto and_then(F&& f) & {
+        using R = std::remove_cvref_t<decltype(f(v_))>;
+        static_assert(std::is_same_v<typename R::error_type, E>, "and_then keeps the error type");
+        return ok_ ? std::forward<F>(f)(v_) : R(unexpected<E>(e_));
+    }
+    template <class F>
+    auto and_then(F&& f) const& {
+        using R = std::remove_cvref_t<decltype(f(v_))>;
+        static_assert(std::is_same_v<typename R::error_type, E>, "and_then keeps the error type");
+        return ok_ ? std::forward<F>(f)(v_) : R(unexpected<E>(e_));
+    }
+    template <class F>
+    auto and_then(F&& f) && {
+        using R = std::remove_cvref_t<decltype(f(std::move(v_)))>;
+        static_assert(std::is_same_v<typename R::error_type, E>, "and_then keeps the error type");
+        return ok_ ? std::forward<F>(f)(std::move(v_)) : R(unexpected<E>(std::move(e_)));
+    }
+
     // As std::expected: equal to a value when it holds one that compares equal.
     template <class U>
         requires(!std::is_same_v<std::remove_cvref_t<U>, expected>)
@@ -183,6 +205,21 @@ public:
     }
     [[nodiscard]] const E& error() const& noexcept { return e_; }
     [[nodiscard]] E& error() & noexcept { return e_; }
+
+    // As std::expected: f() when there is no error, an expected with the same error type;
+    // otherwise the error, passed on.
+    template <class F>
+    auto and_then(F&& f) const& {
+        using R = std::remove_cvref_t<decltype(f())>;
+        static_assert(std::is_same_v<typename R::error_type, E>, "and_then keeps the error type");
+        return failed_ ? R(unexpected<E>(e_)) : std::forward<F>(f)();
+    }
+    template <class F>
+    auto and_then(F&& f) && {
+        using R = std::remove_cvref_t<decltype(f())>;
+        static_assert(std::is_same_v<typename R::error_type, E>, "and_then keeps the error type");
+        return failed_ ? R(unexpected<E>(std::move(e_))) : std::forward<F>(f)();
+    }
 
 private:
     E e_{};  // default-constructed (empty) when there is no error

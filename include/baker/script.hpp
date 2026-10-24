@@ -55,7 +55,8 @@ class Scheduler;
 class ObjectBase;
 namespace detail {
 struct TypeRecord;
-}
+struct ToolsAccess;  // baker::tools' way to the internals (src/tools/access.hpp)
+}  // namespace detail
 
 // Where a function comes from ("One namespace, three tiers"). Macros are expanded
 // by the reader before evaluation, so no function record is ever a macro.
@@ -203,6 +204,8 @@ struct ParamText {
     // Baker's type of each value the parameter reads (Convert<T>::values for a compound
     // type), for the reference and for check without the game; empty when it does not say.
     std::span<const std::string_view> values;
+    ValueCount count = ValueCount::Exact;  // how many it reads (Convert<T>::count)
+    ListElement element{};                 // a list's element and length (Convert<T>::element)
 };
 struct ParamInfo {
     const ParamText* text;
@@ -210,9 +213,14 @@ struct ParamInfo {
     // Whether an (evaluated, or literal) argument has the right node type; null: any.
     bool (*match)(const Node& n, bool promote) noexcept;
     bool raw;  // not evaluated before the call (Raw<T>, or an optional one)
+    // A list whose elements are described (text->element): held to them. Beside raw, in
+    // what was padding, so a declared call learns it without reaching the text.
+    bool listed;
 
     [[nodiscard]] std::string_view type() const noexcept { return text->type; }
     [[nodiscard]] std::span<const std::string_view> values() const noexcept { return text->values; }
+    [[nodiscard]] ValueCount count() const noexcept { return text->count; }
+    [[nodiscard]] const ListElement& element() const noexcept { return text->element; }
 };
 
 template <class P>
@@ -568,7 +576,10 @@ template <class P>
 }
 
 template <class P>
-inline constexpr ParamText kParamText{Param<P>::type(), param_values<P>()};
+inline constexpr ParamText kParamText{
+    Param<P>::type(), param_values<P>(),
+    value_count<typename OptionalOf<std::remove_cvref_t<P>>::type>(),
+    list_element<typename OptionalOf<std::remove_cvref_t<P>>::type>()};
 
 // The parameter descriptions of a signature, built at compile time: no allocation.
 template <class... P>
@@ -583,7 +594,8 @@ struct ParamTable {
         (
             [&] {
                 if constexpr (Param<P>::kind != ParamKind::Implicit)
-                    s.items[i++] = {&kParamText<P>, Param<P>::kind, Param<P>::match, is_raw<P>};
+                    s.items[i++] = {&kParamText<P>, Param<P>::kind, Param<P>::match, is_raw<P>,
+                                    !kParamText<P>.element.values.empty()};
             }(),
             ...);
         return s;
@@ -687,11 +699,6 @@ struct CheckOptions {
 // Writes the report: errors, warnings, the demand report, repeats, then findings, one each.
 // <baker/std_interop.hpp> has to_string(report).
 void write(const CheckReport& report, TextSink out);
-// Writes the report as one JSON object, schema "baker.check/1" (docs/check-json.md): the
-// same data as write(), every list in an order that depends only on the data, so two runs
-// over the same files give the same bytes. Given the session, it lists its packs and their
-// harness metadata too. <baker/std_script.hpp> has to_json(report).
-void write_json(const CheckReport& report, TextSink out, const LoadSession* packs = nullptr);
 
 // What one function, or one script handler of a {class}, has cost: its call statistics.
 // Times are in TimeSource nanoseconds: `total_ns` includes the calls it made,
@@ -723,17 +730,16 @@ struct ParamDescription {
     std::string_view kind = "value";
     bool raw = false;
     // Baker's type of each value, as the reference writes them: what lets a type of the
-    // game's own ("vec2") be checked without the game.
+    // game's own ("vec2") be checked without the game; and how many it takes.
     std::span<const std::string_view> values{};
+    ValueCount count = ValueCount::Exact;
+    // A list's element and length, as the reference's "element" and "length" give them:
+    // what lets a list of the game's own type ("vec2") be checked without the game.
+    ListElement element{};
 };
 struct OverloadDescription {
     std::span<const ParamDescription> params;
     std::string_view result = "value";
-};
-// A method of a type described as data, for Context::declare_type: its name and overloads.
-struct MethodDescription {
-    Symbol name;
-    std::span<const OverloadDescription> overloads;
 };
 
 // A call in progress, on the C++ stack: the frames of a Context form a list from the
@@ -813,22 +819,6 @@ public:
     [[nodiscard]] Expected<FuncRef> declare(Symbol name,
                                             std::span<const OverloadDescription> overloads,
                                             const Callback<Expected<Node>(Args&)>& body);
-    // Declares a type from its description (the reference's `types`), for a tool that checks
-    // without the game: its bases, each a type this Context already knows (native or
-    // declared), and its methods. check() then holds a call on an object of the type to its
-    // methods and its bases', as it does a native type's. The Context owns it; its methods
-    // have no body. An error naming the type, and nothing declared, for a name that is
-    // already a type (ErrorCode::Refused), a base it does not know, or a method declare()
-    // would refuse (ErrorCode::Type).
-    [[nodiscard]] Expected<void> declare_type(Symbol name, std::span<const Symbol> bases,
-                                              std::span<const MethodDescription> methods);
-    // Names an object of `type` (the reference's `objects`) for check(): {name method ...} is
-    // checked against the type. Nothing is added to run: a call on it fails as a call on an
-    // undefined name does. An error for a type it does not know (ErrorCode::Type), or a name
-    // that is already a function or an object (ErrorCode::Refused).
-    [[nodiscard]] Expected<void> declare_object(Symbol name, Symbol type);
-    // Whether this Context knows a type of that name: native, or declared.
-    [[nodiscard]] bool has_type(Symbol name) const noexcept;
 
     // --- Variables. ---
 
@@ -924,6 +914,7 @@ public:
     [[nodiscard]] Impl& impl() const noexcept { return *impl_; }
 
 private:
+    friend struct detail::ToolsAccess;
     [[nodiscard]] Expected<FuncRef> add_overload(Symbol name, detail::Overload overload);
     void add_type(const detail::TypeRecord& type);
     [[nodiscard]] Error resolve_error(const Node& object, std::string_view type) const;
@@ -971,32 +962,6 @@ void check(const Config& cfg, const Context& ctx, CheckReport& report,
 [[nodiscard]] Callback<void(const ValidatorStack& stack, const Callback<void(const Error&)>& warn)>
 check_validator(const Context& ctx, const CheckOptions& options = {});
 
-// Writes the script reference: every function with its overloads, tier, status,
-// and documentation, and every documented global, as Markdown. <baker/std_interop.hpp>
-// has reference(ctx) returning a string.
-// Given the session that loaded the data, it adds the harness register: a Packs section
-// (each pack's level, requires, owners, audience, stage, and file) and an Origins section
-// (which tools generated which files).
-void reference(const Context& ctx, TextSink out, const LoadSession* packs = nullptr);
-[[nodiscard]] Expected<void> write_reference(const Context& ctx, std::string_view path,
-                                             const LoadSession* packs = nullptr);
-// The same as JSON (schema baker.reference/1.1, docs/reference-json.md), for tools and
-// agents: every function with its overloads' parameter types, status, documentation, and,
-// for a script function, its file and line; every type's methods, properties, and script
-// handlers; script-only classes; documented globals; the objects added under a name, with
-// their types, as they are when it is written; and, given the session, its packs and
-// origins. Sorted by name, so the same Context gives the same bytes.
-void write_reference_json(const Context& ctx, TextSink out, const LoadSession* packs = nullptr);
-
-// The script functions that #autorun commands define with {func NAME ...}, each where it is
-// written, in load order, found without running anything: the data's own vocabulary, for a
-// tool that checks or completes data without the game. A {func} nested in another command,
-// or made by a macro, counts; one defined twice is listed twice. Give it a session's
-// commands, or a Config's, which keeps each enabled file layer's apart from its sessions:
-//   script_functions(session.autorun());
-//   script_functions(cfg.autorun().items());
-[[nodiscard]] List<Definition> script_functions(std::span<const Node> autorun);
-
 // Evaluates one line from a tool and writes one line of JSON (schema baker.reply/1.1,
 // docs/reply-json.md). A request is (ID {command}), its ID an int, symbol or string that
 // the reply echoes; any other line is evaluated whole, with a null id, as eval(text) would.
@@ -1004,19 +969,6 @@ void write_reference_json(const Context& ctx, TextSink out, const LoadSession* p
 // of it ("value"), or the error with its script stack. Never fails: a line that does not
 // parse gets an error reply.
 void eval_request(Context& ctx, std::string_view line, TextSink reply);
-
-// The Config's tooling as script functions (config.get, config.source, config.explain,
-// config.layers, config.effect, config.diff; in development builds also config.set,
-// config.clear, config.toggle, config.reload, config.unsaved, config.journal, config.loop, and
-// config.snapshot and config.restore by name), documented, so the reference lists them
-// and check() checks calls to them. config.write_back and config.promote write files, so
-// they are bound only when allowed. Results are data: through eval_request, a tool reads
-// them as JSON. `cfg` must outlive the Context's use of them.
-struct ConfigToolOptions {
-    bool allow_write = false;  // also bind config.write_back and config.promote
-};
-[[nodiscard]] Expected<void> bind_config_tools(Context& ctx, Config& cfg,
-                                               const ConfigToolOptions& options = {});
 
 // --- Template definitions. ---
 

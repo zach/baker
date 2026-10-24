@@ -16,6 +16,7 @@ namespace baker {
 class Array;
 class Node;
 class Path;
+struct ListElement;
 }  // namespace baker
 
 namespace baker::detail {
@@ -35,6 +36,9 @@ namespace baker::detail {
 // escaped (quote, backslash, control characters; UTF-8 as it is), and a list of names.
 void json_string(Str& out, std::string_view s);
 void json_names(Str& out, std::span<const Symbol> names);
+// `, "element": ..., "length": ...` for a tweak or a parameter: the list's element as
+// {"type", "values", "count"} and its fixed length, each null where there is none.
+void json_list_element(Str& out, const ListElement& element);
 
 // The bytes that end an atom: control characters and space, the six brackets, a quote and
 // a comment. A table, so the lexer's scan is one load a byte.

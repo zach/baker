@@ -2,6 +2,7 @@
 // not parse.
 #include <doctest.h>
 #include <baker/parse.hpp>
+#include <baker/tools/structure.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include <vector>
 
 using namespace baker;
+using namespace baker::tools;
 
 namespace {
 std::string_view span(std::string_view text, uint32_t begin, uint32_t end) {

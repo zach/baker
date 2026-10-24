@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include "dev_only.hpp"
 #include "ok.hpp"
 
 using namespace baker;
@@ -122,11 +123,10 @@ TEST_CASE("a text layer is read again when a layer below it changes") {
     CHECK(cfg.get<int>("w") == 1);
     REQUIRE(cfg.remove_layer("narrow"));
     CHECK(cfg.get<int>("w") == 2);
-    CHECK_FALSE(ok(cfg.reload()));  // it has no file to change
+    CHECK_FALSE(ok(cfg.reload()));  // no file to change; check_tests: ok
 }
 
-TEST_CASE("write-back refuses a value from a text layer") {
-    if constexpr (kShipping) return;  // write-back is inert in shipping
+BAKER_DEV_TEST_CASE("write-back refuses a value from a text layer") {
     TempDir dir;
     Config cfg({.tweaks = nullptr});
     cfg.session().set_pack_levels({"game", "live"});
@@ -270,4 +270,123 @@ TEST_CASE("a report that holds and refuses refuses at once, changing nothing") {
     CHECK(runs == before);
     CHECK(cfg.epoch() == epoch);
     CHECK(cfg.layers().size() == 2);
+}
+
+// --- A layer as text for a peer. ---
+
+TEST_CASE("layer_text writes a layer a peer reads back to the same tree and values") {
+    TempDir dir;
+    const std::string base = dir.write("base.dta",
+                                       "[RATE 0.1]\n"
+                                       "(shop (sword (price 12) (rate RATE)) (bow (price 3)))\n"
+                                       "(debug (god_mode 1))\n");
+    const std::string match =
+        dir.write("match.dta",
+                  "; a comment the text does not keep\n"
+                  "(shop (sword (price 15) (rate RATE) (tiny 1e-300) (exact 0.1)) (bow #remove))\n"
+                  "(debug (god_mode #remove))\n");
+    Config server({.tweaks = nullptr});
+    REQUIRE(server.push_layer("base", base));
+    REQUIRE(server.push_layer("match", match));
+    const std::string text = ok(layer_text(server, "match"));
+    CHECK(text.find("comment") == std::string::npos);
+    CHECK(text.find("RATE") == std::string::npos);  // macros expanded, as read
+    CHECK(text.find("#remove") != std::string::npos);
+
+    Config client({.tweaks = nullptr});
+    REQUIRE(client.push_layer("base", base));
+    REQUIRE(client.push_layer_text("received/match", text));
+    CHECK(to_dta(*client.layer_root("received/match")) == to_dta(*server.layer_root("match")));
+    CHECK(client.digest() == server.digest());
+    CHECK(client.get<int>("shop.sword.price") == 15);
+    CHECK(client.get<double>("shop.sword.rate") == 0.1);
+    CHECK(client.get<double>("shop.sword.tiny") == 1e-300);
+    CHECK_FALSE(client.get<int>("shop.bow.price"));
+    CHECK_FALSE(client.get<int>("debug.god_mode"));
+    // The same tree writes the same bytes.
+    CHECK(ok(layer_text(server, "match")) == text);
+
+    std::string none;
+    const auto unknown = server.layer_text("nope", string_out(none));
+    REQUIRE_FALSE(unknown);
+    CHECK(unknown.error().code() == ErrorCode::NotFound);
+}
+
+BAKER_DEV_TEST_CASE("layer_text of scratch carries exactly the live edits") {
+    TempDir dir;
+    Config server({.tweaks = nullptr});
+    REQUIRE(server.push_layer(
+        "base", dir.write("base.dta", "(rules (rounds 3) (time 90) (gravity 9.8))\n")));
+    CHECK(ok(layer_text(server, "scratch")).empty());
+    REQUIRE(server.set(Path("rules.rounds"), 5));
+    REQUIRE(server.set(Path("rules.time"), 120));
+    REQUIRE(server.set(Path("rules.gravity"), 0.7f));
+    REQUIRE(server.clear_scratch("rules.time"));
+    const std::string text = ok(layer_text(server, "scratch"));
+    CHECK(text.find("rounds 5") != std::string::npos);
+    CHECK(text.find("time") == std::string::npos);
+
+    Config client({.tweaks = nullptr});
+    REQUIRE(client.push_layer("base", dir.path("base.dta")));
+    REQUIRE(client.push_layer_text("received/lobby", text));
+    CHECK(client.get<int>("rules.rounds") == 5);
+    CHECK(client.get<int>("rules.time") == 90);
+    CHECK(client.get<float>("rules.gravity") == 0.7f);  // exactly the tuned float
+}
+
+TEST_CASE("a layer with commands is refused by a data-only receiver, located") {
+    TempDir dir;
+    const std::string base = dir.write("base.dta", "(shop (sword (price 12)))\n");
+    Config server({.tweaks = nullptr});
+    REQUIRE(server.push_layer("base", base));
+    REQUIRE(
+        server.push_layer("match", dir.write("match.dta", "(shop\n (sword (price {* 2 5})))\n")));
+    const std::string text = ok(layer_text(server, "match"));
+
+    Config client({.tweaks = nullptr});
+    REQUIRE(client.push_layer("base", base));
+    const LayerPolicy data{.data_only = true};
+    const auto r = client.push_layer_text("received/match", text, {.policy = &data});
+    REQUIRE_FALSE(r);
+    CHECK(to_string(r.error()).find("'shop.sword.price' holds {* 2 5}") != std::string::npos);
+    // Located in the text received, which keeps no layout of the server's file.
+    CHECK(to_string(r.error()).find("(received/match:1)") != std::string::npos);
+}
+
+TEST_CASE("set_layer_text replaces a text layer in place; the same bytes change nothing") {
+    TempDir dir;
+    Config client({.tweaks = nullptr});
+    REQUIRE(client.push_layer("base", dir.write("base.dta", "(rules (rounds 3) (time 90))\n")));
+    REQUIRE(client.push_layer_text("received/lobby", "#define LONG\n(rules (rounds 5))\n"));
+    REQUIRE(client.push_layer_text("local", "#ifdef LONG\n(rules (time 300))\n#endif\n"));
+    CHECK(client.get<int>("rules.time") == 300);
+
+    // Sent again unchanged: the same tree, no reload.
+    const Ref<Array> before = client.root();
+    const auto record = client.last_reload();  // none in shipping, which keeps no history
+    REQUIRE(client.set_layer_text("received/lobby", "#define LONG\n(rules (rounds 5))\n"));
+    CHECK(client.root().get() == before.get());
+    if (record) CHECK(client.last_reload()->epoch == record->epoch);
+
+    // New text: in place, below "local", which reads again without the macro.
+    REQUIRE(client.set_layer_text("received/lobby", "(rules (rounds 7))\n"));
+    CHECK(client.get<int>("rules.rounds") == 7);
+    CHECK(client.get<int>("rules.time") == 90);
+    CHECK(strings(client.layers()) ==
+          std::vector<std::string>{"base", "received/lobby", "local", "scratch"});
+
+    // Under a policy, against the layers below it without the old version: a path only the
+    // old version had is new, and the refusal changes nothing.
+    REQUIRE(client.set_layer_text("received/lobby", "(rules (rounds 8) (bonus 1))\n"));
+    const LayerPolicy existing{.existing_only = true};
+    const auto refused = client.set_layer_text("received/lobby", "(rules (bonus 2))\n", &existing);
+    REQUIRE_FALSE(refused);
+    CHECK(to_string(refused.error()).find("'rules.bonus' is new") != std::string::npos);
+    CHECK(client.get<int>("rules.rounds") == 8);
+    REQUIRE(client.set_layer_text("received/lobby", "(rules (rounds 9))\n", &existing));
+    CHECK(client.get<int>("rules.rounds") == 9);
+
+    CHECK(client.set_layer_text("nope", "").error().code() == ErrorCode::NotFound);
+    CHECK(client.set_layer_text("base", "").error().code() == ErrorCode::Refused);
+    CHECK(client.set_layer_text("scratch", "").error().code() == ErrorCode::Refused);
 }

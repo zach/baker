@@ -220,6 +220,39 @@ TEST_CASE("Expected is std::expected when the library has it") {
     CHECK(v.has_value());
 }
 
+TEST_CASE("Expected chains with and_then, as std::expected does") {
+    int ran = 0;
+    const auto step = [&]() -> Expected<void> {
+        ++ran;
+        return {};
+    };
+    const auto fail = [&]() -> Expected<void> {
+        ++ran;
+        return Unexpected(make_error(ErrorCode::Refused, "no"));
+    };
+    CHECK(Expected<void>().and_then(step).and_then(step).has_value());
+    CHECK(ran == 2);
+    const Expected<void> stopped = Expected<void>().and_then(fail).and_then(step);
+    CHECK(ran == 3);  // the step after the failure did not run
+    REQUIRE_FALSE(stopped);
+    CHECK(stopped.error().code() == ErrorCode::Refused);
+
+    const auto half = [](int n) -> Expected<int> {
+        if (n % 2) return Unexpected(make_error(ErrorCode::Range, "odd"));
+        return n / 2;
+    };
+    CHECK(Expected<int>(12).and_then(half).and_then(half) == 3);
+    const Expected<int> odd = Expected<int>(12).and_then(half).and_then(half).and_then(half);
+    REQUIRE_FALSE(odd);
+    CHECK(odd.error().message() == "odd");
+    const Expected<int> six = 6;  // const&, and to another value type
+    const Expected<std::string> text =
+        six.and_then([](int n) -> Expected<std::string> { return std::to_string(n); });
+    CHECK(text == std::string("6"));
+    // From a value to no value, as a push after a read.
+    CHECK(Expected<int>(4).and_then([](int) -> Expected<void> { return {}; }).has_value());
+}
+
 TEST_CASE("Callback copies, moves, and frees what it holds") {
     static int alive = 0;
     struct Counted {

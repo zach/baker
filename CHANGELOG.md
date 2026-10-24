@@ -3,6 +3,88 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.6.0 - 2026-10-23
+
+- **New: content that is a directory, not a list of files.**
+  - **A directory of layers** for mods, DLC and plugin packs: `Config::push_layer_dir("mods",
+    "mods")`, or `(mods (dir "mods"))` in the project's layers. Each `*.dta` file in it is a
+    layer, and so is each folder that holds a `layer.dta`, in the order `mods/order.dta`
+    lists, `(order base_fixes hard_mode)`, then by name. Every `reload()` lists the directory
+    again, so a mod dropped in, deleted or reordered takes effect, and `Live` watches the
+    directory. A mod turned off with `set_layer_enabled` stays off across a rescan, and
+    `set_layer_enabled("mods", false)` turns them all off. A mod that does not parse is an
+    empty layer, its error located and passed to the warning handler, until it is fixed.
+  - **`#include_dir "cards"`** makes each `.dta` file of a directory a record named by its
+    file, `(fireball (cost 3) (damage 6))`, and each subfolder a nested table, in the same
+    `order.dta` order. A layer retunes `cards.fireball.cost` by name, `source()` and
+    write-back point into the card's own file, and a new card is a new file. A cache is
+    stale once a file is added, removed or renamed.
+  - **`LoadSession::set_lister`** lists directories through the host, as `set_reader` reads
+    files, so both work over an archive or a virtual file system. The host kit passes
+    `CommandHooks::list` to it, and `LiveOptions::lister` takes one.
+- **New: curves.** A curve is a key's values: `(falloff (0 1) (5 3) (10 8))`, with an
+  optional interpolation (`monotone`, the default, which never leaves the keys around it;
+  `linear`; `catmull-rom`; `constant`) and extension (`clamp`, the default; `extrapolate`;
+  `loop`), and a point may give its in and out slopes, `(5 3 0.2 0.4)`. `get<Curve>` and
+  `Tweak<Curve>` read one, `sample(x)` gives its value, and `{curve.sample path x}` does in
+  script. A shape field may have the type `curve`, its range holding every point's y, and
+  a tweak's range does the same. The tweaks JSON names the type `"curve"`.
+- **New: defines the host supplies, changed live.** `Config::set_defines` replaces the
+  host's own flags for `#ifdef` on an open stack, such as a server switching mode: only the
+  layers whose reads tested a changed name are read again, then one merge follows. It works
+  in shipping builds. `ProjectOptions::defines` are the host's at open,
+  `LoadSession::active_defines()` says who made each flag, and `config.explain` names the
+  `#ifdef` branch a value was read in.
+- **New: a formatter that keeps comments.** `tools::format_text` lays out text as Baker writes
+  it, keeping comments and blank lines, and the kit's `format` command formats files
+  (`--baker-check` to only check, `--baker-json` for `baker.format/1`). The project file
+  sets the layout with `(format (indent 3) (width 100))`.
+- **New: rules between values in shapes.** `(rule "starts at or below its maximum" {<=
+  $start_hp $max_hp})` in a shape holds every record to it; `(warn)` makes a failure a
+  warning. `{data tiers $tier ideal}` reads another table, and `{data.sum loot weight}` sums
+  one. `tools::rules_validator` checks them at every merge, and a failure lists the values
+  it read.
+- **New: a shape field may name a key of a table,** `(weapon (key_of weapons))`, checked
+  against the merged tree, with a suggestion for a typo.
+- **New: tweaks a worker thread reads together.** `TweakRegistry::read_consistent(fn)` runs
+  `fn` again if the tweaks changed while it ran, so several atomic tweaks are never seen
+  half old and half new.
+- **New in scenarios:** `(until {command})` may name how a run ended with a symbol, which
+  `$ended` holds for the objectives and `sim` tallies per scenario. `(every SECONDS {...})`
+  and `(every step N {...})` repeat a command. `(steps N)` gives a length in the game's own
+  steps, and `(at step N {...})` runs at one.
+- **New for peers and saves:**
+  - `Config::digest()` and `stack_digest()` hash the data by value, the same on every
+    platform, so lockstep peers, replays and saves can tell they agree; `{config.digest}`.
+  - `Config::layer_text` writes a layer as text for a peer, and `set_layer_text` replaces a
+    received layer's text in place.
+  - `Config::apply_edits()` merges pending live edits into `root()`, and a read of a record
+    or table above a live edit sees it.
+- **New for tools:** a list tweak or parameter describes its elements (`element` and
+  `length` in the JSON), so a tool checks a `std::vector<vec2>` without the game.
+  `ValueCount` says whether a converter takes exactly its values, at least them, or any
+  number. A project's tool path may begin `$build`.
+- **Fixed:** a number is written as the same text on every platform, where a Mac wrote
+  `1.2e+02` for 120. A tool that described a tweak whose default did not read lost every
+  tweak it had described before it. Tweak findings come in one order.
+- **What breaks:**
+  - **What only tools call is the library `baker::tools`:** `tools::explain(cfg, path)`,
+    `tools::layer_effect`, `tools::diff`, `tools::declare_type(ctx, ...)`,
+    `tools::write_reference_json(...)`, `tools::DescribedTweaks`, `tools::read_structure` and
+    `tools::bind_config_tools`, from `<baker/tools/...>`. Link `baker::tools`; the host kit
+    brings it.
+  - **The kit's flags begin `--baker-`:** `--baker-project`, `--baker-seed`, and so on,
+    leaving the short names to the game.
+  - The console's `{config.clear}` is `{config.clear_scratch}`.
+  - `sim::Run::ended` (a symbol) replaces `until`.
+  - A game's own converter that declares `values` and reads more than them says
+    `ValueCount::AtLeast` or `Any`, or a tool reads its extra values wrong.
+  - A list tweak's `default` and `value` are always written in parentheses, `((0.0 0.0))`
+    for one `vec2`.
+  - The JSON documents are `baker.reference/1.5`, `baker.tweaks/1.5`, `baker.shapes/1.4`,
+    `baker.check/1.4` and `baker.sim/1.3`; each adds fields, and a 1.x reader keeps working
+    unless it rejects a new shape field `type` (`"key"`, `"curve"`).
+
 ## 0.5.0 - 2026-10-21
 
 - **New for tools that check without the game:**

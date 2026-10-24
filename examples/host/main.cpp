@@ -1,6 +1,6 @@
 // The host kit (baker::host): a game's tooling from its own main. With a command, the tool
 // commands (check, reference, eval, diff, promote); with `play`, the edit-to-see loop and the
-// remote console on 127.0.0.1. Run from this directory, or pass --project PATH.
+// remote console on 127.0.0.1. Run from this directory, or pass --baker-project PATH.
 #include <baker/host/commands.hpp>
 #include <baker/host/live.hpp>
 #include <baker/std_interop.hpp>

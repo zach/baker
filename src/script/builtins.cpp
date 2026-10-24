@@ -78,7 +78,7 @@ Expected<Node> define(Args a, bool override) {
     o.min_args = o.max_args = static_cast<uint32_t>(body->params.size());
     body->param_info.assign(
         body->params.size(),
-        detail::ParamInfo{&kScriptParam, detail::ParamKind::Value, nullptr, false});
+        detail::ParamInfo{&kScriptParam, detail::ParamKind::Value, nullptr, false, false});
     o.params = body->param_info;
     o.result = "value";
     o.callable = std::move(holder);

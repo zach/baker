@@ -1,5 +1,5 @@
-// Config's write-back: planning an edit of a layer's file, writing it, promoting
-// scratch, and the layer tools, layer_effect and diff.
+// Config's write-back: planning an edit of a layer's file, writing it, and promoting
+// scratch. The layer tools (explain, layer_effect, diff) are baker::tools'.
 
 #include "config_impl.hpp"
 
@@ -194,9 +194,10 @@ Expected<Plan> Config::Impl::plan(const LayerState& layer, const Path& path,
     auto not_literal = [&](const Array& parent, size_t k) -> std::optional<Error> {
         const SourceSpan* sp = map.span(parent, k);
         if (!sp)
-            return refused(
-                quoted(path) + " is in an array assembled by #merge; edit it where it is defined",
-                parent.file(), parent.line());
+            return refused(quoted(path) +
+                               " is in an array assembled by #merge or #include_dir; edit it where "
+                               "it is defined",
+                           parent.file(), parent.line());
         if (!sp->macro.empty()) {
             const auto text = map.text(sp->file);
             return refused(quoted(path) + " comes from macro '" + Str(sp->macro.str()) +
@@ -259,8 +260,8 @@ Expected<Plan> Config::Impl::plan(const LayerState& layer, const Path& path,
             if (!ext || ext->file != main)
                 return Unexpected(
                     refused("cannot add " + quoted(path) + " to '" + layer.file +
-                                "': the array it would go in comes from another file (#include or "
-                                "#merge), not this one",
+                                "': the array it would go in comes from another file (#include, "
+                                "#include_dir or #merge), not this one",
                             cur->file(), cur->line()));
             const SourceSpan* last = map.span(*cur, cur->size() - 1);
             if (!last || last->file != main || last->end > text->size() || ext->end == 0)
@@ -503,174 +504,6 @@ Expected<WriteReport> Config::promote(std::string_view from, std::string_view to
     }
     report.written = List<WrittenLine>(written);
     return report;
-}
-
-// --- Layer tooling ---
-
-Expected<List<LayerEffectEntry>> Config::layer_effect(std::string_view layer) const {
-    const bool is_scratch = layer == "scratch";
-    const auto li = impl_->find_layer(layer);
-    if (!li && !is_scratch)
-        return Unexpected(make_error(ErrorCode::NotFound, "no layer named '" + Str(layer) + "'"));
-    const Ref<Array> tree = li ? impl_->layers[*li].root : impl_->scratch_root();
-    Vec<LayerEffectEntry> out;
-    if (!tree) return List<LayerEffectEntry>();
-    // The stack without this layer.
-    Ref<Array> without = Array::make(0);
-    for (size_t i = 0; i < impl_->layers.size(); ++i)
-        if (impl_->layers[i].options.enabled && (!li || i != *li))
-            without = detail::merge(*without, *impl_->layers[i].root, MergePolicy::Overwrite,
-                                    impl_->merge_scratch);
-    const Ref<Array> scratch = impl_->scratch_enabled ? impl_->scratch_root() : nullptr;
-    if (!is_scratch && scratch)
-        without = detail::merge(*without, *scratch, MergePolicy::Overwrite, impl_->merge_scratch);
-
-    const Source in_scratch{scratch_name()};
-    Vec<Node> below;
-    for (const Leaf& leaf : leaves_of(*tree)) {
-        LayerEffectEntry e{};
-        const Path path(leaf.path);
-        e.path = Symbol(leaf.path);
-        e.value = pack(leaf.values);
-        e.source = li ? Impl::located(impl_->layers[*li], *leaf.holder) : in_scratch;
-        if (value_nodes(*without, path, below)) e.below = pack(below);
-        // The topmost other layer that supplies the path: it shadows this one if above it.
-        const auto s = impl_->supplier(path, impl_->layers.size(), li ? *li : SIZE_MAX);
-        const bool scratch_has = !is_scratch && impl_->scratch_entry(path);
-        if (scratch_has)
-            e.below_source = in_scratch;
-        else if (s)
-            e.below_source = impl_->source_in(impl_->layers[*s], path);
-        e.shadowed = scratch_has || (li && s && *s > *li);
-        out.push_back(std::move(e));
-    }
-    return List<LayerEffectEntry>(out);
-}
-
-Expected<List<DiffEntry>> Config::diff(std::string_view a, std::string_view b) const {
-    auto tree_of = [&](std::string_view name) -> Expected<Ref<Array>> {
-        if (name == "scratch") {
-            Ref<Array> s = impl_->scratch_root();
-            return s ? s : Array::make(0);
-        }
-        if (auto i = impl_->find_layer(name)) return impl_->layers[*i].root;
-        return Unexpected(make_error(ErrorCode::NotFound, "no layer named '" + Str(name) + "'"));
-    };
-    auto ta = tree_of(a), tb = tree_of(b);
-    if (!ta) return Unexpected(std::move(ta).error());
-    if (!tb) return Unexpected(std::move(tb).error());
-    const Vec<Leaf> la = leaves_of(**ta), lb = leaves_of(**tb);
-    auto source = [&](std::string_view layer, const Leaf& l) {
-        return layer == "scratch" ? Source{scratch_name()} : impl_->located(layer, *l.holder);
-    };
-    // b's leaves by path, each matched at most once.
-    HashMap<Str, size_t> in_b;
-    for (size_t i = 0; i < lb.size(); ++i) in_b.emplace(lb[i].path, i);
-    Vec<bool> matched(lb.size(), false);
-    Vec<DiffEntry> out;
-    for (const Leaf& x : la) {
-        const auto it = in_b.find(x.path);
-        const Leaf* y = it != in_b.end() ? &lb[it->second] : nullptr;
-        if (y) matched[it->second] = true;
-        if (y && same_nodes(x.values, y->values)) continue;
-        DiffEntry d{Symbol(x.path), pack(x.values), std::nullopt, source(a, x), std::nullopt};
-        if (y) {
-            d.b = pack(y->values);
-            d.source_b = source(b, *y);
-        }
-        out.push_back(std::move(d));
-    }
-    for (size_t i = 0; i < lb.size(); ++i)
-        if (!matched[i])
-            out.push_back({Symbol(lb[i].path), std::nullopt, pack(lb[i].values), std::nullopt,
-                           source(b, lb[i])});
-    return List<DiffEntry>(out);
-}
-
-Expected<List<ExplainEntry>> Config::explain(const Path& path) const {
-    if (!path.valid()) return Unexpected(detail::get_error(*root_, path, nullptr));
-    if (path.empty())
-        return Unexpected(refused("the whole config has no single value: explain a leaf"));
-
-    // What one tree holds at `path`: a value, a removal of it or of an ancestor, an array
-    // of arrays, or nothing.
-    struct Held {
-        Vec<Node> nodes;
-        const Array* marker = nullptr;
-        bool value = false, subtree = false;
-    };
-    auto held = [&](const Array& root) {
-        Held h;
-        detail::Resolved r;
-        for (size_t k = 1; k <= path.size(); ++k) {
-            if (path[k - 1].is_index) continue;
-            const Path prefix = k == path.size() ? path : Path(detail::text_of(path, k));
-            if (detail::resolve(root, prefix, r) != detail::ResolveStatus::Ok) return h;
-            if (r.array && detail::is_removal(*r.array)) {
-                h.marker = r.array;
-                return h;
-            }
-        }
-        if (detail::resolve(root, path, r) != detail::ResolveStatus::Ok) return h;
-        if (last_is_index(path) || (r.array && has_values(*r.array)))
-            h.value = value_nodes(root, path, h.nodes);
-        else
-            h.subtree = true;
-        return h;
-    };
-
-    // Top down: the first enabled contributor decides (it wins, or it removes); every
-    // enabled one below it is shadowed. Reversed at the end.
-    Vec<ExplainEntry> out;
-    bool decided = false, subtree = false;
-    auto add = [&](Symbol layer, const Held& h, const Source& source, bool enabled) {
-        subtree = subtree || h.subtree;
-        if (!h.value && !h.marker) return;
-        ExplainEntry e{layer, h.marker ? Node(detail::remove_marker()) : pack(h.nodes), source};
-        if (!enabled) {
-            e.standing = Standing::Disabled;
-        } else if (decided) {
-            e.standing = Standing::Shadowed;
-        } else {
-            e.standing = h.marker ? Standing::Removes : Standing::Wins;
-            decided = true;
-        }
-        out.push_back(std::move(e));
-    };
-
-    if (const Ref<Array> scratch = impl_->scratch_root())
-        add(scratch_name(), held(*scratch), Source{scratch_name()}, impl_->scratch_enabled);
-    for (size_t i = impl_->layers.size(); i-- > 0;) {
-        const LayerState& l = impl_->layers[i];
-        const Held h = held(*l.root);
-        const Source source = h.marker  ? Impl::located(l, *h.marker)
-                              : h.value ? impl_->source_in(l, path)
-                                        : Source{};
-        add(Symbol(l.name), h, source, l.options.enabled);
-    }
-    if (TweakRegistry* tweaks = impl_->options.tweaks) {
-        bool found = false;
-        tweaks->each([&](TweakBase& t) {
-            if (found || !(t.parsed() == path)) return;
-            found = true;
-            ValueList v;
-            t.default_values(v);
-            Held h;
-            const std::span<const Node> d = v.nodes();
-            h.nodes.assign(d.data(), d.data() + d.size());
-            h.value = !h.nodes.empty();
-            const Symbol code("code");
-            add(code, h, Source{code}, true);
-        });
-    }
-
-    if (out.empty()) {
-        if (subtree)
-            return Unexpected(refused(quoted(path) + " holds arrays, not values: explain a leaf"));
-        return Unexpected(detail::get_error(*root_, path, nullptr));
-    }
-    std::reverse(out.begin(), out.end());
-    return List<ExplainEntry>(out);
 }
 
 }  // namespace baker

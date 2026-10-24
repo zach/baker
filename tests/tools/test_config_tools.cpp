@@ -5,6 +5,8 @@
 #include <baker/script.hpp>
 #include <baker/std_interop.hpp>
 #include <baker/std_script.hpp>
+#include <baker/tools/console.hpp>
+#include <baker/tools/std_tools.hpp>
 
 #include "temp_dir.hpp"
 
@@ -12,6 +14,7 @@
 #include "ok.hpp"
 
 using namespace baker;
+using namespace baker::tools;
 using baker::test::ok;
 using baker::test::TempDir;
 
@@ -115,22 +118,22 @@ TEST_CASE("the live tools: set, unsaved, journal, toggle, snapshot, restore, rel
     CHECK(eval(f.ctx, "{config.loop}").rfind("((reloads 2) (unchanged 1) (failures 0)", 0) == 0);
 }
 
-TEST_CASE("config.clear drops one path's live edit, and says whether there was one") {
+TEST_CASE("config.clear_scratch drops one path's live edit, and says whether there was one") {
     Fixture f;
     REQUIRE(f.ctx.eval("{config.set box.width 4.5}", "test"));
     REQUIRE(f.ctx.eval("{config.set box.height 9}", "test"));
-    CHECK(eval(f.ctx, "{config.clear box.width}") == "1");
+    CHECK(eval(f.ctx, "{config.clear_scratch box.width}") == "1");
     CHECK(f.cfg.get<int>("box.width") == 3);   // the files' value: local's
     CHECK(f.cfg.get<int>("box.height") == 9);  // the other edit stays
     CHECK(eval(f.ctx, "{config.unsaved}") == "(box/height)");
     CHECK(eval(f.ctx, "{config.journal}").find("(after 4.5) (fate reverted)") != std::string::npos);
     // Nothing to drop: no edit there, or no value at all. Neither changes anything.
     const uint64_t epoch = f.cfg.epoch();
-    CHECK(eval(f.ctx, "{config.clear box.width}") == "0");
-    CHECK(eval(f.ctx, "{config.clear no.such.path}") == "0");
+    CHECK(eval(f.ctx, "{config.clear_scratch box.width}") == "0");
+    CHECK(eval(f.ctx, "{config.clear_scratch no.such.path}") == "0");
     CHECK(f.cfg.epoch() == epoch);
     CHECK(eval(f.ctx, "{config.unsaved}") == "(box/height)");
-    CHECK_FALSE(f.ctx.eval("{config.clear}", "test"));  // no path: an error, never all
+    CHECK_FALSE(f.ctx.eval("{config.clear_scratch}", "test"));  // no path: an error, never all
     CHECK(eval(f.ctx, "{config.unsaved}") == "(box/height)");
 }
 
@@ -165,7 +168,17 @@ TEST_CASE("a shipping build binds the reading tools only") {
     Fixture f({.allow_write = true});
     CHECK(f.ctx.has_func("config.explain"));
     CHECK_FALSE(f.ctx.has_func("config.set"));
-    CHECK_FALSE(f.ctx.has_func("config.clear"));
+    CHECK_FALSE(f.ctx.has_func("config.clear_scratch"));
     CHECK_FALSE(f.ctx.has_func("config.write_back"));
 }
 #endif
+
+TEST_CASE("curve.sample reads a path's curve and samples it") {
+    Fixture f;
+    REQUIRE(
+        f.cfg.push_layer("curves", f.dir.write("curves.dta", "(reward linear (1 10) (3 30))\n")));
+    CHECK(eval(f.ctx, "{curve.sample reward 2}") == "20.0");
+    CHECK(eval(f.ctx, "{curve.sample reward 9}") == "30.0");        // clamped
+    CHECK_FALSE(f.ctx.eval("{curve.sample box.width 1}", "test"));  // not a curve
+    CHECK_FALSE(f.ctx.eval("{curve.sample nosuch 1}", "test"));
+}

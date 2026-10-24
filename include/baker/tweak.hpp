@@ -49,6 +49,12 @@ namespace baker {
 
 class Config;
 class TweakRegistry;
+namespace detail {
+struct ToolsAccess;  // baker::tools' way to the internals (src/tools/access.hpp)
+// read_consistent's wait while a change is under way: a spin, then a yield. Out of line, so
+// this header needs no <thread>.
+void wait_a_moment(unsigned tries) noexcept;
+}  // namespace detail
 struct Source;
 
 struct TweakRange {
@@ -135,6 +141,10 @@ public:
     // Baker's type of each of the value's values: {"float32"} for a float, {"float32",
     // "float32"} for a vec2 whose Convert declares `values`; empty when the type does not say.
     [[nodiscard]] std::span<const std::string_view> value_types() const noexcept { return types(); }
+    // How many values it takes, beside value_types(): exactly them unless the type says.
+    [[nodiscard]] ValueCount value_count() const noexcept { return count(); }
+    // A list's element and length (Convert<T>::element); an empty type for any other value.
+    [[nodiscard]] ListElement list_element() const noexcept { return element(); }
 
     // Metadata, the data file's winning over the code's.
     [[nodiscard]] TweakRange range() const;
@@ -182,6 +192,7 @@ protected:
 private:
     friend class TweakRegistry;
     friend class Config;
+    friend struct detail::ToolsAccess;
     friend TweakFindings check_tweaks(const Array& root, const TweakRegistry& tweaks);
 
     // Reads the values as T and, if `apply`, stores them; false if they do not convert.
@@ -189,6 +200,8 @@ private:
     virtual void reset() = 0;  // back to the default
     [[nodiscard]] virtual detail::ConvertInfo info() const noexcept = 0;
     [[nodiscard]] virtual std::span<const std::string_view> types() const noexcept = 0;
+    [[nodiscard]] virtual ValueCount count() const noexcept = 0;
+    [[nodiscard]] virtual ListElement element() const noexcept = 0;
 
     // Rebinds against `root` (a Config's merged tree); true if the value changed. Reports
     // a value that does not convert through `warn`.
@@ -232,63 +245,59 @@ public:
     // The Config that binds these tweaks, or null.
     [[nodiscard]] Config* config() const noexcept { return config_; }
 
+    // Runs `fn`, which reads tweaks, so that what it read agrees: a reload, a live edit or a
+    // layer change updates tweaks one at a time on the game's thread, and a worker reading
+    // several mid-update could see the new gravity with the old jump speed. `fn` runs again
+    // if the tweaks changed while it ran, so it must only read:
+    //   float g, j;
+    //   baker::TweakRegistry::global().read_consistent([&] { g = gravity; j = jump_speed; });
+    // It covers atomic tweaks only, those whose T is trivially copyable and lock-free (float,
+    // int, bool, Symbol, a small struct): a std::string or std::vector tweak is never safe to
+    // read off the game's thread, inside it or not. While a change is under way it spins
+    // briefly, then yields. Without a change it costs two loads and a fence around `fn`.
+    template <class F>
+    void read_consistent(F&& fn) const {
+        for (unsigned tries = 0;; ++tries) {
+            const uint64_t before = generation_.load(std::memory_order_acquire);
+            if (before & 1u) {  // a change is under way
+                detail::wait_a_moment(tries);
+                continue;
+            }
+            fn();
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (generation_.load(std::memory_order_relaxed) == before) return;
+        }
+    }
+
 private:
     friend class TweakBase;
     friend class Config;
     void lock() const noexcept;
     void unlock() const noexcept;
+    // A change to its tweaks, on the game's thread, for read_consistent: the generation is
+    // odd from begin_change() to end_change(). A seqlock's writer: the stores between are
+    // the tweaks' own relaxed stores. Changes never nest: notifications run after end.
+    void begin_change() noexcept {
+        generation_.store(generation_.load(std::memory_order_relaxed) + 1,
+                          std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+    }
+    void end_change() noexcept {
+        generation_.store(generation_.load(std::memory_order_relaxed) + 1,
+                          std::memory_order_release);
+    }
 
     mutable std::atomic_flag lock_;
+    std::atomic<uint64_t> generation_{0};  // odd while its tweaks are changing
     TweakBase* head_ = nullptr;
     Config* config_ = nullptr;
 };
 
-// Every tweak in `tweaks` as JSON (schema baker.tweaks/1.3, docs/reference-json.md), sorted by
+// Every tweak in `tweaks` as JSON (schema baker.tweaks/1.5, docs/reference-json.md), sorted by
 // path: its type and value types, default and current value, metadata (the data's winning
 // over the code's), and, while a config supplies it, where the value came from. For tools
 // and agents.
 void write_json(const TweakRegistry& tweaks, TextSink out);
-
-// A tweak as the reference describes it (baker.tweaks), for a tool that has the game's
-// reference but not its code.
-struct TweakDescription {
-    std::string_view path{};
-    std::string_view type{};  // Baker's ("float32", "symbol") or the game's own ("vec2")
-    // Baker's type of each value, as the reference's "values" lists them: needed for a type
-    // of the game's own, implied for one of Baker's.
-    std::span<const std::string_view> values{};
-    std::string_view default_text{};  // the code's default, as Baker text: "2.5", "(0 1)"
-    TweakRange range{};
-    double step = 0;
-    std::string_view desc{};
-    std::string_view kind{};
-    std::string_view group{};
-    bool dev_only = false;
-    std::span<const std::string_view> one_of{};
-    std::span<const TweakChoice> choices{};
-};
-
-// Tweaks a tool makes from their descriptions, registered with `registry`, so that
-// check_tweaks holds data to them as the game holds data to its own: a language server, a CI
-// checker, an agent's pre-flight check. No code reads them; they hold copies of what they
-// are given, and unregister when the set goes.
-class DescribedTweaks {
-public:
-    explicit DescribedTweaks(TweakRegistry& registry);
-    ~DescribedTweaks();
-    DescribedTweaks(const DescribedTweaks&) = delete;
-    DescribedTweaks& operator=(const DescribedTweaks&) = delete;
-
-    // The same call for every type. An error naming the tweak if its type is not Baker's and
-    // it gives no value types, if a value type is not one of Baker's, or if its default does
-    // not read as them.
-    [[nodiscard]] Expected<void> add(const TweakDescription& tweak);
-    [[nodiscard]] size_t size() const noexcept;
-
-private:
-    struct Impl;
-    Impl* impl_;
-};
 
 namespace detail {
 
@@ -371,6 +380,10 @@ private:
     }
     [[nodiscard]] std::span<const std::string_view> types() const noexcept override {
         return detail::value_types<T>();
+    }
+    [[nodiscard]] ValueCount count() const noexcept override { return detail::value_count<T>(); }
+    [[nodiscard]] ListElement element() const noexcept override {
+        return detail::list_element<T>();
     }
     void store(T v) {
         if constexpr (kAtomic)

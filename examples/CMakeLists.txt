@@ -102,11 +102,11 @@ if(BAKER_BUILD_SCRIPT)
     add_executable(baker_example_host host/main.cpp)
     target_link_libraries(baker_example_host PRIVATE baker::host)
     if(BAKER_BUILD_TESTS)
-      baker_example_test(baker_example_host_check baker_example_host "^{${nl}  \"schema\": \"baker[.]check/1[.]3\",${nl}  \"passed\": true"
-        check --project ${CMAKE_CURRENT_SOURCE_DIR}/host)
+      baker_example_test(baker_example_host_check baker_example_host "^{${nl}  \"schema\": \"baker[.]check/1[.]4\",${nl}  \"passed\": true"
+        check --baker-project ${CMAKE_CURRENT_SOURCE_DIR}/host)
       baker_example_test(baker_example_host_play baker_example_host
         "^player speed 4[.]5, 3 spawned${nl}$"
-        play --frames 3 --console-port 0 --project ${CMAKE_CURRENT_SOURCE_DIR}/host)
+        play --frames 3 --console-port 0 --baker-project ${CMAKE_CURRENT_SOURCE_DIR}/host)
     endif()
   endif()
   if(BAKER_BUILD_TESTS)

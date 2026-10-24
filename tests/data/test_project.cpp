@@ -166,6 +166,17 @@ TEST_CASE("a project's tool may take arguments of its own") {
           std::string::npos);
 }
 
+TEST_CASE("a project names its game's step, for sim's results") {
+    TempDir dir;
+    const Project p = ok(read_project(
+        dir.write("baker-project.dta", "(project (step_name turn) (layers (d \"d.dta\")))")));
+    CHECK(p.step_name == Symbol("turn"));
+    const auto bad = read_project(
+        dir.write("bad.dta", "(project (step_name \"turn\" x) (layers (d \"d.dta\")))"));
+    REQUIRE_FALSE(bad);
+    CHECK(std::string(bad.error().message()).find("(step_name NAME)") != std::string::npos);
+}
+
 TEST_CASE("a project names its console's port, for tools") {
     TempDir dir;
     const std::string file =
@@ -389,4 +400,32 @@ TEST_CASE("a project names a layer under a virtual root, kept as written") {
     without.session().set_reader(reader);
     REQUIRE(open_project(without, p));
     CHECK(without.get<int>("speed") == 1);
+}
+
+TEST_CASE("a tool path in the build directory resolves where the tool says") {
+    TempDir dir;
+    const std::string named = dir.write("named/baker-project.dta",
+                                        "(project (build \"../out\") (tool \"$build/bin/game\")\n"
+                                        "   (layers (d \"d.dta\")))\n");
+    const Project p = ok(read_project(named));
+    CHECK(p.tool == Symbol("$build/bin/game"));  // as written, for the tool to resolve
+    CHECK(p.build == Symbol(dir.path("named/../out")));
+    CHECK(p.build_at.line == 1);
+    CHECK(p.tool_path() == Symbol(dir.path("named/../out/bin/game")));
+    CHECK(p.tool_path("/ci/build") == Symbol("/ci/build/bin/game"));  // the tool's own wins
+
+    // No (build ...): "build" beside the project file.
+    const std::string plain = dir.write(
+        "plain/baker-project.dta", "(project (tool \"$build/game\") (layers (d \"d.dta\")))\n");
+    CHECK(ok(read_project(plain)).tool_path() == Symbol(dir.path("plain/build/game")));
+
+    // A path without $build is the joined path, as before, whatever the build directory.
+    const std::string fixed = dir.write("fixed/baker-project.dta",
+                                        "(project (tool \"bin/game\") (layers (d \"d.dta\")))\n");
+    CHECK(ok(read_project(fixed)).tool_path("/elsewhere") == Symbol(dir.path("fixed/bin/game")));
+
+    const std::string bad =
+        dir.write("bad/baker-project.dta", "(project (build) (layers (d \"d.dta\")))\n");
+    CHECK(std::string(read_project(bad).error().message()).find("(build \"path\")") !=
+          std::string::npos);
 }

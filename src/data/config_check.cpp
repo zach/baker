@@ -281,14 +281,24 @@ LayerReport Config::Impl::check_candidate(const Config& c, std::string_view name
                                           const Ref<Array>& candidate,
                                           std::span<const Node> commands,
                                           const LoadSession& session, const LayerPolicy& policy,
-                                          std::span<const Error> read_warnings) const {
+                                          std::span<const Error> read_warnings,
+                                          size_t below) const {
     Vec<Symbol> names(alloc);
-    for (const LayerState& l : layers)
-        if (l.options.enabled) names.emplace_back(l.name);
+    for (size_t i = 0; i < std::min(below, layers.size()); ++i)
+        if (layers[i].options.enabled) names.emplace_back(layers[i].name);
     Vec<const Validator*> all(alloc);
     for (const Check& v : validators) all.push_back(&v.fn);
-    const Basis b{*c.root(), stack_layers(),           {names.data(), names.size()},
-                  as_read,   {all.data(), all.size()}, merge_scratch,
+    // Below the top, the stack is the layers under the candidate's place, merged anew.
+    Ref<Array> under = c.root();
+    if (below < layers.size()) {
+        under = Array::make(0);
+        for (size_t i = 0; i < below; ++i)
+            if (layers[i].options.enabled)
+                under =
+                    detail::merge(*under, *layers[i].root, MergePolicy::Overwrite, merge_scratch);
+    }
+    const Basis b{*under,  stack_layers(nullptr, below), {names.data(), names.size()},
+                  as_read, {all.data(), all.size()},     merge_scratch,
                   alloc};
     return run_check(b, name, candidate, commands, session, policy, read_warnings);
 }

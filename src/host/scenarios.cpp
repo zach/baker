@@ -63,33 +63,63 @@ Expected<void> read_forms(const Array& tree, Book& book) {
                 return Unexpected(
                     at(form, ErrorCode::Syntax, "a scenario needs a name: (scenario NAME ...)"));
             s.desc = text(form, "desc");
+            // Its length: (seconds N) at the step rate, or (steps N) whatever the rate.
             const Array* sec = form.try_find(Symbol("seconds"));
+            const Array* st = form.try_find(Symbol("steps"));
             const auto seconds = sec && sec->size() > 1 ? (*sec)[1].try_float() : std::nullopt;
-            if (!seconds || *seconds <= 0)
-                return Unexpected(
-                    at(form, ErrorCode::Syntax,
-                       "scenario '" + Str(s.name.str()) + "' needs (seconds N), N above 0"));
-            s.seconds = *seconds;
+            const auto steps = st && st->size() > 1 ? (*st)[1].try_int() : std::nullopt;
+            if ((!seconds || *seconds <= 0) && (!steps || *steps <= 0))
+                return Unexpected(at(form, ErrorCode::Syntax,
+                                     "scenario '" + Str(s.name.str()) +
+                                         "' needs (seconds N) or (steps N), N above 0"));
+            if (seconds && steps)
+                return Unexpected(at(form, ErrorCode::Syntax,
+                                     "scenario '" + Str(s.name.str()) +
+                                         "' gives (seconds ...) and (steps ...): one length"));
+            if (seconds) s.seconds = *seconds;
+            if (steps) s.steps = static_cast<uint64_t>(*steps);
+            if (const Array* u = form.try_find(Symbol("until"))) {
+                if (u->size() != 2 || (*u)[1].type() != Type::Command)
+                    return Unexpected(
+                        at(*u, ErrorCode::Syntax,
+                           "scenario '" + Str(s.name.str()) + "': (until {command})"));
+                s.until = (*u)[1];
+            }
             for (const Array& part : form.subarrays()) {
                 if (part.empty()) continue;
                 if (part[0].is(Symbol("start"))) {
                     commands(part, 1, s.start);
                 } else if (part[0].is(Symbol("at"))) {
+                    // (at SECONDS {command}...) or (at step N {command}...)
+                    const bool by_step = part.size() > 2 && part[1].is(Symbol("step"));
+                    const auto step = by_step ? part[2].try_int() : std::nullopt;
                     const auto when = part.size() > 1 ? part[1].try_float() : std::nullopt;
-                    if (!when)
-                        return Unexpected(
-                            at(part, ErrorCode::Syntax,
-                               "scenario '" + Str(s.name.str()) + "': (at SECONDS {command}...)"));
-                    Scenario::At a{.seconds = *when};
-                    commands(part, 2, a.commands);
+                    if (by_step ? !step || *step < 0 : !when)
+                        return Unexpected(at(part, ErrorCode::Syntax,
+                                             "scenario '" + Str(s.name.str()) +
+                                                 "': (at SECONDS {command}...) or (at step N "
+                                                 "{command}...)"));
+                    Scenario::At a{.seconds = when.value_or(0), .step = step.value_or(-1)};
+                    commands(part, by_step ? 3 : 2, a.commands);
                     s.at.push_back(std::move(a));
+                } else if (part[0].is(Symbol("every"))) {
+                    // (every SECONDS {command}...) or (every step N {command}...)
+                    const bool by_step = part.size() > 2 && part[1].is(Symbol("step"));
+                    const auto step = by_step ? part[2].try_int() : std::nullopt;
+                    const auto when = part.size() > 1 ? part[1].try_float() : std::nullopt;
+                    if (by_step ? !step || *step <= 0 : !when || *when <= 0)
+                        return Unexpected(at(part, ErrorCode::Syntax,
+                                             "scenario '" + Str(s.name.str()) +
+                                                 "': (every SECONDS {command}...) or (every "
+                                                 "step N {command}...), a period above 0"));
+                    Scenario::At a{.seconds = when.value_or(0), .step = step.value_or(-1)};
+                    commands(part, by_step ? 3 : 2, a.commands);
+                    s.every.push_back(std::move(a));
                 } else if (part[0].is(Symbol("objectives"))) {
                     for (size_t i = 1; i < part.size(); ++i)
                         if (const auto sym = part[i].try_sym()) s.objectives.push_back(*sym);
                 }
             }
-            std::stable_sort(s.at.begin(), s.at.end(),
-                             [](const auto& a, const auto& b) { return a.seconds < b.seconds; });
             book.scenarios.push_back(std::move(s));
         }
     }
@@ -279,8 +309,24 @@ Stepper::Stepper(Context& ctx, const Book& book, const Scenario& scenario, uint6
     // Steps are counted, not timed: the same scenario takes the same steps everywhere.
     const auto step_ns = static_cast<uint64_t>(std::llround(1e9 / step_hz));
     dt_ = static_cast<double>(step_ns) / 1e9;
-    total_ = static_cast<uint64_t>(std::llround(scenario.seconds * step_hz));
+    total_ = scenario.steps ? scenario.steps
+                            : static_cast<uint64_t>(std::llround(scenario.seconds * step_hz));
+    // The step each (at ...) is due: its own, or the first whose time reaches its seconds,
+    // within half a step.
+    for (const Scenario::At& a : scenario.at)
+        due_.emplace_back(a.step >= 0 ? static_cast<uint64_t>(a.step) : step_of(a.seconds), &a);
+    // Each (every ...) first at step 0; later multiples by the same half-step rule.
+    for (const Scenario::At& e : scenario.every) every_.push_back({&e, 0, 0});
+    std::stable_sort(due_.begin(), due_.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
     ctx.var("seed") = Node(static_cast<int64_t>(seed));
+}
+
+// The first step whose time reaches `seconds`, within half a step.
+uint64_t Stepper::step_of(double seconds) const noexcept {
+    uint64_t due = 0;
+    while (seconds > static_cast<double>(due) * dt_ + dt_ * 0.5) ++due;
+    return due;
 }
 
 void Stepper::begin() {
@@ -289,18 +335,42 @@ void Stepper::begin() {
     run_due();
 }
 
-// Each (at ...) whose time has come, at the step about to be taken.
+// Each (at ...) whose step has come, at the step about to be taken; then each (every ...)
+// due at it, in the order written.
 void Stepper::run_due() {
-    const double now = static_cast<double>(run_.steps) * dt_;
-    const Vec<Scenario::At>& at = scenario_->at;
-    while (next_at_ < at.size() && at[next_at_].seconds <= now + dt_ * 0.5)
-        for (const Node& c : at[next_at_++].commands)
+    while (next_at_ < due_.size() && due_[next_at_].first <= run_.steps)
+        for (const Node& c : due_[next_at_++].second->commands)
             if (auto r = ctx_->eval(c); !r) run_.errors.push_back(r.error());
+    for (Every& e : every_) {
+        if (e.next != run_.steps) continue;
+        for (const Node& c : e.every->commands)
+            if (auto r = ctx_->eval(c); !r) run_.errors.push_back(r.error());
+        ++e.multiple;
+        const auto m = static_cast<double>(e.multiple);
+        e.next = e.every->step > 0 ? e.multiple * static_cast<uint64_t>(e.every->step)
+                                   : step_of(m * e.every->seconds);
+    }
 }
 
 void Stepper::advance() {
     ctx_->scheduler().tick(dt_);
     ++run_.steps;
+    // The game's own end: (until {command}), after each step, with $steps set.
+    if (scenario_->until.type() == Type::Command && run_.steps < total_) {
+        ctx_->var("steps") = Node(static_cast<int64_t>(run_.steps));
+        auto r = ctx_->eval(scenario_->until);
+        if (!r) {
+            run_.errors.push_back(r.error());
+            ended_ = true;  // a condition that fails ends the run, which fails
+            run_.ended = Symbol("until");
+        } else if (const auto name = r->try_sym()) {
+            ended_ = true;  // the game's own name for how it ended
+            run_.ended = *name;
+        } else if (const auto v = r->try_float(); v && *v != 0) {
+            ended_ = true;
+            run_.ended = Symbol("until");
+        }
+    }
     if (!done()) run_due();
 }
 
@@ -311,6 +381,9 @@ Run Stepper::stop() {
 
 Run Stepper::judge() {
     Context& ctx = *ctx_;
+    if (run_.ended.empty()) run_.ended = Symbol("length");
+    ctx.var("steps") = Node(static_cast<int64_t>(run_.steps));  // for the measures
+    ctx.var("ended") = Node(run_.ended);
     const Scenario& scenario = *scenario_;
     for (const Objective& o : book_->objectives) {
         if (!scenario.objectives.empty() &&
@@ -407,7 +480,16 @@ bool all_passed(const Vec<Run>& runs, const Vec<Median>& medians) {
            std::all_of(medians.begin(), medians.end(), [](const Median& m) { return m.pass; });
 }
 
-Str results_json(Vec<Run> runs, const Vec<Median>& medians) {
+namespace {
+// How a run ended, as the results write it: its name, "length" if it has none yet.
+Str json_ended(const Run& r) {
+    Str s;
+    detail::json_string(s, r.ended.empty() ? std::string_view("length") : r.ended.str());
+    return s;
+}
+}  // namespace
+
+Str results_json(Vec<Run> runs, const Vec<Median>& medians, Symbol step_name) {
     for (Run& r : runs)
         std::sort(r.objectives.begin(), r.objectives.end(),
                   [](const auto& a, const auto& b) { return by_text(a.name, b.name); });
@@ -416,8 +498,10 @@ Str results_json(Vec<Run> runs, const Vec<Median>& medians) {
     });
     const bool stopped =
         std::any_of(runs.begin(), runs.end(), [](const Run& r) { return !r.finished; });
-    Str s = "{\n  \"schema\": \"baker.sim/1.1\",\n  \"status\": ";
+    Str s = "{\n  \"schema\": \"baker.sim/1.3\",\n  \"status\": ";
     s += stopped ? "\"stopped\"" : all_passed(runs, medians) ? "\"passed\"" : "\"failed\"";
+    s += ",\n  \"step_name\": ";
+    detail::json_string(s, step_name.empty() ? std::string_view("step") : step_name.str());
     s += ",\n  \"runs\": [";
     for (size_t i = 0; i < runs.size(); ++i) {
         const Run& r = runs[i];
@@ -426,8 +510,8 @@ Str results_json(Vec<Run> runs, const Vec<Median>& medians) {
         json_place(s, r.file, r.line);
         s += ", \"seed\": " + detail::decimal(static_cast<int64_t>(r.seed)) +
              ", \"steps\": " + detail::decimal(static_cast<int64_t>(r.steps)) +
-             ", \"finished\": " + json_bool(r.finished) + ", \"passed\": " + json_bool(r.passed()) +
-             ", \"errors\": [";
+             ", \"finished\": " + json_bool(r.finished) + ", \"ended\": " + json_ended(r) +
+             ", \"passed\": " + json_bool(r.passed()) + ", \"errors\": [";
         for (size_t e = 0; e < r.errors.size(); ++e) {
             if (e) s += ", ";
             json_problem(s, r.errors[e]);
@@ -471,7 +555,35 @@ Str results_json(Vec<Run> runs, const Vec<Median>& medians) {
         by[k].tally.json(s);
         s += '}';
     }
-    s += by.empty() ? "]\n}\n" : "\n  ]\n}\n";
+    s += by.empty() ? "],\n" : "\n  ],\n";
+    // How each scenario's runs ended, as a tally: {"victory": 7, "defeat": 3}.
+    s += "  \"endings\": [";
+    size_t written = 0;
+    for (size_t i = 0; i < runs.size();) {
+        size_t end = i;
+        while (end < runs.size() && runs[end].scenario == runs[i].scenario) ++end;
+        Vec<std::pair<Symbol, int>> counts;
+        for (size_t k = i; k < end; ++k) {
+            const Symbol e = runs[k].ended.empty() ? Symbol("length") : runs[k].ended;
+            auto c = std::find_if(counts.begin(), counts.end(),
+                                  [&](const auto& x) { return x.first == e; });
+            if (c == counts.end())
+                counts.emplace_back(e, 1);
+            else
+                ++c->second;
+        }
+        s += written++ ? ",\n    {\"scenario\": " : "\n    {\"scenario\": ";
+        detail::json_string(s, runs[i].scenario.str());
+        s += ", \"endings\": {";
+        for (size_t k = 0; k < counts.size(); ++k) {
+            if (k) s += ", ";
+            detail::json_string(s, counts[k].first.str());
+            s += ": " + detail::decimal(counts[k].second);
+        }
+        s += "}}";
+        i = end;
+    }
+    s += written ? "\n  ]\n}\n" : "]\n}\n";
     return s;
 }
 
@@ -482,6 +594,7 @@ Str results_dta(const Vec<Run>& runs, const Vec<Median>& medians) {
              detail::decimal(static_cast<int64_t>(r.seed)) + ") (steps " +
              detail::decimal(static_cast<int64_t>(r.steps)) + ") (passed " +
              (r.passed() ? "1" : "0") + ")" + (r.finished ? "" : " (finished 0)") +
+             (r.ended.empty() ? Str() : " (ended " + Str(r.ended.str()) + ")") +
              place_dta(r.file, r.line);
         for (const ObjectiveResult& o : r.objectives) {
             s += "\n   (objective " + Str(o.name.str()) + " (value " + number_text(o.value) +
@@ -525,7 +638,8 @@ Expected<void> read_results(std::string_view file, Vec<Run>& runs, Vec<Median>& 
                   .seed = static_cast<uint64_t>(number(form.try_find(Symbol("seed")))),
                   .steps = static_cast<uint64_t>(number(form.try_find(Symbol("steps")))),
                   .finished = !form.try_find(Symbol("finished")) ||
-                              number(form.try_find(Symbol("finished"))) != 0};
+                              number(form.try_find(Symbol("finished"))) != 0,
+                  .ended = sym(form.try_find(Symbol("ended")))};
             for (const Array& part : form.subarrays()) {
                 if (part.empty()) continue;
                 if (part[0].is(Symbol("error")) && part.size() > 1) {

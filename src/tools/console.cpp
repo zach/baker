@@ -2,8 +2,9 @@
 // agents. Each result is data, so it prints as Baker text and
 // projects to JSON through eval_request.
 
-#include <baker/config.hpp>
-#include <baker/script.hpp>
+#include <baker/curve.hpp>
+#include <baker/tools/console.hpp>
+#include <baker/tools/layers.hpp>
 
 #include "common/containers.hpp"
 
@@ -36,6 +37,7 @@ struct Convert<Name> {
     }
 };
 
+namespace tools {
 namespace {
 
 Node text_node(std::string_view s) {
@@ -78,7 +80,7 @@ struct Tools {
 };
 
 Expected<Node> explain_node(Config& cfg, std::string_view path) {
-    auto entries = cfg.explain(Path(path));
+    auto entries = explain(cfg, Path(path));
     if (!entries) return Unexpected(std::move(entries).error());
     Vec<Node> out;
     for (const ExplainEntry& e : *entries) {
@@ -87,6 +89,15 @@ Expected<Node> explain_node(Config& cfg, std::string_view path) {
         fields.push_back(tagged("value", e.value));
         fields.push_back(tagged("standing", Node(standing_name(e.standing))));
         add_source(fields, e.source, false);
+        if (e.section) {  // (chosen_by server ifdef): the define behind the value
+            Vec<Node> by;
+            by.emplace_back(Symbol("chosen_by"));
+            by.emplace_back(e.section->name);
+            by.emplace_back(Symbol(e.section->else_branch ? "else"
+                                   : e.section->negated   ? "ifndef"
+                                                          : "ifdef"));
+            fields.push_back(list(by));
+        }
         out.push_back(list(fields));
     }
     return list(out);
@@ -133,7 +144,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
     bind(
         "config.get",
         [tools](Name path) -> Expected<Node> {
-            auto entries = tools->cfg.explain(Path(path.text));
+            auto entries = explain(tools->cfg, Path(path.text));
             if (!entries) return Unexpected(std::move(entries).error());
             for (const ExplainEntry& e : *entries)
                 if (e.standing == Standing::Wins && e.layer != "code") return e.value;
@@ -141,6 +152,15 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
                 ErrorCode::NotFound, "nothing sets '" + Str(path.text) + "'; its default stands"));
         },
         "The value at a path, as get() reads it: several values come as one array.");
+    bind(
+        "curve.sample",
+        [tools](Name path, double x) -> Expected<double> {
+            auto curve = tools->cfg.get<Curve>(Path(path.text));
+            if (!curve) return Unexpected(std::move(curve).error());
+            return curve->sample(x);
+        },
+        "A curve's value at x: the path's values read as a curve (points (x y), with an "
+        "optional interpolation and extension).");
     bind(
         "config.source",
         [tools](Name path) -> Expected<Node> {
@@ -173,7 +193,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
     bind(
         "config.effect",
         [tools](Name layer) -> Expected<Node> {
-            auto effect = tools->cfg.layer_effect(layer.text);
+            auto effect = layer_effect(tools->cfg, layer.text);
             if (!effect) return Unexpected(std::move(effect).error());
             Vec<Node> out;
             for (const LayerEffectEntry& e : *effect) {
@@ -192,7 +212,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
     bind(
         "config.diff",
         [tools](Name a, Name b) -> Expected<Node> {
-            auto diff = tools->cfg.diff(a.text, b.text);
+            auto diff = tools::diff(tools->cfg, a.text, b.text);
             if (!diff) return Unexpected(std::move(diff).error());
             Vec<Node> out;
             for (const DiffEntry& d : *diff) {
@@ -226,7 +246,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             },
             "Tunes a path live, in the scratch layer; returns the value set.");
         bind(
-            "config.clear",
+            "config.clear_scratch",
             [tools](Name path) -> Expected<Node> {
                 // A path with no live edit changes nothing, not even a merge. All of scratch
                 // is never this call with the path left out: a tool probing whether the
@@ -257,6 +277,16 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
                 return Node(int64_t{*r});
             },
             "Re-reads changed files now; returns 1 if anything changed.");
+        bind(
+            "config.digest",
+            [tools]() -> Node {
+                char hex[17];
+                uint64_t d = tools->cfg.digest();
+                for (int i = 15; i >= 0; --i, d >>= 4) hex[i] = "0123456789abcdef"[d & 15];
+                return Node(std::string_view(hex, 16));
+            },
+            "The digest of the data as the game reads it, live edits included, as 16 hex "
+            "digits: the same on every machine with the same data.");
         bind(
             "config.epoch",
             [tools]() -> Node { return Node(static_cast<int64_t>(tools->cfg.epoch())); },
@@ -373,4 +403,5 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
     return status;
 }
 
+}  // namespace tools
 }  // namespace baker

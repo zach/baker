@@ -70,7 +70,8 @@ public:
     // Watches exactly `files` (a Config's stack_files()) and `more` (the project file, say),
     // replacing what it watched before; a directory already watched keeps its handle. A
     // file whose directory the system will not watch (it does not exist yet) is checked by
-    // its stamp instead, so watching cannot fail.
+    // its stamp instead, so watching cannot fail. A directory of layers (StackFile::directory)
+    // is watched whole: a file added to it, or removed, reports the directory's path.
     void watch(std::span<const StackFile> files, std::span<const std::string_view> more = {});
 
     // Once a frame; never blocks. True if a watched file was saved, appeared, or went away

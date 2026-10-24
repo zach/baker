@@ -148,20 +148,24 @@ Expected<Ref<Array>> Config::Impl::read_through_cache(std::string_view path, con
 // stack_files(): the layers' dependencies, flattened. A merge that read the same files keeps
 // the list, and its epoch, as they were.
 void Config::Impl::refresh_files() {
+    // Each layer's files and directories, bottom to top.
+    auto each = [this](auto&& fn) {
+        for (const LayerState& l : layers)
+            for (const Dep& d : l.deps) fn(l, d.path.view(), d.present, d.directory);
+    };
     size_t i = 0;
     bool same = true;
-    for (const LayerState& l : layers)
-        for (const Dep& d : l.deps) {
-            same = same && i < stack_files.size() && stack_files[i].present == d.present &&
-                   stack_files[i].path.str() == d.path.view() &&
-                   stack_files[i].layer.str() == l.name.view();
-            ++i;
-        }
+    each([&](const LayerState& l, std::string_view path, bool present, bool dir) {
+        same = same && i < stack_files.size() && stack_files[i].present == present &&
+               stack_files[i].directory == dir && stack_files[i].path.str() == path &&
+               stack_files[i].layer.str() == l.name.view();
+        ++i;
+    });
     if (same && i == stack_files.size()) return;
     stack_files.clear();
-    for (const LayerState& l : layers)
-        for (const Dep& d : l.deps)
-            stack_files.push_back({Symbol(l.name.view()), Symbol(d.path.view()), d.present});
+    each([&](const LayerState& l, std::string_view path, bool present, bool dir) {
+        stack_files.push_back({Symbol(l.name.view()), Symbol(path), present, dir});
+    });
     ++stack_files_epoch;
 }
 
@@ -194,6 +198,16 @@ Expected<void> Config::Impl::read(LayerState& layer, const LoadSession& before, 
             name[16] = '\0';
             cache.append(cache_dir).append("/").append(name).append(".datb");
         }
+        // A directory a load lists (#include_dir) is one of its files too.
+        const LoadSession::Lister& lister = before.lister();
+        session->set_lister(
+            [&](std::string_view dir, const Callback<void(std::string_view)>& entry) {
+                Vec<Str> entries(alloc);
+                const uint64_t listing = detail::list_with(lister, dir, entries, alloc);
+                deps.push_back({Str(dir, alloc), listing != 0, listing, true});
+                for (const Str& e : entries) entry(e);
+                return listing != 0;
+            });
         session->set_reader([&](std::string_view p, TextSink out) {
             const uint64_t t0 = read_ns ? now() : 0;
             // Into the Config's buffer, which the parser copies from before it reads an
@@ -209,6 +223,7 @@ Expected<void> Config::Impl::read(LayerState& layer, const LoadSession& before, 
                              : read_through_cache(layer.path, cache, *session,
                                                   detail::SessionAccess::reads_disk(before));
         session->set_reader(reader);
+        session->set_lister(lister);
     }
     session->source_map = nullptr;
     // The one-way rule's warnings, and a pack's unmet requires, go to the warning
@@ -223,20 +238,36 @@ Expected<void> Config::Impl::read(LayerState& layer, const LoadSession& before, 
     layer.missing = false;
     if (!root) {
         // An optional layer whose file is absent is an empty layer.
-        if (!layer.options.optional || deps.empty() || deps.front().present)
+        if (!layer.options.optional || deps.empty() || deps.front().present) {
+            layer.deps = std::move(deps);  // a layer found in a directory waits for a change
             return Unexpected(std::move(root).error());
+        }
         root = Array::make(0, Symbol(layer.file), 1);
         layer.missing = true;
     }
     layer.root = std::move(*root);
     layer.map = map;
     layer.deps = std::move(deps);
+    // What its read tested, if it parsed: a cache's replay records none.
+    const auto tested = detail::SessionAccess::tested(*session);
+    const size_t from = std::min(detail::SessionAccess::tested(before).size(), tested.size());
+    layer.tested.assign(tested.data() + from, tested.data() + tested.size());  // EASTL: pointers
+    layer.tested_known =
+        detail::SessionAccess::parses(*session) > detail::SessionAccess::parses(before);
     layer.after = session;
     return {};
 }
 
 bool Config::Impl::changed(const LayerState& layer, Symbol& first) const {
     for (const Dep& d : layer.deps) {
+        if (d.directory) {
+            const uint64_t listing = detail::list_with(base.lister(), d.path, listed, alloc);
+            if ((listing != 0) != d.present || listing != d.hash) {
+                first = Symbol(d.path);
+                return true;
+            }
+            continue;
+        }
         const bool ok = detail::read_with(base.reader(), d.path, scan);
         if (ok != d.present || (ok && detail::content_hash(scan) != d.hash)) {
             first = Symbol(d.path);
@@ -244,6 +275,117 @@ bool Config::Impl::changed(const LayerState& layer, Symbol& first) const {
         }
     }
     return false;
+}
+
+bool Config::Impl::stale(const LayerState& layer, Symbol& first) const {
+    return (!layer.path.empty() || !layer.dir.empty()) && changed(layer, first);
+}
+
+// --- Directories of layers ---
+
+namespace {
+
+// The name of a path's last entry.
+std::string_view leaf_of(std::string_view path) noexcept {
+    const size_t at = path.find_last_of("/\\");
+    return at == std::string_view::npos ? path : path.substr(at + 1);
+}
+
+bool is_dta(std::string_view name) noexcept {
+    return name.size() > 4 && name.substr(name.size() - 4) == ".dta";
+}
+
+}  // namespace
+
+Expected<void> Config::Impl::list_dir(LayerState& marker, Vec<Found>& found) const {
+    found.clear();
+    marker.deps.clear();
+    Vec<Str> entries(alloc);
+    const uint64_t listing = detail::list_with(base.lister(), marker.dir, entries, alloc);
+    marker.missing = listing == 0;
+    marker.deps.push_back({marker.dir, !marker.missing, listing, true});
+    if (marker.missing) {
+        if (marker.options.optional) return {};
+        return Unexpected(make_error(ErrorCode::Io, "cannot list the directory '" + marker.dir +
+                                                        "' of layer '" + marker.name + "'"));
+    }
+    const Str order = detail::join_path(marker.dir, "order.dta");
+    Str text(alloc);
+    const bool ordered = detail::read_with(base.reader(), order, text);
+    marker.deps.push_back({order, ordered, ordered ? detail::content_hash(text) : 0});
+    Vec<Found> named(alloc);
+    for (const Str& e : entries) {
+        const std::string_view leaf = leaf_of(e);
+        if (leaf.empty() || leaf.front() == '.' || leaf == "order.dta") continue;  // hidden
+        if (is_dta(leaf)) {
+            named.push_back({Str(leaf.substr(0, leaf.size() - 4), alloc), Str(e, alloc)});
+        } else if (leaf.find('.') == std::string_view::npos) {
+            // A subdirectory, if it holds a layer.dta; else watched for one. A name with an
+            // extension is a file, and not looked into.
+            Str inner = detail::join_path(e, "layer.dta");
+            if (detail::read_with(base.reader(), inner, scan))
+                named.push_back({Str(leaf, alloc), std::move(inner)});
+            else
+                marker.deps.push_back({std::move(inner), false, 0});
+        }
+    }
+    std::stable_sort(named.begin(), named.end(),
+                     [](const Found& a, const Found& b) { return a.name < b.name; });
+    if (!ordered) {
+        found = std::move(named);
+        return {};
+    }
+    Vec<std::string_view> names(alloc);
+    for (const Found& f : named) names.push_back(f.name.view());
+    Vec<uint32_t> order_of(alloc);
+    Vec<Error> warnings(alloc);
+    if (auto r =
+            detail::directory_order(text, order, {names.data(), names.size()}, order_of, warnings);
+        !r)
+        return r;
+    if (warn)
+        for (const Error& w : warnings) warn(w);
+    for (const uint32_t i : order_of) found.push_back(std::move(named[i]));
+    return {};
+}
+
+Expected<size_t> Config::Impl::relist(Vec<LayerState>& ls, size_t at) const {
+    Vec<Found> found(alloc);
+    if (auto r = list_dir(ls[at], found); !r) return Unexpected(std::move(r).error());
+    const LayerState& marker = ls[at];
+    const size_t old = members(ls, at);
+    Vec<LayerState> next(alloc);
+    for (const Found& f : found) {
+        // A name taken outside the directory, or twice in it (a.dta and a/), is left out.
+        bool taken = f.name == "scratch" || f.name == marker.name;
+        for (size_t i = 0; i < ls.size() && !taken; ++i)
+            taken = (i <= at || i > at + old) && ls[i].name == f.name;
+        for (const LayerState& n : next) taken = taken || n.name == f.name;
+        if (taken) {
+            if (warn)
+                warn(refused(
+                    "'" + f.path + "' is not read: there is already a layer named '" + f.name + "'",
+                    Symbol(f.path)));
+            continue;
+        }
+        const LayerState* was = nullptr;
+        for (size_t i = at + 1; i <= at + old; ++i)
+            if (ls[i].name == f.name && ls[i].path == f.path) was = &ls[i];
+        if (was) {
+            next.push_back(*was);
+            continue;
+        }
+        LayerState l(alloc);
+        l.name = f.name;
+        l.path = f.path;
+        l.group = marker.name;
+        l.options.enabled = marker.options.enabled;
+        next.push_back(std::move(l));
+    }
+    const auto first = ls.begin() + static_cast<ptrdiff_t>(at + 1);
+    ls.erase(first, first + static_cast<ptrdiff_t>(old));
+    ls.insert(ls.begin() + static_cast<ptrdiff_t>(at + 1), next.begin(), next.end());
+    return next.size();
 }
 
 Expected<void> Config::Impl::reread(Vec<LayerState>& ls, size_t from, uint64_t* read_ns,
@@ -255,7 +397,17 @@ Expected<void> Config::Impl::reread(Vec<LayerState>& ls, size_t from, uint64_t* 
         if (l.path.empty()) {
             l.after = before;
         } else {
-            if (auto r = read(l, *before, read_ns); !r) return r;
+            l.broken = false;
+            if (auto r = read(l, *before, read_ns); !r) {
+                if (l.group.empty()) return r;
+                // A layer found in a directory that does not read is empty, and the rest
+                // stand; it is read again when its files change.
+                if (warn) warn(r.error());
+                l.root = Array::make(0, Symbol(l.file), 1);
+                l.map = nullptr;
+                l.after = before;
+                l.broken = true;
+            }
             if (files)
                 for (const Dep& d : l.deps) *files += d.present ? 1u : 0u;
         }
@@ -295,6 +447,7 @@ BAKER_INLINE void Config::Impl::retune(const ScratchEntry& e) const {
     // Lazily: even an empty vector allocates in MSVC's debug library.
     Own<Vec<TweakBase*>> more;
     const Values all = e.values->values();
+    options.tweaks->begin_change();  // read_consistent waits until every tweak is set
     options.tweaks->each([&](TweakBase& t) {
         const Path& tp = t.parsed();
         Values v;
@@ -319,6 +472,7 @@ BAKER_INLINE void Config::Impl::retune(const ScratchEntry& e) const {
             more->push_back(&t);
         }
     });
+    options.tweaks->end_change();
     for (size_t i = 0; i < n; ++i) few[i]->notify();
     if (more)
         for (TweakBase* t : *more) t->notify();
@@ -401,10 +555,13 @@ void Config::Impl::commit(Config& c, ReloadRecord& rec, uint64_t& t) {
     lap(rec.merge_ns, t);
     ++c.epoch_;
     Vec<TweakBase*> moved;
-    if (options.tweaks)
+    if (options.tweaks) {
+        options.tweaks->begin_change();  // read_consistent waits until every tweak is set
         options.tweaks->each([&](TweakBase& tw) {
             if (tw.bind(*c.root_, warn)) moved.push_back(&tw);
         });
+        options.tweaks->end_change();
+    }
     rec.tweaks_changed = static_cast<uint32_t>(moved.size());
     lap(rec.bind_ns, t);
     for (TweakBase* tw : moved) tw->notify();
@@ -487,10 +644,11 @@ void Config::set_warning_handler(Callback<void(const Error&)> handler) {
     impl_->warn = std::move(handler);
 }
 
-std::span<const Ref<Array>> Config::Impl::stack_layers(const Ref<Array>& candidate) const {
+std::span<const Ref<Array>> Config::Impl::stack_layers(const Ref<Array>& candidate,
+                                                       size_t count) const {
     enabled_roots.clear();
-    for (const LayerState& l : layers)
-        if (l.options.enabled) enabled_roots.push_back(l.root);
+    for (size_t i = 0; i < std::min(count, layers.size()); ++i)
+        if (layers[i].options.enabled) enabled_roots.push_back(layers[i].root);
     if (candidate) enabled_roots.push_back(candidate);
     return {enabled_roots.data(), enabled_roots.size()};
 }
@@ -510,7 +668,10 @@ void Config::remove_validator(ValidatorId id) {
 }
 
 void Config::bind(TweakBase& t) {
-    if (t.bind(*root_, impl_->warn)) t.notify();
+    t.registry_->begin_change();
+    const bool moved = t.bind(*root_, impl_->warn);
+    t.registry_->end_change();
+    if (moved) t.notify();
 }
 
 // --- Layers ---
@@ -525,7 +686,12 @@ Expected<size_t> Config::Impl::placement(LayerOptions& opts) const {
     const auto at = find_layer(anchor);
     if (!at)
         return Unexpected(make_error(ErrorCode::NotFound, "no layer named '" + Str(anchor) + "'"));
-    return below ? *at : *at + 1;
+    if (!layers[*at].group.empty())
+        return Unexpected(refused("'" + Str(anchor) + "' is in the directory of layer '" +
+                                  layers[*at].group + "': place a layer below or above '" +
+                                  layers[*at].group + "'"));
+    // Above a directory is above the layers found in it.
+    return below ? *at : *at + 1 + members(layers, *at);
 }
 
 Expected<void> Config::Impl::admit(const Config& c, const LayerOptions& opts, std::string_view name,
@@ -589,6 +755,67 @@ Expected<void> Config::push_layer_text(std::string_view name, std::string_view t
     return impl_->push_read(*this, std::move(layer), options);
 }
 
+Expected<void> Config::set_layer_text(std::string_view name, std::string_view text,
+                                      const LayerPolicy* policy) {
+    if (auto ok = impl_->may_change(*this); !ok) return ok;
+    if (name == "scratch") return Unexpected(refused("scratch is edited with set(), not as text"));
+    const auto at = impl_->find_layer(name);
+    if (!at)
+        return Unexpected(make_error(ErrorCode::NotFound, "no layer named '" + Str(name) + "'"));
+    if (!impl_->layers[*at].text)
+        return Unexpected(
+            refused("'" + Str(name) + "' is not a text layer; reload() reads a file layer again"));
+    if (impl_->layers[*at].text->view() == text) return {};  // the same layer: nothing to do
+    LayerState layer = impl_->layers[*at];
+    layer.text = Rc<Str>::make(impl_->alloc, text, impl_->alloc);
+    Vec<Error> read_warnings(impl_->alloc);
+    if (auto r =
+            impl_->read(layer, *impl_->session_below(impl_->layers, *at), nullptr, &read_warnings);
+        !r)
+        return r;
+    // Checked against the layers below it, as a push on top was (and as one placed lower
+    // was not), without the version it replaces.
+    if (policy)
+        if (auto r = refuse_unless(impl_->check_candidate(*this, name, layer.root,
+                                                          layer.after->autorun(), *layer.after,
+                                                          *policy, read_warnings, *at));
+            !r)
+            return r;
+    // The layers above read with its macros: read them again with the new text's.
+    Vec<LayerState> placed = impl_->layers;
+    placed[*at] = std::move(layer);
+    if (auto r = impl_->reread(placed, *at + 1); !r) return r;
+    impl_->layers = std::move(placed);
+    impl_->change(*this, trigger_name("layer"));
+    return {};
+}
+
+Expected<void> Config::push_layer_dir(std::string_view name, std::string_view dir,
+                                      LayerOptions options) {
+    if (auto ok = impl_->may_change(*this); !ok) return ok;
+    if (options.policy)
+        return Unexpected(
+            refused("a directory of layers is pushed without a policy; check each "
+                    "layer's text with check_layer_text instead"));
+    if (name == "scratch" || impl_->find_layer(name))
+        return Unexpected(refused("there is already a layer named '" + Str(name) + "'"));
+    const auto at = impl_->placement(options);
+    if (!at) return Unexpected(at.error());
+    LayerState marker(impl_->alloc);
+    marker.name.assign(name);
+    marker.dir.assign(dir);
+    marker.options = options;
+    marker.root = Array::make(0);  // it holds nothing
+    Vec<LayerState> placed = impl_->layers;
+    placed.insert(placed.begin() + static_cast<ptrdiff_t>(*at), std::move(marker));
+    if (auto n = impl_->relist(placed, *at); !n) return Unexpected(std::move(n).error());
+    // The layers above read with the macros of the ones found, as above a file layer.
+    if (auto r = impl_->reread(placed, *at); !r) return r;
+    impl_->layers = std::move(placed);
+    impl_->change(*this, trigger_name("layer"));
+    return {};
+}
+
 Expected<void> Config::push_layer(std::string_view name, Ref<Array> overlay, LayerOptions options) {
     if (auto ok = impl_->may_change(*this); !ok) return ok;
     if (!overlay)
@@ -614,6 +841,66 @@ Expected<void> Config::push_layer(std::string_view name, Ref<Array> overlay, Lay
     return {};
 }
 
+Expected<void> Config::set_defines(std::span<const std::string_view> names) {
+    if (auto ok = impl_->may_change(*this); !ok) return ok;
+    LoadSession& base = impl_->base;
+    auto has = [](const Vec<Symbol>& v, Symbol s) {
+        return std::find(v.begin(), v.end(), s) != v.end();
+    };
+    Vec<Symbol> was(impl_->alloc), now(impl_->alloc), changed(impl_->alloc);
+    for (const ActiveDefine& d : base.active_defines())
+        if (d.from == DefineFrom::Host) was.push_back(d.name);
+    for (const std::string_view n : names)
+        if (!has(now, Symbol(n))) now.emplace_back(n);
+    for (const Symbol s : was)
+        if (!has(now, s)) changed.push_back(s);
+    for (const Symbol s : now)
+        if (!has(was, s)) changed.push_back(s);
+    if (changed.empty()) return {};
+    const LoadSession kept = base;  // to put back if a layer does not read
+    for (const Symbol s : was)
+        if (!has(now, s)) base.undefine(s);
+    for (const Symbol s : now)
+        if (!has(was, s)) base.define(s, DefineFrom::Host);
+    ++impl_->generation;
+    // Each layer that touched a changed name, read again; every other keeps its tree, and
+    // its session takes each changed name as the session below it now has it, since its own
+    // read neither tested nor set one.
+    Vec<LayerState> fresh = impl_->layers;
+    for (size_t i = 0; i < fresh.size(); ++i) {
+        LayerState& l = fresh[i];
+        const Rc<LoadSession> before = impl_->session_below(fresh, i);
+        if (l.path.empty()) {  // an overlay reads nothing: its session is the one below
+            l.after = before;
+            continue;
+        }
+        const bool touched =
+            !l.tested_known || std::any_of(l.tested.begin(), l.tested.end(),
+                                           [&](Symbol s) { return has(changed, s); });
+        if (touched) {
+            if (auto r = impl_->read(l, *before); !r) {
+                base = kept;
+                return r;
+            }
+            continue;
+        }
+        auto patched = Rc<LoadSession>::make(impl_->alloc, *l.after);
+        for (const Symbol s : changed) {
+            const auto stands =
+                std::find_if(before->active_defines().begin(), before->active_defines().end(),
+                             [&](const ActiveDefine& d) { return d.name == s; });
+            if (stands == before->active_defines().end())
+                patched->undefine(s);
+            else
+                patched->define(s, stands->from);
+        }
+        l.after = patched;
+    }
+    impl_->layers = std::move(fresh);
+    impl_->change(*this, trigger_name("defines"));
+    return {};
+}
+
 Expected<void> Config::remove_layer(std::string_view name) {
     if (auto ok = impl_->may_change(*this); !ok) return ok;
     if (name == "scratch")
@@ -621,9 +908,14 @@ Expected<void> Config::remove_layer(std::string_view name) {
     const auto at = impl_->find_layer(name);
     if (!at)
         return Unexpected(make_error(ErrorCode::NotFound, "no layer named '" + Str(name) + "'"));
-    // The layers above were read with this one's macros; read them again without.
+    if (!impl_->layers[*at].group.empty())
+        return Unexpected(refused("'" + Str(name) + "' is in the directory of layer '" +
+                                  impl_->layers[*at].group + "': remove its file, or disable it"));
+    // The layers above were read with this one's macros; read them again without. A
+    // directory goes with the layers found in it.
     Vec<LayerState> rest = impl_->layers;
-    rest.erase(rest.begin() + static_cast<ptrdiff_t>(*at));
+    const auto first = rest.begin() + static_cast<ptrdiff_t>(*at);
+    rest.erase(first, first + 1 + static_cast<ptrdiff_t>(Impl::members(rest, *at)));
     if (auto r = impl_->reread(rest, *at); !r) return r;
     impl_->layers = std::move(rest);
     impl_->change(*this, trigger_name("layer"));
@@ -632,9 +924,11 @@ Expected<void> Config::remove_layer(std::string_view name) {
 
 Expected<void> Config::pop_layer() {
     if (auto ok = impl_->may_change(*this); !ok) return ok;
-    if (impl_->layers.empty())
-        return Unexpected(make_error(ErrorCode::NotFound, "no layer to pop"));
-    impl_->layers.pop_back();
+    auto& ls = impl_->layers;
+    if (ls.empty()) return Unexpected(make_error(ErrorCode::NotFound, "no layer to pop"));
+    // A directory's layers go with it.
+    const auto group = ls.back().group.empty() ? std::nullopt : impl_->find_layer(ls.back().group);
+    ls.erase(ls.begin() + static_cast<ptrdiff_t>(group ? *group : ls.size() - 1), ls.end());
     impl_->change(*this, trigger_name("layer"));
     return {};
 }
@@ -650,7 +944,7 @@ List<Node> Config::autorun() const {
     Vec<Node> commands;
     for (const auto& l : impl_->layers) {
         // An overlay's session is the layer's below it: its commands are that layer's.
-        if (l.path.empty() || !l.options.enabled || !l.after) continue;
+        if (l.path.empty() || l.broken || !l.options.enabled || !l.after) continue;
         for (const Node& n : l.after->autorun()) commands.push_back(n);
     }
     return List<Node>(commands);
@@ -659,16 +953,21 @@ List<Node> Config::autorun() const {
 Expected<void> Config::set_layer_enabled(std::string_view name, bool enabled) {
     if constexpr (kShipping) return Unexpected(shipping("toggling a layer"));
     if (auto ok = impl_->may_change(*this); !ok) return ok;
-    bool* flag = nullptr;
+    bool changed = false;
+    auto set = [&](bool& flag) {
+        changed = changed || flag != enabled;
+        flag = enabled;
+    };
     if (name == "scratch") {
-        flag = &impl_->scratch_enabled;
+        set(impl_->scratch_enabled);
     } else if (auto at = impl_->find_layer(name)) {
-        flag = &impl_->layers[*at].options.enabled;
+        // A directory, and every layer found in it.
+        for (size_t i = *at; i <= *at + Impl::members(impl_->layers, *at); ++i)
+            set(impl_->layers[i].options.enabled);
     } else {
         return Unexpected(make_error(ErrorCode::NotFound, "no layer named '" + Str(name) + "'"));
     }
-    if (*flag == enabled) return {};
-    *flag = enabled;
+    if (!changed) return {};
     impl_->change(*this, trigger_name("layer"));
     return {};
 }
@@ -685,12 +984,56 @@ bool Config::layer_enabled(std::string_view name) const {
     return at && impl_->layers[*at].options.enabled;
 }
 
+uint64_t Config::digest() const {
+    // A live edit is in scratch until the next full merge: merge afresh then.
+    return baker::digest(scratch_dirty_ ? *with_edits() : *root_);
+}
+
+uint64_t Config::stack_digest() const {
+    uint64_t d = 0;
+    auto layer = [&d](std::string_view name, const Array& tree) {
+        const Node n{Symbol(name)};
+        d = baker::digest(tree, baker::digest(*Array::make_copy(std::span<const Node>(&n, 1)), d));
+    };
+    for (const LayerState& l : impl_->layers)
+        if (l.options.enabled) layer(l.name.view(), *l.root);
+    if (impl_->scratch_enabled)
+        if (const Ref<Array> s = impl_->scratch_root()) layer("scratch", *s);
+    return d;
+}
+
 Ref<Array> Config::layer_root(std::string_view name) const {
     const auto at = impl_->find_layer(name);
     return at ? impl_->layers[*at].root : nullptr;
 }
 
+Expected<void> Config::layer_text(std::string_view name, TextSink out) const {
+    Ref<Array> tree;
+    if (name == "scratch")
+        tree = impl_->scratch_root();
+    else if (const auto at = impl_->find_layer(name))
+        tree = impl_->layers[*at].root;
+    else
+        return Unexpected(make_error(ErrorCode::NotFound, "no layer named '" + Str(name) + "'"));
+    if (tree) write_dta(*tree, out);  // empty scratch is an empty layer
+    return {};
+}
+
 // --- Reading ---
+
+bool Config::edits_beneath(const Path& path) const noexcept {
+    return impl_->edits_beneath(path);
+}
+
+Ref<Array> Config::with_edits() const {
+    return impl_->merged();
+}
+
+void Config::apply_edits() {
+    if (!scratch_dirty_) return;
+    root_ = impl_->merged();
+    scratch_dirty_ = false;
+}
 
 Config::ScratchHit Config::scratch_values(const Path& path, Values& out) const noexcept {
     const ScratchEntry* e = impl_->scratch_entry(path);
@@ -746,7 +1089,24 @@ Expected<bool> Config::reload(const ReloadRequest& request) {
     auto& ls = impl_->layers;
     size_t from = ls.size();
     for (size_t i = 0; i < ls.size() && from == ls.size(); ++i)
-        if (!ls[i].path.empty() && impl_->changed(ls[i], rec.first_file)) from = i;
+        if (impl_->stale(ls[i], rec.first_file)) from = i;
+    // A directory at or above the change is listed again if it changed, into a copy of the
+    // stack that replaces it only if every layer reads.
+    // Made only then: even an empty vector allocates in MSVC's debug library.
+    std::optional<Vec<LayerState>> listed;
+    for (size_t i = from; i < ls.size(); ++i) {
+        Symbol unused;
+        if (ls[i].dir.empty() || (i != from && !impl_->stale(ls[i], unused))) continue;
+        if (!listed) listed.emplace(ls);
+        const size_t at = i + listed->size() - ls.size();  // where it is in the copy
+        if (auto n = impl_->relist(*listed, at); !n) {
+            impl_->lap(rec.scan_ns, t);
+            rec.layer = Symbol(ls[i].name);
+            rec.outcome = ReloadOutcome::ParseError;
+            impl_->feed(*this, rec, impl_->finish(*this, rec, t));
+            return Unexpected(std::move(n).error());
+        }
+    }
     impl_->lap(rec.scan_ns, t);
     if (from == ls.size()) {
         rec.outcome = ReloadOutcome::Unchanged;
@@ -754,10 +1114,12 @@ Expected<bool> Config::reload(const ReloadRequest& request) {
         return false;
     }
     rec.layer = Symbol(ls[from].name);
-    if (auto r = impl_->reread_stages(rec, from, t); !r) {
+    Vec<LayerState>& next = listed ? *listed : ls;
+    if (auto r = impl_->reread_stages(rec, next, from, t); !r) {
         impl_->feed(*this, rec, impl_->finish(*this, rec, t));
         return Unexpected(std::move(r).error());
     }
+    if (listed) ls = std::move(*listed);
     impl_->commit(*this, rec, t);
     impl_->feed(*this, rec, impl_->finish(*this, rec, t));
     return true;

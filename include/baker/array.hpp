@@ -188,12 +188,21 @@ private:
     detail::NodeBuffer nodes_;
 };
 
+// A 64-bit digest of `tree` by value: numbers by type and value (-0.0 as 0.0, every NaN as
+// one), symbols and strings by type and text, arrays, commands and properties by type and
+// elements in order; not file names, lines or comments. The encoding is fixed: each value a
+// type word, then its words (a float's IEEE 754 bits; a text's length, then its bytes eight
+// to a word, little-endian, zero-padded; an array's count, then its elements), each folded
+// into the state as state = splitmix64(state ^ word) from 0. The same on every platform and
+// build, and stable within a major version. Not cryptographic. `seed` chains digests.
+[[nodiscard]] uint64_t digest(const Array& tree, uint64_t seed = 0) noexcept;
+
 // Convert<T>: how a lookup reads a T. Specialize it for your own types:
 //
 //   template <> struct baker::Convert<Vec2> {
 //       static constexpr std::string_view name = "vec2";   // optional; used in errors
 //       // optional: Baker's type of each value, for the reference and tools that check
-//       // data without the game (DescribedTweaks)
+//       // data without the game (tools::DescribedTweaks)
 //       static constexpr std::string_view values[] = {"float32", "float32"};
 //       static bool from(const baker::Values& v, Vec2& out) {
 //           return v.size() >= 2 && v.read(0, out.x) && v.read(1, out.y);
@@ -219,6 +228,30 @@ private:
 // be given a converter without adding names to its namespace.
 template <class T>
 struct Convert;
+
+// How many values a converter takes, beside the value types it declares
+// (Convert<T>::values), for a tool that checks data without the game:
+//   static constexpr ValueCount count = ValueCount::Any;
+// A converter that declares values and no count takes exactly those.
+enum class ValueCount : uint8_t {
+    Exact,    // one value of each type, in order, and no more
+    AtLeast,  // one of each type, in order, then any more, which it reads or leaves
+    Any,      // any number, zero included, each of the one type (or groups of the types)
+};
+
+// A list's element, for the reference and a tool that checks data without the game. A list
+// converter declares its element type, and a fixed-size one its length too:
+//   using element = Vec2;
+//   static constexpr size_t length = 4;
+// as Convert<std::vector<T>> and Convert<std::array<T, N>> do. An element of one of Baker's
+// single-value types is written bare, (spawns 3 4 5); one of the game's own nests in
+// parentheses, (patrol (0 0) (4 0) (4 4)), as Values::read reads it.
+struct ListElement {
+    std::string_view type{};  // "float32", "vec2"; empty for a value that is not a list
+    std::span<const std::string_view> values{};  // Baker's type of each of its values
+    ValueCount count = ValueCount::Exact;        // how many it takes, as a value's count
+    size_t length = 0;                           // a fixed-size list's elements; 0: any
+};
 
 namespace detail {
 
@@ -279,12 +312,41 @@ template <class T>
         return {};
 }
 
+// How many values a T takes: Convert<T>::count if it says, else exactly its value types.
+template <class T>
+[[nodiscard]] constexpr ValueCount value_count() noexcept {
+    if constexpr (requires { ValueCount(Convert<T>::count); })
+        return Convert<T>::count;
+    else
+        return ValueCount::Exact;
+}
+
+// A list converter's element (Convert<T>::element, ::length); none for any other T.
+template <class T>
+[[nodiscard]] constexpr ListElement list_element() noexcept {
+    if constexpr (requires { typename Convert<T>::element; }) {
+        using E = typename Convert<T>::element;
+        size_t length = 0;
+        if constexpr (requires { size_t(Convert<T>::length); }) length = Convert<T>::length;
+        return {convert_info<E>().name, value_types<E>(), value_count<E>(), length};
+    } else {
+        return {};
+    }
+}
+
 // Whether `type` is one of Baker's single-value types: "int8" to "uint64", "int", "float32",
 // "float", "bool", "symbol", "string", or "value" (any one value).
 [[nodiscard]] bool value_type_known(std::string_view type) noexcept;
-// Whether `values` hold a value of each of `types` in order, as a Convert that reads them
-// with Values::read would take them; false if a type is not one of Baker's.
-[[nodiscard]] bool reads_as(std::span<const std::string_view> types, const Values& values);
+// Whether `values` are what `types` and `count` describe, each read as a Convert that reads
+// it with Values::read would take it; false if a type is not one of Baker's.
+[[nodiscard]] bool reads_as(std::span<const std::string_view> types, ValueCount count,
+                            const Values& values);
+// Whether `values` are a list of `element`s, each read as Values::read reads it: bare for
+// one of Baker's types, its contents for an array of the game's own; `length` of them if it
+// is fixed. True when the element's values are not described: nothing to hold them to.
+[[nodiscard]] bool reads_list(const ListElement& element, const Values& values);
+// "exact", "at_least" or "any", as the JSON documents write a count.
+[[nodiscard]] std::string_view count_name(ValueCount count) noexcept;
 
 // The double nearest the shortest decimal that reads back as `f`: 0.7f gives 0.7.
 [[nodiscard]] double float_to_decimal_double(float f) noexcept;

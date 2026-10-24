@@ -3,11 +3,13 @@
 
 #include <baker/host/console.hpp>
 #include <baker/host/live.hpp>
+#include <baker/tools/console.hpp>
 
 #include "common/containers.hpp"
 
 #if BAKER_HOST_SHAPE
 #include <baker/shape.hpp>
+#include <baker/tools/rules.hpp>
 #endif
 
 namespace baker::host {
@@ -78,6 +80,7 @@ Expected<void> Live::open(const LiveOptions& options) {
     im.on_log = options.log;
     im.load_errors.clear();
     if (options.reader) im.cfg.session().set_reader(options.reader);
+    if (options.lister) im.cfg.session().set_lister(options.lister);
     if (options.disk_path) im.watcher.set_disk_path_hook(options.disk_path);
     if (options.stamp) im.watcher.set_stamp_hook(options.stamp);
 
@@ -107,6 +110,7 @@ Expected<void> Live::open(const LiveOptions& options) {
     im.cfg.add_validator(check_validator(im.ctx, {.packs = &im.cfg.read_session()}));
 #if BAKER_HOST_SHAPE
     im.cfg.add_validator(shape::validator(), {.any_thread = true});
+    im.cfg.add_validator(tools::rules_validator(im.ctx));  // the shapes' rules, in script
 #endif
     auto opened = open_project(im.cfg, *project, options.open);
     if (!opened) {
@@ -116,7 +120,8 @@ Expected<void> Live::open(const LiveOptions& options) {
     Vec<Error> problems;  // a layer that did not read, with go_on: kept past autorun's reset
     for (const ProjectProblem& p : *opened) problems.push_back(p.error);
 
-    if (auto r = bind_config_tools(im.ctx, im.cfg, {.allow_write = options.console_write}); !r)
+    if (auto r = tools::bind_config_tools(im.ctx, im.cfg, {.allow_write = options.console_write});
+        !r)
         im.log(r.error());
     im.autorun();
     for (const Error& e : problems) im.problem(e);
@@ -156,6 +161,7 @@ void Live::begin_frame() {
     if (im.stack_changed) {
         im.autorun();
     } else if (im.cfg.epoch() != im.seen) {  // a live edit
+        im.cfg.apply_edits();                // so the game's reads of records and tables see it
         if (im.changed) im.changed(im.cfg);
         im.seen = im.cfg.epoch();
     }

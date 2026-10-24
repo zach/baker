@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(baker VERSION 0.5.0 LANGUAGES CXX)
+project(baker VERSION 0.6.0 LANGUAGES CXX)
 
 option(BAKER_BUILD_SCRIPT     "Build baker::script (evaluation, objects, tasks)" ON)
 option(BAKER_BUILD_SHAPE      "Build baker::shape (data-declared shapes)" ON)
@@ -121,11 +121,13 @@ add_library(baker_data
   src/data/config_loop.cpp
   src/data/config_write.cpp
   src/data/config_check.cpp
+  src/data/curve.cpp
   src/data/project.cpp
   src/data/error.cpp
   src/data/lookup.cpp
   src/data/merge.cpp
   src/data/node.cpp
+  src/data/list_dir.cpp
   src/data/parse.cpp
   src/data/repeats.cpp
   src/data/source_map.cpp
@@ -144,10 +146,9 @@ target_include_directories(baker_data SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/third
 if(BAKER_BUILD_SCRIPT)
   add_library(baker_script
     src/script/builtins.cpp
-    src/script/config_tools.cpp
+    src/script/check.cpp
     src/script/context.cpp
     src/script/object.cpp
-    src/script/reference.cpp
     src/script/request.cpp
     src/script/script_tasks.cpp
     src/script/task.cpp)
@@ -163,6 +164,28 @@ if(BAKER_BUILD_SHAPE)
   add_library(baker::shape ALIAS baker_shape)
   baker_configure_library(baker_shape)
   target_link_libraries(baker_shape PUBLIC baker::data)
+  # Without baker::script nothing can evaluate a rule, and the validator says so.
+  if(NOT BAKER_BUILD_SCRIPT)
+    target_compile_definitions(baker_shape PRIVATE BAKER_SHAPE_NO_SCRIPT=1)
+  endif()
+endif()
+
+# --- baker::tools: what only tools, and the host kit on their behalf, call: the reference,
+#     the check report and the tweaks as JSON, the layer tools, the console's config.*
+#     commands, the vocabulary declared from a reference, and the tolerant read of text. A
+#     game links it only with the kit. Built with baker::script.
+if(BAKER_BUILD_SCRIPT)
+  add_library(baker_tools src/tools/console.cpp src/tools/described.cpp src/tools/layers.cpp
+              src/tools/reference.cpp src/tools/structure.cpp src/tools/tweaks.cpp
+              src/tools/format.cpp)
+  add_library(baker::tools ALIAS baker_tools)
+  baker_configure_library(baker_tools)
+  target_link_libraries(baker_tools PUBLIC baker::script)
+  # Rules between values: declared in shapes, evaluated here.
+  if(BAKER_BUILD_SHAPE)
+    target_sources(baker_tools PRIVATE src/tools/rules.cpp)
+    target_link_libraries(baker_tools PUBLIC baker::shape)
+  endif()
 endif()
 
 # --- baker::host: the host kit, what every host would write: the files the stack was
@@ -173,7 +196,7 @@ if(BAKER_BUILD_HOST AND BAKER_BUILD_SCRIPT)
               src/host/watcher.cpp)
   add_library(baker::host ALIAS baker_host)
   baker_configure_library(baker_host)
-  target_link_libraries(baker_host PUBLIC baker::script)
+  target_link_libraries(baker_host PUBLIC baker::tools)
   if(BAKER_BUILD_SHAPE)  # Live adds the shape validator when there is one
     target_link_libraries(baker_host PUBLIC baker::shape)
     target_compile_definitions(baker_host PRIVATE BAKER_HOST_SHAPE=1)

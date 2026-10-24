@@ -10,6 +10,7 @@
 #include "data/text.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <utility>
 
 namespace baker {
@@ -379,5 +380,15 @@ private:
     Context::Impl& impl_;
     size_t mark_;
 };
+
+namespace detail {
+// Builds each overload of `name` from its description into `built`; why not, if one cannot
+// be, and then `built` is not to be added. Context::declare's, and baker::tools'
+// declare_type's.
+std::optional<Str> build_described(Context::Impl& impl, Symbol name,
+                                   std::span<const OverloadDescription> overloads,
+                                   Vec<Overload>& built,
+                                   const Callback<Expected<Node>(Args&)>& body = {});
+}  // namespace detail
 
 }  // namespace baker

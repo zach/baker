@@ -18,20 +18,6 @@ inline std::string to_string(const CheckReport& report) {
     return out;
 }
 
-// The check report as JSON (baker::write_json, docs/check-json.md).
-inline std::string to_json(const CheckReport& report, const LoadSession* packs = nullptr) {
-    std::string out;
-    write_json(report, string_out(out), packs);
-    return out;
-}
-
-// The script reference, as Markdown.
-inline std::string reference(const Context& ctx, const LoadSession* packs = nullptr) {
-    std::string out;
-    reference(ctx, string_out(out), packs);
-    return out;
-}
-
 // The script calls in progress on this thread's current Context, one line each.
 inline std::string script_backtrace() {
     std::string out;

@@ -83,7 +83,8 @@ struct Watcher::Impl {
     struct Entry {
         Symbol path;                 // as given
         fs::path file;               // on the disk, unless hooked
-        fs::path::string_type name;  // its file name, as the system reports it
+        fs::path::string_type name;  // its file name, as the system reports it; empty: any
+                                     // name in `dir` (a directory of layers)
         size_t dir = SIZE_MAX;       // its directory's watch; SIZE_MAX: by stamp
         bool hooked = false;         // through the stamp hook
         bool pending = false;        // changed before a watch() kept it: report at next poll
@@ -140,8 +141,9 @@ struct Watcher::Impl {
         return false;
 #elif defined(__linux__)
         if (fd < 0) return false;
-        d.wd = inotify_add_watch(fd, d.path.c_str(),
-                                 IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM | IN_DELETE);
+        d.wd =
+            inotify_add_watch(fd, d.path.c_str(),
+                              IN_CLOSE_WRITE | IN_MOVED_TO | IN_MOVED_FROM | IN_DELETE | IN_CREATE);
         return d.wd >= 0;
 #else
         (void)d;
@@ -167,8 +169,8 @@ struct Watcher::Impl {
     static bool issue(Dir& d) {
         d.overlapped = OVERLAPPED{};
         return ReadDirectoryChangesW(d.handle, d.buffer, sizeof d.buffer, FALSE,
-                                     FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE |
-                                         FILE_NOTIFY_CHANGE_SIZE,
+                                     FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                                         FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
                                      nullptr, &d.overlapped, nullptr) != 0;
     }
 #endif
@@ -202,7 +204,8 @@ struct Watcher::Impl {
     // A change the system reported: `name` in the directory watched as `dir`.
     void reported(size_t dir, std::basic_string_view<fs::path::value_type> name) {
         for (size_t i = 0; i < entries.size(); ++i)
-            if (entries[i].dir == dir && entries[i].name == name) note(i);
+            if (entries[i].dir == dir && (entries[i].name.empty() || entries[i].name == name))
+                note(i);
     }
     // Every file in the directory watched as `dir`: its notifications were lost.
     void all_in(size_t dir) {
@@ -245,8 +248,8 @@ struct Watcher::Impl {
                     if (dirs[k]->wd == e->wd) di = k;
                 if (e->mask & IN_Q_OVERFLOW) {
                     for (size_t k = 0; k < dirs.size(); ++k) all_in(k);
-                } else if (di == SIZE_MAX) {
-                    continue;
+                } else if (di == SIZE_MAX || ((e->mask & IN_CREATE) && !(e->mask & IN_ISDIR))) {
+                    continue;  // a file is reported when it is written; a new folder now
                 } else if (e->mask & IN_IGNORED) {
                     // The directory went: its files are checked by their stamps from now on.
                     for (Entry& entry : entries)
@@ -314,7 +317,7 @@ void Watcher::Impl::watch(std::span<const StackFile> files,
     Vec<Impl::Entry> before = std::move(im.entries);
     im.entries.clear();
     Vec<Own<Impl::Dir>> kept;
-    auto add = [&](Symbol path) {
+    auto add = [&](Symbol path, bool directory) {
         for (const Impl::Entry& e : im.entries)
             if (e.path == path) return;
         Impl::Entry e;
@@ -332,8 +335,14 @@ void Watcher::Impl::watch(std::span<const StackFile> files,
             if (im.hook) im.hook(path.str(), e.stamp);
         } else {
             e.file = fs::path(mapped ? std::string_view(on_disk) : path.str()).lexically_normal();
-            e.name = e.file.filename().native();
-            fs::path dir = e.file.parent_path();
+            fs::path dir = e.file;
+            if (directory) {
+                if (!e.file.has_filename()) e.file = e.file.parent_path();  // "mods/"
+                dir = e.file;  // a file added to it, or removed, is a change
+            } else {
+                e.name = e.file.filename().native();
+                dir = e.file.parent_path();
+            }
             if (dir.empty()) dir = ".";
             e.dir = im.dir_of(dir, kept);
             e.stamp = disk_stamp(e.file);
@@ -346,8 +355,8 @@ void Watcher::Impl::watch(std::span<const StackFile> files,
             }
         im.entries.push_back(std::move(e));
     };
-    for (const StackFile& f : files) add(f.path);
-    for (const std::string_view p : more) add(Symbol(p));
+    for (const StackFile& f : files) add(f.path, f.directory);
+    for (const std::string_view p : more) add(Symbol(p), false);
     for (Own<Impl::Dir>& d : im.dirs)
         if (d) im.close(*d);  // directories no file is in any more
     im.dirs = std::move(kept);

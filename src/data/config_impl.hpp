@@ -31,14 +31,16 @@ inline const Symbol& scratch_name() {
 struct Dep {
     Str path;
     bool present = false;
-    uint64_t hash = 0;
+    uint64_t hash = 0;  // of its text; for a directory, of its listing
+    bool directory = false;
 };
 
 struct LayerState {
     LayerState() = default;
     // A record the Config makes: its own containers from its allocator. A copy keeps
     // its source's.
-    explicit LayerState(const Allocator& a) : name(a), path(a), file(a), deps(a) {}
+    explicit LayerState(const Allocator& a)
+        : name(a), path(a), file(a), deps(a), tested(a), dir(a), group(a) {}
 
     Str name;
     Str path;      // as given; empty for an overlay; the name, for text
@@ -49,7 +51,18 @@ struct LayerState {
     Rc<SourceMap> map;  // edit mode; shared with snapshots, read-only once built
     Vec<Dep> deps;
     Rc<LoadSession> after;  // macros and defines after this layer; read-only
-    bool missing = false;   // optional, and its file is absent
+    bool missing = false;   // optional, and its file is absent (a directory: not listed)
+    // The names its read's #ifdef, #ifndef, #define and #undef named: set_defines reads it
+    // again only if one changed. Unknown when a cache replayed it, which parses nothing.
+    Vec<Symbol> tested;
+    bool tested_known = false;
+    // A directory of layers (push_layer_dir): its own layer, which holds nothing, is `dir`'s
+    // marker, and the layers found in it stand directly above, each with `group` its name.
+    // The marker's deps are the directory itself, its order.dta, and the layer.dta files its
+    // subdirectories lacked.
+    Str dir;
+    Str group;
+    bool broken = false;  // a found layer that did not read: empty until its files change
 };
 
 // One path in scratch. The array is owned by scratch alone, so set() may change it in
@@ -208,8 +221,9 @@ struct Config::Impl {
 
     const Allocator alloc;  // first: the containers below take it
     ConfigOptions options;
-    Str cache_dir{alloc};     // options.cache_dir views this
-    mutable Str scan{alloc};  // changed()'s buffer, kept so that a poll allocates nothing
+    Str cache_dir{alloc};            // options.cache_dir views this
+    mutable Str scan{alloc};         // changed()'s buffer, kept so that a poll allocates nothing
+    mutable Vec<Str> listed{alloc};  // the same for a directory's listing
     // Every merge's temporaries, reused: a merge allocates only the arrays it keeps.
     mutable detail::MergeScratch merge_scratch{alloc};
     LoadSession base{alloc};  // the sessions the Config keeps are on its allocator
@@ -346,11 +360,41 @@ struct Config::Impl {
     Expected<void> push_read(Config& c, LayerState&& layer, LayerOptions opts);
 
     bool changed(const LayerState& layer, Symbol& first) const;
+    // Whether reload() must read `layer` again: a file of it changed, or, for a directory of
+    // layers, its listing or order.dta.
+    bool stale(const LayerState& layer, Symbol& first) const;
+
+    // --- Directories of layers ---
+
+    // A layer the directory holds: its name, and the file it is read from.
+    struct Found {
+        Str name;
+        Str path;
+    };
+    // Lists the directory of `marker`, filling its deps, and `found` with its
+    // layers in order.dta's order. Warns of a name order.dta lists that the directory lacks.
+    [[nodiscard]] Expected<void> list_dir(LayerState& marker, Vec<Found>& found) const;
+    // Lists the directory of the marker at `ls[at]` again and puts the layers it holds above
+    // it, in place of those that were: one that stays keeps its state (its enabled flag).
+    // Returns how many layers the group now has above the marker.
+    [[nodiscard]] Expected<size_t> relist(Vec<LayerState>& ls, size_t at) const;
+    // How many layers of `ls[at]`'s directory stand above it (0 for a layer that is not one).
+    [[nodiscard]] static size_t members(const Vec<LayerState>& ls, size_t at) noexcept {
+        if (ls[at].dir.empty()) return 0;
+        size_t n = 0;
+        while (at + 1 + n < ls.size() && ls[at + 1 + n].group == ls[at].name) ++n;
+        return n;
+    }
 
     // Re-reads `layers[from..]` as the read and parse stages of `rec`, from `t`, which it
     // moves to their end; a failure marks the record a parse error.
     Expected<void> reread_stages(ReloadRecord& rec, size_t from, uint64_t& t) {
-        auto r = reread(layers, from, &rec.read_ns, &rec.files_reloaded);
+        return reread_stages(rec, layers, from, t);
+    }
+    // The same over `ls`, a stack to replace `layers` with.
+    Expected<void> reread_stages(ReloadRecord& rec, Vec<LayerState>& ls, size_t from,
+                                 uint64_t& t) const {
+        auto r = reread(ls, from, &rec.read_ns, &rec.files_reloaded);
         const uint64_t parsed = now();
         rec.parse_ns = parsed - t - rec.read_ns;
         t = parsed;
@@ -384,6 +428,19 @@ struct Config::Impl {
         for (const ScratchEntry& e : scratch)
             if (e.path == path || is_element_of(path, e.path)) return &e;
         return nullptr;
+    }
+
+    // Whether a live edit waits in scratch at a path below `path`: a record or table read
+    // there would miss it in the last full merge.
+    [[nodiscard]] bool edits_beneath(const Path& path) const noexcept {
+        if (!scratch_enabled) return false;
+        for (const ScratchEntry& e : scratch) {
+            if (e.path.size() <= path.size()) continue;
+            bool under = true;
+            for (size_t i = 0; under && i < path.size(); ++i) under = e.path[i] == path[i];
+            if (under) return true;
+        }
+        return false;
     }
 
     // The current value at `path`: scratch first, then the merged tree.
@@ -455,21 +512,25 @@ struct Config::Impl {
     // --- Checking a candidate layer (Config::check_layer) ---
 
     // The candidate `tree` (with a file layer's #autorun `commands`, read with `session`) on
-    // top of the stack: its effect, the policy's refusals, and the validators' warnings,
-    // `read_warnings` added.
+    // top of the stack, or of its first `below` layers (set_layer_text's replacement, without
+    // the layer it replaces and scratch): its effect, the policy's refusals, and the
+    // validators' warnings, `read_warnings` added.
     [[nodiscard]] LayerReport check_candidate(const Config& c, std::string_view name,
                                               const Ref<Array>& tree,
                                               std::span<const Node> commands,
                                               const LoadSession& session, const LayerPolicy& policy,
-                                              std::span<const Error> read_warnings) const;
+                                              std::span<const Error> read_warnings,
+                                              size_t below = SIZE_MAX) const;
     // A held report from a LayerChecker: the validators it left out (not any_thread), over
     // the stack with `candidate` on top, read with `session`; their warnings refuse under
     // the policy's warnings_refuse.
     [[nodiscard]] LayerReport check_left_out(const Config& c, const Ref<Array>& candidate,
                                              const LoadSession& session,
                                              const LayerPolicy& policy) const;
-    // Fills enabled_roots: the enabled layers' trees, then `candidate` if given.
-    std::span<const Ref<Array>> stack_layers(const Ref<Array>& candidate = nullptr) const;
+    // Fills enabled_roots: the enabled layers' trees among the first `count`, then
+    // `candidate` if given.
+    std::span<const Ref<Array>> stack_layers(const Ref<Array>& candidate = nullptr,
+                                             size_t count = SIZE_MAX) const;
 
     // --- Write-back ---
 

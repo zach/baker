@@ -97,6 +97,18 @@ bool exists(const LoadSession::Reader& reader, std::string_view path) {
 
 }  // namespace
 
+Symbol Project::tool_path(std::string_view build_dir) const {
+    constexpr std::string_view kBuild = "$build";
+    const std::string_view path = tool.str();
+    if (!path.starts_with(kBuild)) return tool;
+    std::string_view rest = path.substr(kBuild.size());
+    while (!rest.empty() && (rest.front() == '/' || rest.front() == '\\')) rest.remove_prefix(1);
+    const Symbol base = !build_dir.empty() ? Symbol(build_dir)
+                        : !build.empty()   ? build
+                                           : joined(detail::parent_path(file.str()), "build");
+    return rest.empty() ? base : joined(base.str(), rest);
+}
+
 Expected<Project> read_project(std::string_view path, const LoadSession::Reader& reader) {
     SourceMap map;
     LoadSession session;
@@ -139,7 +151,8 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
             std::string_view file;
             if (part->size() < 2 || !text_of((*part)[1], file))
                 return Unexpected(places.at(*part, R"(the tool is (tool "path" "argument"...))"));
-            p.tool = joined(dir, file);
+            // A path into the build directory stays as written, for tool_path().
+            p.tool = file.starts_with("$build") ? Symbol(file) : joined(dir, file);
             p.tool_at = places.of(*part, 1);
             Vec<Symbol> args;
             for (size_t k = 2; k < part->size(); ++k) {
@@ -149,6 +162,21 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
                 args.emplace_back(arg);
             }
             p.tool_args = List<Symbol>(std::span<const Symbol>(args.data(), args.size()));
+        } else if (key == Symbol("format")) {
+            for (size_t k = 1; k < part->size(); ++k) {
+                const Array* f = (*part)[k].try_array();
+                const std::optional<int64_t> n =
+                    f && f->size() == 2 ? (*f)[1].try_int() : std::nullopt;
+                const bool indent = f && f->tag() == Symbol("indent");
+                if (!n || (!indent && !(f && f->tag() == Symbol("width"))) || *n < 0 || *n > 1000)
+                    return Unexpected(places.at(
+                        f ? *f : *part, "the layout is (format (indent N) (width N)), 0 to 1000"));
+                (indent ? p.format.indent : p.format.width) = static_cast<int>(*n);
+            }
+        } else if (key == Symbol("step_name")) {
+            const auto name = part->size() == 2 ? (*part)[1].try_sym() : std::nullopt;
+            if (!name) return Unexpected(places.at(*part, "the step's name is (step_name NAME)"));
+            p.step_name = *name;
         } else if (key == Symbol("console")) {
             const std::optional<int64_t> port =
                 part->size() == 2 ? (*part)[1].try_int() : std::nullopt;
@@ -156,6 +184,12 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
                 return Unexpected(places.at(*part, "the console is (console PORT), 1 to 65535"));
             p.console_port = static_cast<uint16_t>(*port);
             p.console_at = places.of(*part, 1);
+        } else if (key == Symbol("build")) {
+            std::string_view where;
+            if (part->size() != 2 || !text_of((*part)[1], where))
+                return Unexpected(places.at(*part, "the build directory is (build \"path\")"));
+            p.build = joined(dir, where);
+            p.build_at = places.of(*part, 1);
         } else if (key == Symbol("reference")) {
             std::string_view file;
             if (part->size() != 2 || !text_of((*part)[1], file))
@@ -168,14 +202,20 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
             for (size_t j = 1; j < part->size(); ++j) {
                 const Array* l = (*part)[j].try_array();
                 std::string_view file;
-                if (!l || l->size() < 2 || l->tag().empty() || !text_of((*l)[1], file))
+                // (name (dir "path")): a directory of layers.
+                const Array* in = l && l->size() >= 2 ? (*l)[1].try_array() : nullptr;
+                const bool is_dir =
+                    in && in->tag() == Symbol("dir") && in->size() == 2 && text_of((*in)[1], file);
+                if (!l || l->size() < 2 || l->tag().empty() || (!is_dir && !text_of((*l)[1], file)))
                     return Unexpected(
                         places.at(l ? *l : *part,
-                                  "a layer is (name \"path\" [optional] [disabled] [dev_only])"));
+                                  "a layer is (name \"path\" [optional] [disabled] [dev_only]), "
+                                  "or (name (dir \"path\") ...) for a directory of layers"));
                 ProjectLayer layer{.name = l->tag(),
                                    .path = joined(dir, file),
+                                   .dir = is_dir,
                                    .name_at = places.of(*l, 0),
-                                   .path_at = places.of(*l, 1)};
+                                   .path_at = is_dir ? places.of(*in, 1) : places.of(*l, 1)};
                 for (size_t k = 2; k < l->size(); ++k) {
                     if ((*l)[k].is(Symbol("optional")))
                         layer.optional = true;
@@ -197,10 +237,11 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
             p.layers =
                 List<ProjectLayer>(std::span<const ProjectLayer>(layers.data(), layers.size()));
         } else {
-            return Unexpected(places.at(*part, "a project has no '" + Str(key.str()) +
-                                                   "': it holds pack_levels, include_dirs, "
-                                                   "defines, reference, tool, console, scenarios, "
-                                                   "objectives, and layers"));
+            return Unexpected(
+                places.at(*part, "a project has no '" + Str(key.str()) +
+                                     "': it holds pack_levels, include_dirs, "
+                                     "defines, reference, tool, build, console, step_name, format, "
+                                     "scenarios, objectives, and layers"));
         }
     }
     if (!has_layers) return Unexpected(places.at(*root, "a project needs (layers ...)"));
@@ -233,14 +274,16 @@ Expected<List<ProjectProblem>> open_project(Config& cfg, const Project& project,
         session.set_pack_levels(std::span<const Symbol>(levels.data(), levels.size()));
     }
     for (const ProjectEntry& e : project.include_dirs) session.add_include_dir(e.value.str());
-    for (const ProjectEntry& e : project.defines) session.define(e.value);
+    for (const ProjectEntry& e : project.defines) session.define(e.value, DefineFrom::Project);
+    for (const std::string_view d : options.defines) session.define(Symbol(d), DefineFrom::Host);
     Vec<ProjectProblem> problems;  // allocates only for a problem
     for (const ProjectLayer& l : project.layers) {
         if (options.skip.contains(l.name.str())) continue;
         // A development layer never reaches a shipping build, whatever its file says.
         if (l.dev_only && (kShipping || options.skip_dev_only)) continue;
-        if (auto r = cfg.push_layer(l.name.str(), l.path.str(),
-                                    {.optional = l.optional, .enabled = l.enabled});
+        const LayerOptions o{.optional = l.optional, .enabled = l.enabled};
+        if (auto r = l.dir ? cfg.push_layer_dir(l.name.str(), l.path.str(), o)
+                           : cfg.push_layer(l.name.str(), l.path.str(), o);
             !r) {
             if (!options.go_on) return Unexpected(std::move(r).error());
             problems.push_back({l.name, std::move(r).error()});

@@ -61,7 +61,9 @@ struct Cipher {
 
 // True if the cache at `cache_path` was written from a recorded load, every file that load
 // read (through the session's reader) is unchanged, every file it looked for and missed is
-// still missing, and the session's defines and macros are those the load began with.
+// still missing, every directory it listed (#include_dir, through the session's lister)
+// lists the same entries, and the session's defines and macros are those the load began
+// with.
 // Re-reads every file: for development and build steps, not every launch of a shipped game.
 [[nodiscard]] bool cache_fresh(std::string_view cache_path, LoadSession& session);
 // The cache if it is fresh; otherwise the text, and a new cache written from it. Under

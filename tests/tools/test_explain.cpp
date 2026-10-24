@@ -2,6 +2,8 @@
 #include <doctest.h>
 #include <baker/config.hpp>
 #include <baker/std_interop.hpp>
+#include <baker/tools/layers.hpp>
+#include <baker/tools/reference.hpp>
 
 #include "temp_dir.hpp"
 
@@ -10,6 +12,7 @@
 #include "ok.hpp"
 
 using namespace baker;
+using namespace baker::tools;
 using baker::test::ok;
 using baker::test::TempDir;
 
@@ -28,7 +31,7 @@ std::string show(const ExplainEntry& e) {
 
 // The chain as one line, entries separated by " | ".
 std::string chain(const Config& cfg, const char* path) {
-    auto r = cfg.explain(path);
+    auto r = explain(cfg, path);
     REQUIRE(r);
     std::string out;
     for (const ExplainEntry& e : *r) out += (out.empty() ? "" : " | ") + show(e);
@@ -80,7 +83,7 @@ TEST_CASE("the contributor that wins is the one source() names, for every leaf")
         {"phase", "(1 2)"}, {"phase.0", "1"},    {"phase.1", "2"}};
     for (const auto& [p, value] : leaves) {
         CAPTURE(p);
-        const auto entries = cfg.explain(p);
+        const auto entries = explain(cfg, p);
         REQUIRE(entries);
         const ExplainEntry* winner = nullptr;
         for (const ExplainEntry& e : *entries)
@@ -98,7 +101,7 @@ TEST_CASE("the contributor that wins is the one source() names, for every leaf")
     CHECK(cfg.root()->get<int>("box.width") == 4);
     CHECK(cfg.root()->get<int>("phase.1") == 2);
     CHECK_FALSE(cfg.root()->get<int>("cheats.noclip"));
-    const auto noclip = ok(cfg.explain("cheats.noclip"));
+    const auto noclip = ok(explain(cfg, "cheats.noclip"));
     CHECK(noclip[noclip.size() - 1].standing == Standing::Removes);
 }
 
@@ -142,15 +145,15 @@ TEST_CASE("a path nothing sets, or one that holds arrays, is refused") {
     TempDir dir;
     Config cfg({.tweaks = nullptr});
     REQUIRE(cfg.push_layer("default", dir.write("default.dta", kDefault)));
-    auto missing = cfg.explain("box.depth");
+    auto missing = explain(cfg, "box.depth");
     REQUIRE_FALSE(missing);
     CHECK(missing.error().code() == ErrorCode::NotFound);
-    auto subtree = cfg.explain("box");
+    auto subtree = explain(cfg, "box");
     REQUIRE_FALSE(subtree);
     CHECK(subtree.error().code() == ErrorCode::Refused);
     CHECK(subtree.error().message().find("holds arrays") != std::string_view::npos);
-    CHECK_FALSE(cfg.explain(""));
-    CHECK_FALSE(cfg.explain("box..width"));
+    CHECK_FALSE(explain(cfg, ""));
+    CHECK_FALSE(explain(cfg, "box..width"));
 }
 
 #if !BAKER_SHIPPING
@@ -178,3 +181,36 @@ TEST_CASE("a disabled layer and scratch are listed, and toggling changes who win
                  "scratch wins 2.5"}));
 }
 #endif
+
+TEST_CASE("explain names the define that chose a value; check's JSON lists the defines") {
+    test::TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    cfg.session().define(Symbol("server"));
+    REQUIRE(cfg.push_layer("modes", dir.write("modes.dta",
+                                              "(mode\n"
+                                              "#ifdef server\n"
+                                              "   (tick 30)\n"
+                                              "#else\n"
+                                              "   (tick 60)\n"
+                                              "#endif\n"
+                                              "   (name \"m\"))\n")));
+    const auto entries = ok(explain(cfg, Path("mode.tick")));
+    REQUIRE(entries.size() == 1);
+    REQUIRE(entries[0].section);
+    CHECK(entries[0].section->name == Symbol("server"));
+    CHECK_FALSE(entries[0].section->else_branch);
+    CHECK_FALSE(ok(explain(cfg, Path("mode.name")))[0].section);  // outside every branch
+
+    static constexpr std::string_view kNone[] = {"demo"};
+    REQUIRE(cfg.set_defines(kNone));
+    const auto other = ok(explain(cfg, Path("mode.tick")));
+    REQUIRE(other[0].section);
+    CHECK(other[0].section->else_branch);
+
+    std::string json;
+    write_json(CheckReport{}, string_out(json), &cfg.read_session());
+    CHECK(json.find(R"j("defines": [)j"
+                    "\n"
+                    R"j(    {"name": "demo", "origin": "host", "file": "", "line": 0})j") !=
+          std::string::npos);
+}

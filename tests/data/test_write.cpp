@@ -7,6 +7,7 @@
 #include "text.hpp"
 
 #include <bit>
+#include <charconv>
 #include <clocale>
 #include <cmath>
 #include <cstdio>
@@ -179,6 +180,41 @@ TEST_CASE("preview is bounded on shared trees") {
     CHECK(p.ends_with("..."));
 }
 
+#if !(defined(__APPLE__) && defined(_LIBCPP_VERSION))  // Apple's lacks double to_chars
+TEST_CASE("the fallback double formatter writes what std::to_chars writes, byte for byte") {
+    // Where std::to_chars lacks doubles, format_double_fallback writes every number; a
+    // write-back on one platform must read as on another (0020).
+    auto to_chars = [](double v) {
+        char buf[400];
+        return std::string(buf, std::to_chars(buf, buf + sizeof buf, v).ptr);
+    };
+    std::vector<double> values;
+    for (int i = -20000; i <= 20000; ++i)
+        values.insert(values.end(), {double(i), i / 100.0, i / 8.0, i * 1000.0, i * 1e15});
+    for (int e = -1074; e <= 1023; ++e) {  // the powers of two, where spacing changes
+        const double p = std::ldexp(1.0, e);
+        values.insert(values.end(), {p, std::nextafter(p, 0.0), std::nextafter(p, INFINITY)});
+    }
+    for (int e = -323; e <= 308; ++e) {
+        const double p = std::pow(10.0, e);
+        for (int k = 1; k <= 9; ++k) values.push_back(k * p);
+        values.insert(values.end(), {std::nextafter(p, 0.0), std::nextafter(p, INFINITY)});
+    }
+    std::mt19937_64 rng(20);
+    for (int i = 0; i < 100000; ++i) {
+        const double v = std::bit_cast<double>(rng());
+        if (std::isfinite(v)) values.push_back(v);
+    }
+    int differ = 0;
+    for (double v : values) {
+        if (std::string(detail::format_double_fallback(v).view()) == to_chars(v)) continue;
+        if (++differ <= 10)
+            CHECK(std::string(detail::format_double_fallback(v).view()) == to_chars(v));
+    }
+    CHECK(differ == 0);
+}
+#endif
+
 TEST_CASE("both double formatters round-trip exactly") {
     // format_double uses std::to_chars except on Apple, where format_double_fallback
     // (shortest %g that reads back) stands in. Both must give back the same bits.
@@ -214,7 +250,16 @@ TEST_CASE("both double formatters round-trip exactly") {
     CHECK(detail::format_double_fallback(-0.0) == "-0");
     CHECK(detail::format_double_fallback(1e20) == "1e+20");
 
-    // %g follows the C locale's decimal point; the fallback must normalize it.
+    CHECK(detail::format_double_fallback(120.0) == "120");  // not 1.2e+02
+    CHECK(detail::format_double_fallback(-0.25) == "-0.25");
+    CHECK(detail::format_double_fallback(1e-5) == "1e-05");
+    CHECK(detail::format_double_fallback(0.001) == "0.001");
+    CHECK(detail::format_double_fallback(1e16) == "1e+16");
+    CHECK(detail::format_double_fallback(1e-300) == "1e-300");
+    CHECK(detail::format_double_fallback(123456789.125) == "123456789.125");
+    CHECK(detail::format_double_fallback(1152921504606846976.0) == "1152921504606846976");
+
+    // A locale's decimal point never reaches the text.
     for (const char* name : {"de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "German_Germany.1252"}) {
         if (!std::setlocale(LC_NUMERIC, name)) continue;
         CHECK(detail::format_double_fallback(12.75) == "12.75");

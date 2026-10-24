@@ -106,6 +106,32 @@ may set the key again, and removing the layer brings the key back. The merged tr
 holds a marker, and `#merge` ignores one (it only fills in what is missing).
 `layer_effect` lists a removal with the value `#remove`, and what it removed in `below`.
 
+### Curves
+
+A curve is a function designers tune, such as reward by stage, difficulty by time, or
+falloff by distance. It is a key's values: points `(x y)` in ascending x.
+
+```dta
+(falloff (0 1) (5 3) (10 8))                       ; monotone, clamped
+(difficulty catmull-rom loop (0 1) (30 4) (60 1))
+(reward linear (1 10) (2 25 0 15) (3 40))          ; a point's slopes: (x y in out)
+```
+
+- **Interpolation,** an optional symbol before the points, for the whole curve: `monotone`
+  (the default: smooth, and never above or below the two keys around it), `linear`,
+  `catmull-rom` (smooth, but it overshoots between keys that swing), or `constant` (each
+  key's value held to the next key). The names are RenderMan's and Houdini's.
+- **Beyond the points,** another optional symbol: `clamp` (the default: the end keys'
+  values), `extrapolate` (on along the end slopes), or `loop` (repeating the span of x).
+- **A point's slopes:** a third and fourth number give the slope (dy/dx) arriving at the
+  point and leaving it, as glTF's Hermite tangents do. They replace the slopes the
+  interpolation would compute there; a `linear` segment with one becomes a cubic, and a
+  `constant` curve has none. An engine that stores tangents as angles takes their atan.
+- **In C++,** `get<Curve>(path)` and `Tweak<Curve>` read one (`<baker/curve.hpp>`), and
+  `sample(x)` gives its value. **In script,** `{curve.sample path x}`.
+- **A layer replaces a whole curve,** points, interpolation and extension together, as it
+  replaces any key's values.
+
 ## The preprocessor
 
 Directives are handled while a file is read and never appear in the tree. Files read
@@ -116,6 +142,7 @@ in the order they are read; a Config's layers read in one session, bottom to top
 |---|---|
 | `#include path` | Splice another file's top-level nodes here. |
 | `#include_opt path` | The same; a missing file is not an error. |
+| `#include_dir path` | A child for each `.dta` file of a directory, named by its file and holding its nodes, and for each subdirectory, named by it and holding its own. See below. |
 | `#require path` | The same, once per session: later `#require`s of that file, from any file, are no-ops. |
 | `#merge path` | Merge another file into the enclosing array, keeping existing keys and adding missing ones. |
 | `#ifdef N`, `#ifndef N`, `#else`, `#endif` | Conditional sections. |
@@ -131,6 +158,40 @@ including file's directory, then the session's include directories
 
 Any other `#name` is an error, so a misspelled directive is caught. A lone `#` is not a
 directive but the symbol `#`, as in a key binding `(# {toggle_hud})`.
+
+### A directory as a table: `#include_dir`
+
+A game with a file per record (a card, a unit, a quest) names the directory instead of
+each file:
+
+```dta
+(cards
+   #include_dir "cards"
+   (starter_deck fireball fireball shield))   ; other children beside it
+```
+
+`cards/fireball.dta`, holding `(cost 3) (damage 6)`, becomes `(fireball (cost 3) (damage 6))`
+in `cards`, so a layer retunes it as `cards.fireball.cost`, and `source()` names
+`cards/fireball.dta` and its line. The record is named by its file, so the two cannot
+disagree, and a new card is a new file.
+
+- **A subdirectory is a nested table:** `cards/fire/fireball.dta` becomes
+  `(fire (fireball ...))` in `cards`. A name is unique in its directory.
+- **Order:** the names a directory's `order.dta` lists, `(order fireball shield)`, come
+  first, in its order; the rest follow in name order. A name it lists that the directory
+  lacks is a warning, located in it. Without one, the order is name order, the same on
+  every platform. `order.dta` is not a record.
+- **What is read:** `.dta` files and subdirectories (entries without an extension).
+  Hidden entries, those whose names begin with `.`, are skipped. A name that is not a
+  symbol Baker reads bare (`my card.dta`) is an error, as is a file that does not parse,
+  or a directory that cannot be listed.
+- **Where:** the path resolves as `#include`'s does, against the including file's
+  directory, then the include directories. The session's lister lists it
+  (`LoadSession::set_lister`, the disk by default), so a host's archive works as its
+  reader does.
+- **What notices a change:** a Config's reload, the host kit's watcher, and a cache, which
+  is stale once a file is added, removed or renamed, or `order.dta` changes. Each file
+  counts as an include toward the session's limits.
 
 ### Macros
 
@@ -162,8 +223,23 @@ Defines usually come from the host, so one file serves every target:
 ```
 
 ```cpp
-cfg.session().define("HANDHELD");   // before pushing the layers
+// with a project file: the build's own defines, beside the project's (defines ...)
+static constexpr std::string_view kDefines[] = {"HANDHELD", "steam"};
+baker::open_project(cfg, project, {.defines = kDefines});
+// or before pushing the layers by hand
+cfg.session().define(baker::Symbol("HANDHELD"));
 ```
+
+- **Who made each.** `session.active_defines()` lists the flags that stand, in the order
+  they were made, each with its origin: the host's, the project's `(defines ...)`, or a
+  file's `#define` with its file and line. `check`'s JSON and the reference list them, so a
+  tool can show which sections a build reads; `explain` names the define that chose a
+  value read inside an `#ifdef`.
+- **Changing them on a live stack.** `cfg.set_defines(names)` replaces the host's flags: a
+  server switching mode, a demo unlocked. Each layer that tested, defined or undefined a
+  name that changed is read again, in place; every other layer keeps its tree. It is one
+  reload, with the trigger `defines`, and works in a shipping build. If a layer does not
+  read under the new set, nothing changes.
 
 ### `#require`
 
@@ -258,8 +334,9 @@ Shapes are declared in data, in one `(shapes ...)` container, each tagged by its
       (cadence  float (range 0.2 5) (optional))))
 ```
 
-- **Types:** `int`, `float`, `bool`, `symbol`, `string`, `any`, `(list T)`, or another
-  shape's name.
+- **Types:** `int`, `float`, `bool`, `symbol`, `string`, `any`, `curve`, `(list T)`,
+  `(key_of TABLE)`, or another shape's name. A `curve` field's values are a curve (see
+  Curves, above), and its `(range lo hi)` holds every point's y.
 - **Metadata:** `range`, `step`, `kind`, `desc`, `note` (as a tweak's), and `optional`.
   A field without `optional` is required. A `symbol` or `(list symbol)` field may list the
   symbols it allows, `(button symbol (one_of light heavy kick special))`, in the order a tool
@@ -282,13 +359,31 @@ Shapes are declared in data, in one `(shapes ...)` container, each tagged by its
   Keyed data is what layers merge by name: a layer above can retune `heavy` alone. Data
   written `(boss (name dragon) ...)` is governed by name, but repeated tags do not merge
   one by one.
+- **Keys of a table.** A field `(key_of TABLE)` holds the key of a record in TABLE, a
+  dotted path such as `weapons` or `items.weapons`; `(list (key_of TABLE))` holds several.
+  The table is the nearest one of that path that encloses the record, looked up outward, the
+  root last, so a fighter's move names one of that fighter's moves:
+
+  ```dta
+  (shapes
+     (unit (at units) (keyed) (weapon (key_of weapons)))
+     (move (at fighters * moves) (keyed) (cancel_into (list (key_of moves)) (optional))))
+  (weapons (laser (damage 3)) (cannon (damage 9)))
+  (units (scout (weapon laser)))
+  (fighters (kestrel (moves (jab) (heavy (cancel_into jab)))))
+  ```
+
+  The check runs on the merged tree, so a key a layer adds may be named, and one a layer
+  removes is an error at each record that still names it, with the key it most likely
+  meant: `'lazer' is not a key of weapons (laser?)`. With packs, a harder pack naming a
+  softer pack's key is a warning, as for a call.
 - **Layers merge shapes like any data**, because the container is tagged `shapes` and
   each shape by its name: a later layer adds a shape, adds a field, or retunes one
   field's range.
 
-Checking reports a field of the wrong type, out of range or outside its `one_of`, or a
-required field missing, as an error, located by file, line, and path. A field the shape does not declare is a
-warning, so adding data never waits on its shape. Commands and variables are not checked:
+Checking reports a field of the wrong type, out of range or outside its `one_of`, a key
+its table lacks, or a required field missing, as an error, located by file, line, and
+path. A field the shape does not declare is a warning, so adding data never waits on its shape. Commands and variables are not checked:
 their values are unknown until they run.
 
 ```cpp
@@ -300,6 +395,63 @@ Through a Config, violations go to the warning handler; the load itself never fa
 shape. Elsewhere, `baker::shape::Set` reads the declarations and `baker::shape::check`
 checks a tree; `set.shapes()` enumerates them, with their metadata, for a tool to build
 panels from. Shapes are opt-in, and cost nothing unless checked.
+
+### Rules between values
+
+Some rules span several values: a unit starts with no more health than its maximum, loot
+weights sum to 100, a card's power is near its tier's ideal. A shape states them as rules,
+each a message and a script expression that must be true for every record the shape
+governs:
+
+```dta
+(shapes
+   (unit (at units) (keyed)
+      (max_hp int (range 1 9999))
+      (start_hp int)
+      (rule "starts at or below its maximum" {<= $start_hp $max_hp}))
+   (card (at cards) (keyed)
+      (tier (key_of tiers))
+      (power float)
+      (rule "within 10% of its tier's ideal"
+            {and {>= $power {* 0.9 {data tiers $tier ideal}}}
+                 {<= $power {* 1.1 {data tiers $tier ideal}}}}
+            (warn)))
+   (loot (rule "weights sum to 100" {== {data.sum loot weight} 100})))
+```
+
+- **What a rule reads.**
+  - Its record's fields, each as a `$variable` named by the field: one value is itself,
+    several an array. A field the record lacks leaves its variable unset, and reading it
+    fails.
+  - The rest of the tree under check: `{data SEGMENT ...}` gives the value at a path,
+    each argument evaluated, so `{data tiers $tier ideal}` follows a key. `{data.sum PATH
+    FIELD}` sums each child's FIELD, or each child's first number without one. Both read
+    the tree being checked, never a live Config, so a check of a candidate layer judges the
+    candidate.
+  - The game's own functions, when the game checks.
+- **What a failure says.** A rule whose expression is false is an error, or a warning with
+  `(warn)`, located at the record and carrying each value its expression read:
+  `starts at or below its maximum ($start_hp 12, $max_hp 10)`. A rule that does not
+  evaluate, or gives something other than true or false, is an error naming the rule.
+- **Layers** replace a rule by its message, so a later layer may add a rule or soften one
+  with `(warn)`. With packs, a softer pack may make a harder pack's rule an error, but not
+  soften or change it.
+- **Where they run.** `baker::shape` reads rules; it cannot run script, so
+  `baker::tools` evaluates them:
+
+  ```cpp
+  // after every push, reload and restore, on the game's thread: a live edit that breaks a
+  // rule warns at once
+  cfg.add_validator(baker::tools::rules_validator(ctx));
+  // or over one tree
+  baker::tools::check_rules(tree, shapes, ctx, report);
+  ```
+
+  The host kit adds the validator, and its `check` command fails on a broken rule. A build
+  without `baker::script` reads rules and says once that it cannot check them.
+- **Cost.** Rules run only in checks: one evaluation per rule and governed record, about
+  half a microsecond for a two-value comparison, so 3,000 cards with two rules each is
+  under 3 ms a reload. A shape set with no rules costs nothing more.
 
 ## Script
 
@@ -452,10 +604,10 @@ cfg.add_validator(baker::check_validator(ctx, {.packs = &cfg.read_session()}));
 
 The validator reports errors and one-way warnings; the demand report, repeats, and
 findings are for tools. `ctx` must outlive the Config's use of it. For a build
-artifact, `to_json(report, &cfg.read_session())` writes the whole report, packs included, as
-versioned JSON that is the same bytes for the same data ([schema](check-json.md)); and
-`reference(ctx, &cfg.read_session())` adds the packs and the files tools generated to the
-reference: the harness register.
+artifact, `baker::tools::to_json(report, &cfg.read_session())` writes the whole report,
+packs included, as versioned JSON that is the same bytes for the same data
+([schema](check-json.md)); and `baker::tools::reference(ctx, &cfg.read_session())` adds the
+packs and the files tools generated to the reference: the harness register.
 
 ## Errors
 

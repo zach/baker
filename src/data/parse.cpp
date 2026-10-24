@@ -2,7 +2,7 @@
 
 #include "arena.hpp"
 #include "common/containers.hpp"
-
+#include "lexer.hpp"
 #include "merge.hpp"
 #include "session.hpp"
 #include "text.hpp"
@@ -15,279 +15,6 @@
 namespace baker {
 namespace detail {
 namespace {
-
-enum class Tok : uint8_t { End, Open, Close, Int, Float, String, Symbol, Var, Directive };
-
-struct Token {
-    Tok kind = Tok::End;
-    char bracket = 0;     // Open, Close
-    bool quoted = false;  // Symbol written as 'text'
-    int32_t line = 0;
-    uint32_t begin = 0, end = 0;  // byte span in the source
-    int64_t i = 0;
-    double f = 0;
-    std::string_view text;  // symbol, var name, directive name, decoded string
-};
-
-std::string_view bracket_name(char c) noexcept {
-    switch (c) {
-        case '(': return "'('";
-        case ')': return "')'";
-        case '{': return "'{'";
-        case '}': return "'}'";
-        case '[': return "'['";
-        case ']': return "']'";
-        default: return "?";
-    }
-}
-
-class Lexer {
-public:
-    Lexer(std::string_view src, Symbol file) : src_(src), file_(file) {
-        if (src_.size() >= 3 && std::memcmp(src_.data(), "\xEF\xBB\xBF", 3) == 0) pos_ = 3;
-    }
-
-    // Produces the next token. On failure fills `err` and returns false.
-    bool next(Token& t, Error& err) {
-        if (has_peek_) {
-            has_peek_ = false;
-            t = peeked_;
-            return true;
-        }
-        return lex(t, err);
-    }
-    bool peek(Token& t, Error& err) {
-        if (!has_peek_) {
-            if (!lex(peeked_, err)) return false;
-            has_peek_ = true;
-        }
-        t = peeked_;
-        return true;
-    }
-
-    // Tolerant: each problem goes to `errors` and the lexing goes on (read_structure), and
-    // each comment's span to `comments`.
-    void tolerate(Vec<Error>& errors, Vec<TextComment>& comments) noexcept {
-        soft_ = &errors;
-        comments_ = &comments;
-    }
-
-private:
-    bool fail(Error& err, ErrorCode code, std::string_view msg, int32_t line, size_t at) {
-        err = make_error(code, msg, file_, line);
-        err.set_column(column_at(at));
-        return false;
-    }
-    // A problem the lexer goes on past when tolerant; false, as fail, when not.
-    bool soft(Error& err, ErrorCode code, std::string_view msg, int32_t line, size_t at) {
-        if (!soft_) return fail(err, code, msg, line, at);
-        Error e;
-        (void)fail(e, code, msg, line, at);
-        soft_->push_back(std::move(e));
-        return true;
-    }
-    void comment(int32_t line, size_t begin, bool block) {
-        if (comments_)
-            comments_->push_back(
-                {line, static_cast<uint32_t>(begin), static_cast<uint32_t>(pos_), block});
-    }
-
-public:
-    // The 1-based column of byte `at`, in characters (code points) from its line's start,
-    // a byte-order mark aside. On the error path only: nothing tracks it per token.
-    [[nodiscard]] int32_t column_at(size_t at) const noexcept {
-        at = std::min(at, src_.size());
-        const size_t nl = at == 0 ? std::string_view::npos : src_.rfind('\n', at - 1);
-        size_t from = nl == std::string_view::npos ? 0 : nl + 1;
-        if (from == 0 && src_.size() >= 3 && std::memcmp(src_.data(), "\xEF\xBB\xBF", 3) == 0)
-            from = std::min<size_t>(3, at);
-        int32_t column = 1;
-        for (size_t i = from; i < at; ++i)
-            if ((static_cast<unsigned char>(src_[i]) & 0xC0) != 0x80) ++column;
-        return column;
-    }
-
-private:
-    bool lex(Token& t, Error& err) {
-        const bool ok = lex_token(t, err);
-        t.end = static_cast<uint32_t>(pos_);
-        return ok;
-    }
-
-    static int32_t count_lines(std::string_view s) noexcept {
-        return static_cast<int32_t>(std::count(s.begin(), s.end(), '\n'));
-    }
-
-    bool lex_token(Token& t, Error& err) {
-        t = Token{};
-        const size_t n = src_.size();
-        for (;;) {
-            if (pos_ >= n) {
-                t.kind = Tok::End;
-                t.line = line_;
-                t.begin = static_cast<uint32_t>(pos_);
-                return true;
-            }
-            const auto c = static_cast<unsigned char>(src_[pos_]);
-            if (c <= 0x20) {
-                if (c == '\n') ++line_;
-                ++pos_;
-            } else if (c == ';') {
-                const size_t opened = pos_;
-                pos_ = std::min(src_.find('\n', pos_), n);  // to the newline, as memchr
-                comment(line_, opened, false);
-            } else if (c == '/' && pos_ + 1 < n && src_[pos_ + 1] == '*') {
-                const int32_t start = line_;
-                const size_t opened = pos_;
-                pos_ += 2;
-                for (;;) {
-                    if (pos_ + 1 >= n) {
-                        if (!soft(err, ErrorCode::Syntax, "unterminated /* comment", start, opened))
-                            return false;
-                        pos_ = n;  // the comment runs to the end
-                        comment(start, opened, true);
-                        break;
-                    }
-                    if (src_[pos_] == '*' && src_[pos_ + 1] == '/') {
-                        pos_ += 2;
-                        comment(start, opened, true);
-                        break;
-                    }
-                    if (src_[pos_] == '\n') ++line_;
-                    ++pos_;
-                }
-            } else {
-                break;
-            }
-        }
-
-        t.line = line_;
-        t.begin = static_cast<uint32_t>(pos_);
-        const char c = src_[pos_];
-        switch (c) {
-            case '(':
-            case '{':
-            case '[':
-                t.kind = Tok::Open;
-                t.bracket = c;
-                ++pos_;
-                return true;
-            case ')':
-            case '}':
-            case ']':
-                t.kind = Tok::Close;
-                t.bracket = c;
-                ++pos_;
-                return true;
-            case '"': return lex_string(t, err);
-            case '\'': return lex_quoted_symbol(t, err);
-            default: return lex_atom(t, err);
-        }
-    }
-
-    // "..." with two escapes: \n (newline) and \q (double quote). Any other backslash is
-    // literal, so Windows paths need no doubling.
-    bool lex_string(Token& t, Error& err) {
-        const int32_t start_line = line_;
-        const size_t begin = ++pos_;
-        // Neither escape contains a quote, so the string ends at the first one.
-        size_t i = src_.find('"', begin);
-        if (i == std::string_view::npos) {
-            if (!soft(err, ErrorCode::Syntax, "unterminated string", start_line, begin - 1))
-                return false;
-            i = src_.size();  // the string runs to the end
-        }
-        const std::string_view raw = src_.substr(begin, i - begin);
-        line_ += count_lines(raw);
-        pos_ = std::min(i + 1, src_.size());
-        t.kind = Tok::String;
-        if (raw.find('\\') == std::string_view::npos) {
-            t.text = raw;
-            return true;
-        }
-        buf_.clear();
-        for (size_t k = 0; k < raw.size(); ++k) {
-            if (raw[k] == '\\' && k + 1 < raw.size() && (raw[k + 1] == 'n' || raw[k + 1] == 'q')) {
-                buf_ += raw[k + 1] == 'n' ? '\n' : '"';
-                ++k;
-            } else {
-                buf_ += raw[k];
-            }
-        }
-        t.text = buf_;
-        return true;
-    }
-
-    bool lex_quoted_symbol(Token& t, Error& err) {
-        const int32_t start_line = line_;
-        const size_t begin = ++pos_;
-        size_t end = src_.find('\'', begin);
-        if (end == std::string_view::npos) {
-            if (!soft(err, ErrorCode::Syntax, "unterminated 'quoted symbol'", start_line,
-                      begin - 1))
-                return false;
-            end = src_.size();  // runs to the end
-        }
-        t.kind = Tok::Symbol;
-        t.quoted = true;
-        t.text = src_.substr(begin, end - begin);
-        line_ += count_lines(t.text);
-        pos_ = std::min(end + 1, src_.size());
-        return true;
-    }
-
-    bool lex_atom(Token& t, Error& err) {
-        const size_t begin = pos_;
-        while (pos_ < src_.size() && !is_atom_end(static_cast<unsigned char>(src_[pos_]))) ++pos_;
-        const std::string_view atom = src_.substr(begin, pos_ - begin);
-        if (atom[0] == '#' && atom.size() > 1) {  // a lone # is the symbol '#'
-            t.kind = Tok::Directive;
-            t.text = atom.substr(1);
-            return true;
-        }
-        if (atom[0] == '$') {
-            if (atom.size() == 1 &&
-                !soft(err, ErrorCode::Syntax, "'$' without a variable name", t.line, begin))
-                return false;
-            t.kind = Tok::Var;
-            t.text = atom.substr(1);
-            return true;
-        }
-        const Number num = classify_number(atom);
-        switch (num.kind) {
-            case NumberKind::Int:
-                t.kind = Tok::Int;
-                t.i = num.i;
-                return true;
-            case NumberKind::Float:
-                t.kind = Tok::Float;
-                t.f = num.f;
-                return true;
-            case NumberKind::IntOutOfRange:
-                t.kind = Tok::Int;
-                return soft(err, ErrorCode::Range,
-                            "integer " + Str(atom) + " is out of 64-bit range", t.line, begin);
-            case NumberKind::FloatOutOfRange:
-                t.kind = Tok::Float;
-                return soft(err, ErrorCode::Range, "float " + Str(atom) + " is out of double range",
-                            t.line, begin);
-            case NumberKind::NotNumber: break;
-        }
-        t.kind = Tok::Symbol;
-        t.text = atom;
-        return true;
-    }
-
-    std::string_view src_;
-    Symbol file_;
-    size_t pos_ = 0;
-    int32_t line_ = 1;
-    Str buf_;  // decoded string with escapes; valid until the next string token
-    bool has_peek_ = false;
-    Token peeked_;
-    Vec<Error>* soft_ = nullptr;            // tolerant: the problems gone past
-    Vec<TextComment>* comments_ = nullptr;  // tolerant: the comments' spans
-};
 
 bool read_disk_file(std::string_view path, TextSink out) {
     std::FILE* f = std::fopen(CPath(path).c_str(), "rb");
@@ -307,6 +34,58 @@ bool read_with(const LoadSession::Reader& reader, std::string_view path, Str& te
     return reader(path, detail::str_out(text));
 }
 
+uint64_t list_with(const LoadSession::Lister& lister, std::string_view dir, Vec<Str>& entries,
+                   const Allocator& alloc) {
+    entries.clear();
+    if (!lister(dir, [&](std::string_view p) { entries.emplace_back(p, alloc); })) return 0;
+    std::sort(entries.begin(), entries.end());
+    Str all(alloc);
+    for (const Str& e : entries) all.append(e).append("\n");
+    return content_hash(all) | 1;
+}
+
+Expected<void> directory_order(std::string_view text, std::string_view file,
+                               std::span<const std::string_view> names, Vec<uint32_t>& order,
+                               Vec<Error>& warnings) {
+    order.clear();
+    for (uint32_t i = 0; i < names.size(); ++i) order.push_back(i);
+    LoadSession session;
+    session.text_only = session.refuse_includes = true;
+    auto tree = read_string(text, file, session);
+    if (!tree) return Unexpected(std::move(tree).error());
+    const Array* list = (*tree)->size() == 1 ? (**tree)[0].try_array() : nullptr;
+    if (!list || list->tag() != Symbol("order"))
+        return Unexpected(make_error(ErrorCode::Syntax, "order.dta holds (order NAME ...)",
+                                     (*tree)->file(), list ? list->line() : 1));
+    // The names it lists first, in its order; the rest stay in their order after them.
+    size_t placed = 0;
+    for (size_t i = 1; i < list->size(); ++i) {
+        std::string_view name;
+        if (const auto sym = (*list)[i].try_sym())
+            name = sym->str();
+        else if (const auto str = (*list)[i].try_str())
+            name = *str;
+        else
+            return Unexpected(
+                make_error(ErrorCode::Syntax, "order.dta lists names", list->file(), list->line()));
+        size_t at = 0;
+        while (at < order.size() && names[order[at]] != name) ++at;
+        if (at < placed) continue;  // listed twice
+        if (at == order.size()) {
+            warnings.push_back(make_error(ErrorCode::NotFound,
+                                          "order.dta lists '" + Str(name) + "', which '" +
+                                              Str(parent_path(file)) + "' does not hold",
+                                          list->file(), list->line()));
+            continue;
+        }
+        std::rotate(order.begin() + static_cast<ptrdiff_t>(placed),
+                    order.begin() + static_cast<ptrdiff_t>(at),
+                    order.begin() + static_cast<ptrdiff_t>(at) + 1);
+        ++placed;
+    }
+    return {};
+}
+
 }  // namespace detail
 
 struct LoadSession::State {
@@ -320,6 +99,9 @@ struct LoadSession::State {
           packs(a),
           origins(a),
           definitions(a),
+          flags(a),
+          sections(a),
+          tested(a),
           macro_pack(a),
           warnings(a),
           files(a),
@@ -330,6 +112,7 @@ struct LoadSession::State {
         defines = o.defines;
         reader = o.reader;
         disk = o.disk;
+        lister = o.lister;
         include_dirs = o.include_dirs;
         autorun = o.autorun;
         required = o.required;
@@ -337,6 +120,10 @@ struct LoadSession::State {
         packs = o.packs;
         origins = o.origins;
         definitions = o.definitions;
+        flags = o.flags;
+        sections = o.sections;
+        tested = o.tested;
+        parses = o.parses;
         macro_pack = o.macro_pack;
         warnings = o.warnings;
         recorded = o.recorded;
@@ -358,13 +145,18 @@ struct LoadSession::State {
     HashMap<Symbol, Ref<Array>> defines;
     Reader reader = detail::read_disk_file;
     bool disk = true;  // `reader` is the default
+    Lister lister = detail::list_disk_dir;
     Vec<Str> include_dirs;
     Vec<Node> autorun;
-    Vec<Str> required;                     // the files #require has read, normalized
-    Vec<Symbol> pack_levels;               // hardest first
-    Vec<Pack> packs;                       // in the order they were read
-    Vec<Origin> origins;                   // files that declared one, in the order read
-    Vec<Definition> definitions;           // macro definitions, in the order read
+    Vec<Str> required;                 // the files #require has read, normalized
+    Vec<Symbol> pack_levels;           // hardest first
+    Vec<Pack> packs;                   // in the order they were read
+    Vec<Origin> origins;               // files that declared one, in the order read
+    Vec<Definition> definitions;       // macro definitions, in the order read
+    Vec<ActiveDefine> flags;           // the flags that stand, in the order made
+    Vec<ConditionalSection> sections;  // the #ifdef branches the reads took
+    Vec<Symbol> tested;   // each name an #ifdef, #ifndef, #define or #undef named, as read
+    uint64_t parses = 0;  // the files parsed: a cache's replay parses none
     HashMap<Symbol, uint32_t> macro_pack;  // the pack that defined each macro, by index
     Vec<Error> warnings;
     // What the last top-level read did, if recorded (record_for_cache).
@@ -396,6 +188,7 @@ public:
           map_(session.source_map),
           size_(static_cast<uint32_t>(text.size())) {
         if (map_) map_->record_text(file, text);
+        ++s_.st_->parses;
     }
 
     bool run(Ref<Array>& out, Error& err) {
@@ -462,8 +255,14 @@ private:
         bool value;          // the condition's result
         bool seen_else;
         bool negated;
-        int32_t line;
+        int32_t line;  // where the current branch began: its #ifdef, or its #else
+        Symbol name;   // what it tests; empty inside a branch not read
     };
+    // The branch `c` ends at `line`: a section of the read, if it was read.
+    void section_ends(const Cond& c, int32_t line) {
+        if (c.active && !c.name.empty())
+            s_.st_->sections.push_back({c.name, c.negated, c.seen_else, file_, c.line, line});
+    }
 
     static constexpr uint32_t kNoColumn = UINT32_MAX;
     // An error at byte `at`, which gives its column.
@@ -588,6 +387,7 @@ private:
         switch (f.kind) {
             case Frame::DefineBody:
                 s_.define(f.name, std::move(arr));
+                s_.st_->tested.push_back(f.name);
                 defined(f.name, f.line, false);
                 return true;
             case Frame::Autorun:
@@ -802,12 +602,16 @@ private:
     bool conditional(const Token& t, bool parent_active) {
         const bool negated = t.text == "ifndef";
         bool value = false;
+        Symbol tested;
         if (parent_active) {
             Token name;
             if (!name_arg(t.text, name)) return false;
-            value = s_.is_defined(Symbol(name.text)) != negated;
+            tested = Symbol(name.text);
+            value = s_.is_defined(tested) != negated;
+            s_.st_->tested.push_back(tested);
         }
-        conds_.push_back({parent_active && value, parent_active, value, false, negated, t.line});
+        conds_.push_back(
+            {parent_active && value, parent_active, value, false, negated, t.line, tested});
         return true;
     }
 
@@ -816,14 +620,17 @@ private:
             return fail(ErrorCode::Directive, "#" + Str(t.text) + " without #ifdef", t.line,
                         t.begin);
         if (t.text == "endif") {
+            section_ends(conds_.back(), t.line);
             conds_.pop_back();
             return true;
         }
         Cond& c = conds_.back();
         if (c.seen_else)
             return fail(ErrorCode::Directive, "second #else for one #ifdef", t.line, t.begin);
+        section_ends(c, t.line);
         c.seen_else = true;
         c.active = c.parent_active && !c.value;
+        c.line = t.line;
         return true;
     }
 
@@ -872,6 +679,7 @@ private:
             }
             return true;
         }
+        if (d == "include_dir") return include_dir(t);
         if (d == "define") {
             Token name;
             if (!name_arg(d, name)) return false;
@@ -885,7 +693,10 @@ private:
                 frames_.back().name = sym;
                 return true;
             }
-            s_.define(sym);
+            s_.define(sym, DefineFrom::File);
+            s_.st_->flags.back().file = file_;
+            s_.st_->flags.back().line = name.line;
+            s_.st_->tested.push_back(sym);
             defined(sym, name.line, true);
             return true;
         }
@@ -893,6 +704,7 @@ private:
             Token name;
             if (!name_arg(d, name)) return false;
             s_.undefine(Symbol(name.text));
+            s_.st_->tested.emplace_back(name.text);
             return true;
         }
         if (d == "autorun") {
@@ -908,10 +720,8 @@ private:
         return fail(ErrorCode::Directive, "unknown directive '#" + Str(d) + "'", t.line, t.begin);
     }
 
-    // Resolves and parses an included or merged file. Leaves `out` null if `optional`
-    // and the file does not exist, or if `require` and the session has read it already.
-    bool load(const Str& path, bool optional, int32_t line, uint32_t at, Ref<Array>& out,
-              bool require = false) {
+    // Whether one more file may be included here.
+    bool may_include(const Str& path, int32_t line, uint32_t at) {
         if (s_.refuse_includes)
             return fail(ErrorCode::Refused,
                         "'" + path + "' is not read: this text may include no files", line, at);
@@ -924,7 +734,11 @@ private:
             return fail(ErrorCode::Limit,
                         "more than " + detail::decimal(s_.limits.max_includes) + " included files",
                         line, at);
+        return true;
+    }
 
+    // Where an included path may be: beside this file, then in each include directory.
+    [[nodiscard]] Vec<Str> candidates_of(const Str& path) const {
         Vec<Str> candidates;
         if (is_absolute_path(path)) {
             candidates.push_back(normalize_path(path));
@@ -933,19 +747,56 @@ private:
             for (const Str& dir : s_.st_->include_dirs)
                 candidates.push_back(normalize_path(join_path(dir, path)));
         }
+        return candidates;
+    }
+
+    // Reads `path` through the session's reader, recording it for the cache.
+    bool read_recorded(const Str& path, Str& text) {
+        const bool read = read_with(s_.st_->reader, path, text);
+        if (s_.st_->recorded)
+            s_.st_->files.push_back({path, read ? static_cast<int64_t>(text.size()) : -1,
+                                     read ? content_hash(text) : 0});
+        return read;
+    }
+
+    // Lists `dir` through the session's lister, recording it for the cache.
+    bool list_recorded(const Str& dir, Vec<Str>& entries) {
+        const uint64_t listing = list_with(s_.st_->lister, dir, entries);
+        if (s_.st_->recorded)
+            s_.st_->files.push_back(
+                {dir, listing ? kListedDirectory : kUnlistedDirectory, listing});
+        return listing != 0;
+    }
+
+    // Parses `text`, read from `found` for `path` as written, as an included file.
+    bool parse_included(const Str& path, const Str& found, const Str& text, int32_t line,
+                        uint32_t at, Ref<Array>& out) {
+        for (const Str& open_file : s_.st_->include_stack)
+            if (open_file == found)
+                return fail(ErrorCode::Directive, "'" + path + "' includes itself", line, at);
+        ++s_.st_->includes;
+        s_.st_->include_stack.push_back(found);
+        Parser sub(s_, arena_, text, Symbol(found), include_depth_ + 1);
+        const bool ok = sub.run(out, *err_);
+        s_.st_->include_stack.pop_back();
+        return ok;
+    }
+
+    // Resolves and parses an included or merged file. Leaves `out` null if `optional`
+    // and the file does not exist, or if `require` and the session has read it already.
+    bool load(const Str& path, bool optional, int32_t line, uint32_t at, Ref<Array>& out,
+              bool require = false) {
+        if (!may_include(path, line, at)) return false;
         Str text;
         const Str* found = nullptr;
         Vec<Str>& required = s_.st_->required;
+        const Vec<Str> candidates = candidates_of(path);
         for (const Str& c : candidates) {
             // A required file is not read again: the first candidate the session has
             // required already ends the search.
             if (require && std::find(required.begin(), required.end(), c) != required.end())
                 return true;
-            const bool read = read_with(s_.st_->reader, c, text);
-            if (s_.st_->recorded)
-                s_.st_->files.push_back({c, read ? static_cast<int64_t>(text.size()) : -1,
-                                         read ? content_hash(text) : 0});
-            if (read) {
+            if (read_recorded(c, text)) {
                 found = &c;
                 break;
             }
@@ -954,17 +805,115 @@ private:
             if (optional) return true;
             return fail(ErrorCode::Io, "cannot read included file '" + path + "'", line, at);
         }
-        for (const Str& open_file : s_.st_->include_stack)
-            if (open_file == *found)
-                return fail(ErrorCode::Directive, "'" + path + "' includes itself", line, at);
         if (require) required.push_back(*found);
+        return parse_included(path, *found, text, line, at, out);
+    }
 
-        ++s_.st_->includes;
-        s_.st_->include_stack.push_back(*found);
-        Parser sub(s_, arena_, text, Symbol(*found), include_depth_ + 1);
-        const bool ok = sub.run(out, *err_);
-        s_.st_->include_stack.pop_back();
-        return ok;
+    // #include_dir path: a child for each .dta file in the directory, named by the file and
+    // holding what it holds, and for each subdirectory, named by it and holding its own; in
+    // the order of the directory's order.dta, then by name.
+    bool include_dir(const Token& t) {
+        Str path;
+        if (!path_arg(t.text, path)) return false;
+        if (s_.refuse_includes)
+            return fail(ErrorCode::Refused,
+                        "'" + path + "' is not read: this text may include no files", t.line,
+                        t.begin);
+        Vec<Str> entries;
+        for (const Str& c : candidates_of(path))
+            if (list_recorded(c, entries))
+                return splice_dir(c, entries, t.line, t.begin, nullptr, nullptr);
+        return fail(ErrorCode::Io, "cannot list the directory '" + path + "' of #include_dir",
+                    t.line, t.begin);
+    }
+
+    // The children of the directory `dir`, listed as `entries`: pushed here, or added to
+    // `into` (and `into_spans` in edit mode) for a subdirectory's table.
+    bool splice_dir(const Str& dir, const Vec<Str>& entries, int32_t line, uint32_t at,
+                    Vec<Node>* into, Vec<SourceSpan>* into_spans) {
+        struct Child {
+            Str name;
+            Str path;
+            bool folder;
+        };
+        Vec<Child> children;
+        children.reserve(entries.size());
+        for (const Str& e : entries) {
+            const size_t cut = e.view().find_last_of("/\\");
+            const std::string_view leaf =
+                cut == std::string_view::npos ? e.view() : e.view().substr(cut + 1);
+            if (leaf.empty() || leaf.front() == '.' || leaf == "order.dta") continue;  // hidden
+            const bool dta = leaf.size() > 4 && leaf.substr(leaf.size() - 4) == ".dta";
+            if (!dta && leaf.find('.') != std::string_view::npos) continue;  // not data
+            const std::string_view name = dta ? leaf.substr(0, leaf.size() - 4) : leaf;
+            if (!is_bare_symbol(name) || name.find_first_of("./") != std::string_view::npos)
+                return fail(ErrorCode::Directive,
+                            "'" + e + "' cannot be a record: its name is not a symbol", line, at);
+            children.push_back({Str(name), e, !dta});
+        }
+        std::sort(children.begin(), children.end(),
+                  [](const Child& a, const Child& b) { return a.name < b.name; });
+        for (size_t i = 1; i < children.size(); ++i)
+            if (children[i].name == children[i - 1].name)
+                return fail(ErrorCode::Directive,
+                            "'" + dir + "' holds two records named '" + children[i].name + "'",
+                            line, at);
+        Vec<uint32_t> order;
+        for (uint32_t i = 0; i < children.size(); ++i) order.push_back(i);
+        Str text;
+        const Str order_file = normalize_path(join_path(dir, "order.dta"));
+        if (read_recorded(order_file, text)) {
+            Vec<std::string_view> names;
+            for (const Child& c : children) names.push_back(c.name.view());
+            auto r = directory_order(text, order_file, {names.data(), names.size()}, order,
+                                     s_.st_->warnings);
+            if (!r) {
+                *err_ = std::move(r).error();
+                return false;
+            }
+        }
+        for (const uint32_t i : order) {
+            const Child& c = children[i];
+            Vec<Node> kids{Node(Symbol(c.name))};
+            Vec<SourceSpan> spans;           // edit mode
+            if (map_) spans.emplace_back();  // the name, written nowhere
+            Ref<Array> record;
+            if (c.folder) {
+                Vec<Str> inner;
+                if (!list_recorded(c.path, inner)) continue;  // a file without an extension
+                if (!splice_dir(c.path, inner, line, at, &kids, map_ ? &spans : nullptr))
+                    return false;
+                record = arena_.make_array(kids, file_, line);
+            } else {
+                Ref<Array> root;
+                if (!may_include(c.path, line, at)) return false;
+                if (!read_recorded(c.path, text))
+                    return fail(ErrorCode::Io, "cannot read '" + c.path + "'", line, at);
+                if (!parse_included(c.path, c.path, text, line, at, root)) return false;
+                kids.reserve(1 + root->size());
+                for (size_t k = 0; k < root->size(); ++k) {
+                    kids.push_back((*root)[k]);
+                    if (map_) {
+                        const SourceSpan* sp = map_->span(*root, k);
+                        spans.push_back(sp ? *sp : SourceSpan{});
+                    }
+                }
+                // The record is its file: provenance and write-back point into it.
+                record = arena_.make_array(kids, Symbol(c.path), 1);
+                if (map_)
+                    map_->record(
+                        record, {Symbol(c.path), 0, static_cast<uint32_t>(text.size()), {}}, spans);
+            }
+            if (record->height() > s_.limits.max_depth) return too_deep(line, at);
+            const SourceSpan where{file_, at, at, {}};
+            if (into) {
+                into->emplace_back(std::move(record));
+                if (into_spans) into_spans->push_back(where);
+            } else if (!push(Node(std::move(record)), where)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     LoadSession& s_;
@@ -1029,14 +978,44 @@ LoadSession::~LoadSession() {
     detail::destroy(*st_->alloc, st_);
 }
 
-void LoadSession::define(Symbol name) {
+namespace {
+void drop_flag(Vec<ActiveDefine>& flags, Symbol name) {
+    flags.erase(std::remove_if(flags.begin(), flags.end(),
+                               [&](const ActiveDefine& f) { return f.name == name; }),
+                flags.end());
+}
+}  // namespace
+
+void LoadSession::define(Symbol name, DefineFrom from) {
     st_->defines[name] = nullptr;
+    drop_flag(st_->flags, name);
+    st_->flags.push_back({name, from, {}, 0});
 }
 void LoadSession::define(Symbol name, Ref<Array> body) {
+    if (!body) {
+        define(name);
+        return;
+    }
     st_->defines[name] = std::move(body);
+    drop_flag(st_->flags, name);  // a macro now, not a flag
 }
 void LoadSession::undefine(Symbol name) {
     st_->defines.erase(name);
+    drop_flag(st_->flags, name);
+}
+std::span<const ActiveDefine> LoadSession::active_defines() const noexcept {
+    return {st_->flags.data(), st_->flags.size()};
+}
+std::span<const ConditionalSection> LoadSession::conditional_sections() const noexcept {
+    return {st_->sections.data(), st_->sections.size()};
+}
+std::string_view define_from_name(DefineFrom from) noexcept {
+    switch (from) {
+        case DefineFrom::Host: return "host";
+        case DefineFrom::Project: return "project";
+        case DefineFrom::File: return "file";
+    }
+    return "host";
 }
 bool LoadSession::is_defined(Symbol name) const {
     return st_->defines.count(name) != 0;
@@ -1051,6 +1030,12 @@ void LoadSession::set_reader(Reader reader) {
 }
 const LoadSession::Reader& LoadSession::reader() const noexcept {
     return st_->reader;
+}
+void LoadSession::set_lister(Lister lister) {
+    st_->lister = lister ? std::move(lister) : Lister(detail::list_disk_dir);
+}
+const LoadSession::Lister& LoadSession::lister() const noexcept {
+    return st_->lister;
 }
 void LoadSession::add_include_dir(std::string_view dir) {
     st_->include_dirs.emplace_back(dir);
@@ -1108,6 +1093,12 @@ std::span<const CacheFile> SessionAccess::files(const LoadSession& s) noexcept {
 }
 const SessionAccess::Defines& SessionAccess::defines(const LoadSession& s) noexcept {
     return s.st_->defines;
+}
+std::span<const Symbol> SessionAccess::tested(const LoadSession& s) noexcept {
+    return {s.st_->tested.data(), s.st_->tested.size()};
+}
+uint64_t SessionAccess::parses(const LoadSession& s) noexcept {
+    return s.st_->parses;
 }
 const SessionAccess::Defines& SessionAccess::defines_before(const LoadSession& s) noexcept {
     return s.st_->defines_before;
@@ -1331,103 +1322,6 @@ Expected<Ref<Array>> read_file(std::string_view path, LoadSession& session) {
 Expected<Ref<Array>> read_file(std::string_view path) {
     LoadSession session;
     return read_file(path, session);
-}
-
-}  // namespace baker
-
-// --- What a text holds, for tools ---
-
-namespace baker {
-
-TextStructure read_structure(std::string_view text, Symbol file) {
-    using detail::Tok;
-    Vec<Error> errors;
-    Vec<TextComment> comments;
-    Vec<TextToken> tokens;
-    Vec<TextBracket> brackets;
-    Vec<int32_t> open;    // the brackets not yet closed, innermost last
-    Vec<Symbol> macros;   // the names [name ...] at the top level defines, in order
-    int32_t fresh = -1;   // a bracket just opened, whose first token may be its tag
-    bool naming = false;  // the next symbol names a macro
-    detail::Lexer lexer(text, file);
-    lexer.tolerate(errors, comments);
-    auto problem = [&](const Str& message, int32_t line, uint32_t at) {
-        Error e = make_error(ErrorCode::Syntax, message, file, line);
-        e.set_column(lexer.column_at(at));
-        errors.push_back(std::move(e));
-    };
-    for (;;) {
-        detail::Token t;
-        Error ignored;
-        (void)lexer.next(t, ignored);  // tolerant: it goes on past every problem
-        if (t.kind == Tok::End) break;
-        TextToken out{.bracket = t.bracket, .line = t.line, .begin = t.begin, .end = t.end};
-        const auto index = static_cast<int32_t>(tokens.size());
-        switch (t.kind) {
-            case Tok::Open: {
-                out.kind = TextTokenKind::Open;
-                const int32_t parent = open.empty() ? -1 : open.back();
-                naming = t.bracket == '[' && parent == -1;
-                fresh = static_cast<int32_t>(brackets.size());
-                brackets.push_back({.open = t.bracket,
-                                    .line = t.line,
-                                    .begin = t.begin,
-                                    .end = static_cast<uint32_t>(text.size()),
-                                    .parent = parent});
-                open.push_back(fresh);
-                tokens.push_back(out);
-                continue;
-            }
-            case Tok::Close: {
-                out.kind = TextTokenKind::Close;
-                fresh = -1;
-                if (open.empty()) {
-                    problem("unexpected " + Str(detail::bracket_name(t.bracket)), t.line, t.begin);
-                    continue;  // a stray close is left out
-                }
-                TextBracket& b = brackets[open.back()];
-                const char want = b.open == '(' ? ')' : b.open == '{' ? '}' : ']';
-                if (t.bracket != want)
-                    problem(Str(detail::bracket_name(t.bracket)) + " closes " +
-                                Str(detail::bracket_name(b.open)) + " opened on line " +
-                                detail::decimal(b.line),
-                            t.line, t.begin);
-                b.end = t.end;
-                b.closed = t.bracket == want;
-                open.pop_back();
-                tokens.push_back(out);
-                continue;
-            }
-            case Tok::Int: out.kind = TextTokenKind::Int; break;
-            case Tok::Float: out.kind = TextTokenKind::Float; break;
-            case Tok::String: out.kind = TextTokenKind::String; break;
-            case Tok::Var: out.kind = TextTokenKind::Variable; break;
-            case Tok::Directive: out.kind = TextTokenKind::Directive; break;
-            case Tok::Symbol: {
-                out.kind = t.quoted ? TextTokenKind::QuotedSymbol : TextTokenKind::Symbol;
-                const Symbol name(t.text);
-                if (!t.quoted && naming && fresh >= 0) {
-                    macros.push_back(name);
-                } else if (!t.quoted &&
-                           std::find(macros.begin(), macros.end(), name) != macros.end()) {
-                    out.kind = TextTokenKind::Macro;
-                }
-                if (fresh >= 0) brackets[fresh].tag = index;
-                break;
-            }
-            case Tok::End: break;
-        }
-        fresh = -1;
-        naming = false;
-        tokens.push_back(out);
-    }
-    for (const int32_t b : open)
-        problem("unclosed " + Str(detail::bracket_name(brackets[b].open)), brackets[b].line,
-                brackets[b].begin);
-    return {List<TextToken>({tokens.data(), tokens.size()}),
-            List<TextBracket>({brackets.data(), brackets.size()}),
-            List<TextComment>({comments.data(), comments.size()}),
-            List<Error>({errors.data(), errors.size()})};
 }
 
 }  // namespace baker

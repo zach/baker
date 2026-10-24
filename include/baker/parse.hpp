@@ -9,6 +9,9 @@
 //
 //   #include path        splice another file's top-level nodes here
 //   #include_opt path    the same, but a missing file is not an error
+//   #include_dir path    a child for each .dta file of a directory, named by the file and
+//                        holding its nodes, and for each subdirectory, named by it and
+//                        holding its own; in the order its order.dta lists, then by name
 //   #require path        the same, once per session: later #requires of that file, from
 //                        any file the session reads, are no-ops (for packs)
 //   #merge path          merge another file into the enclosing array, keeping existing
@@ -99,14 +102,40 @@ struct Origin {
 };
 
 // Where a load defined a name: a macro (`#define NAME`, `#define NAME (body)`, a top-level
-// `[NAME ...]`), or a script function its #autorun commands define (script.hpp,
-// script_functions). For a tool's completion, go-to-definition, and checks.
+// `[NAME ...]`), or a script function its #autorun commands define
+// (tools::script_functions, <baker/tools/reference.hpp>). For a tool's completion,
+// go-to-definition, and checks.
 struct Definition {
     Symbol name;
     Symbol file;
     int32_t line = 0;
     bool flag = false;  // a macro with no body: #define NAME
 };
+
+// Who made a flag, for #ifdef: the host in code (LoadSession::define, ProjectOptions::defines),
+// the project file's (defines ...), or a file's #define.
+enum class DefineFrom : uint8_t { Host, Project, File };
+
+// A flag that stands, and who made it: for check's and the reference's JSON, and explain.
+struct ActiveDefine {
+    Symbol name;
+    DefineFrom from = DefineFrom::Host;
+    Symbol file;  // a file's #define: where
+    int32_t line = 0;
+};
+
+// A branch of an #ifdef or #ifndef that a read took: the lines of `file` it holds, and the
+// name that chose it. explain names it for a value read there.
+struct ConditionalSection {
+    Symbol name;
+    bool negated = false;      // #ifndef: taken because `name` was not defined
+    bool else_branch = false;  // the #else: taken because the test was false
+    Symbol file;
+    int32_t begin = 0, end = 0;  // the directive's line and the closing #else or #endif's
+};
+
+// "host", "project" or "file", as the JSON documents write a define's origin.
+[[nodiscard]] std::string_view define_from_name(DefineFrom from) noexcept;
 
 // State shared by all files read through it. Macros and defines persist from one file to
 // the next, as in the original; a fresh session starts empty. Copying a session copies
@@ -128,7 +157,8 @@ public:
     LoadSession& operator=(LoadSession&& other) noexcept;
     ~LoadSession();
 
-    void define(Symbol name);                   // a flag, for #ifdef
+    // A flag, for #ifdef; `from` is who made it, the host's own code unless it says.
+    void define(Symbol name, DefineFrom from = DefineFrom::Host);
     void define(Symbol name, Ref<Array> body);  // a macro; null body means a flag
     void undefine(Symbol name);
     [[nodiscard]] bool is_defined(Symbol name) const;
@@ -138,6 +168,16 @@ public:
     // memory or a socket. A null reader restores the default.
     void set_reader(Reader reader);
     [[nodiscard]] const Reader& reader() const noexcept;
+
+    // Lists a directory: calls `entry` with each entry's path (the directory joined with its
+    // name; files and directories alike) and returns true, or returns false if it cannot
+    // list `dir`. The Config lists a directory of layers with it (Config::push_layer_dir).
+    using Lister =
+        Callback<bool(std::string_view dir, Callback<void(std::string_view path)> entry)>;
+    // Replaces directory listing (default: the local filesystem), as set_reader replaces
+    // reading. A null lister restores the default.
+    void set_lister(Lister lister);
+    [[nodiscard]] const Lister& lister() const noexcept;
 
     // Searched, in order, after the including file's directory.
     void add_include_dir(std::string_view dir);
@@ -157,6 +197,12 @@ public:
     // written: a name defined twice is listed twice, and one #undef'd stays listed
     // (is_defined says which stand). Macros a host defines in code are not listed.
     [[nodiscard]] std::span<const Definition> macro_definitions() const noexcept;
+    // The flags that stand, in the order they were made, each with who made it: the host's,
+    // the project's, and the files' #define, less those #undef'd. Macros are
+    // macro_definitions().
+    [[nodiscard]] std::span<const ActiveDefine> active_defines() const noexcept;
+    // Every #ifdef or #ifndef branch the session's reads took, in the order read.
+    [[nodiscard]] std::span<const ConditionalSection> conditional_sections() const noexcept;
     [[nodiscard]] const Origin* origin_of(Symbol file) const noexcept;  // null: none
     // Warnings from the files read, in order (the one-way rule), until cleared.
     [[nodiscard]] std::span<const Error> warnings() const noexcept;
@@ -205,54 +251,5 @@ private:
                                                LoadSession& session);
 [[nodiscard]] Expected<Ref<Array>> read_string(std::string_view text,
                                                std::string_view name = "<string>");
-
-// --- What a text holds, for tools, even when it does not parse ---
-
-enum class TextTokenKind : uint8_t {
-    Open,   // ( { [
-    Close,  // ) } ]
-    Int,
-    Float,
-    String,  // "..."
-    Symbol,
-    QuotedSymbol,  // '...'
-    Variable,      // $name
-    Directive,     // #name
-    Macro,         // a symbol this text defines as a macro, [name ...] at the top level
-};
-struct TextToken {
-    TextTokenKind kind{};
-    char bracket = 0;  // Open, Close
-    int32_t line = 0;
-    uint32_t begin = 0, end = 0;  // bytes
-};
-struct TextBracket {
-    char open = 0;
-    int32_t line = 0;
-    uint32_t begin = 0;
-    uint32_t end = 0;     // past its close; the text's end when it is not closed
-    int32_t parent = -1;  // the bracket it is in, as an index; -1 at the top level
-    int32_t tag = -1;     // its first token, as an index, when that is a symbol; else -1
-    bool closed = false;
-};
-struct TextComment {
-    int32_t line = 0;
-    uint32_t begin = 0, end = 0;
-    bool block = false;  // /* */, or ; to the line's end
-};
-struct TextStructure {
-    List<TextToken> tokens;
-    List<TextBracket> brackets;  // in the order they open
-    List<TextComment> comments;
-    List<Error> errors;  // located as the parser locates them; the read goes on past each
-};
-
-// Reads `text` as the parser lexes it and gives back what is written there, for an editor
-// while a person types, a formatter or a highlighter: every token, bracket and comment,
-// with byte spans. Nothing is refused: an unclosed bracket runs to the end of the text, an
-// unterminated string or comment ends there, a stray close is left out, and each is an
-// error beside the rest. No macro is expanded and no include followed. Linear in the
-// text; the lists are all it allocates. `file` names the errors' file.
-[[nodiscard]] TextStructure read_structure(std::string_view text, Symbol file = {});
 
 }  // namespace baker

@@ -16,22 +16,24 @@ add_executable(baker_data_tests
   data/test_cache.cpp
   data/test_config.cpp
   data/test_core.cpp
+  data/test_curve.cpp
   data/test_corpus.cpp
   data/test_lookup.cpp
   data/test_m3b.cpp
   data/test_m10.cpp
-  data/test_explain.cpp
-  data/test_tweaks_json.cpp
   data/test_layer_check.cpp
+  data/test_layer_dir.cpp
+  data/test_include_dir.cpp
   data/test_received_layers.cpp
   data/test_layer_checker.cpp
   data/test_project.cpp
   data/test_parse.cpp
   data/test_preprocessor.cpp
-  data/test_structure.cpp
   data/test_version.cpp
-  data/test_write.cpp
-  readiness_loop.cpp)
+  data/test_tweaks_json.cpp
+  data/test_read_consistent.cpp
+  data/test_defines.cpp
+  data/test_write.cpp)
 target_link_libraries(baker_data_tests PRIVATE baker::data baker_parse_harness baker_doctest_main
                       baker_alloc_counter)
 # White-box tests of internal helpers (text.hpp).
@@ -56,19 +58,43 @@ if(BAKER_BUILD_SCRIPT)
     script/test_script_tasks.cpp
     script/test_stats.cpp
     script/test_tasks.cpp
-    script/test_request.cpp
-    script/test_config_tools.cpp
-    script/test_reference_json.cpp)
-  target_link_libraries(baker_script_tests PRIVATE baker::script baker_doctest_main
+    script/test_request.cpp)
+  # baker::tools too: some of script's tests read what a Context registers through the
+  # reference. The data tests, which also build without script, link no tools.
+  target_link_libraries(baker_script_tests PRIVATE baker::tools baker_doctest_main
                         baker_alloc_counter)
   target_compile_definitions(baker_script_tests PRIVATE
     BAKER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
     BAKER_CORPUS_DIR="${PROJECT_SOURCE_DIR}/tests/corpus")
   add_test(NAME baker_script_tests COMMAND baker_script_tests)
+
+  # baker::tools: the reference and the JSON a game writes for tools, the layer tools, the
+  # console's config.* commands, the vocabulary declared from a reference, and the tolerant
+  # read of text.
+  add_executable(baker_tools_tests
+    tools/readiness_loop.cpp
+    tools/test_config_tools.cpp
+    tools/test_described.cpp
+    tools/test_format.cpp
+    tools/test_explain.cpp
+    tools/test_layers.cpp
+    tools/test_reference_json.cpp
+    tools/test_structure.cpp)
+  target_link_libraries(baker_tools_tests PRIVATE baker::tools baker_doctest_main
+                        baker_alloc_counter)
+  target_include_directories(baker_tools_tests PRIVATE support)
+  target_compile_definitions(baker_tools_tests PRIVATE
+    BAKER_SOURCE_DIR="${PROJECT_SOURCE_DIR}"
+    BAKER_CORPUS_DIR="${PROJECT_SOURCE_DIR}/tests/corpus")
+  if(BAKER_BUILD_SHAPE)
+    target_sources(baker_tools_tests PRIVATE tools/test_rules.cpp)  # rules in shapes
+  endif()
+  add_test(NAME baker_tools_tests COMMAND baker_tools_tests)
 endif()
 
 if(TARGET baker::host)
-  add_executable(baker_host_tests host/test_console.cpp host/test_live.cpp host/test_scenarios.cpp
+  add_executable(baker_host_tests host/test_command_line.cpp host/test_console.cpp
+                                  host/test_live.cpp host/test_scenarios.cpp
                                   host/test_sim_run.cpp host/test_watcher.cpp)
   target_link_libraries(baker_host_tests PRIVATE baker::host baker_doctest_main
                         baker_alloc_counter)
@@ -99,14 +125,15 @@ if(BAKER_BUILD_SHAPE)
   add_executable(baker_shape_tests shape/test_shape.cpp)
   target_link_libraries(baker_shape_tests PRIVATE baker::shape baker_doctest_main
                         baker_alloc_counter)
-  target_compile_definitions(baker_shape_tests PRIVATE BAKER_SHAPE_DIR="${PROJECT_SOURCE_DIR}/tests/shape")
+  target_compile_definitions(baker_shape_tests PRIVATE BAKER_SHAPE_DIR="${PROJECT_SOURCE_DIR}/tests/shape"
+                             BAKER_TEST_SCRIPT=$<BOOL:${BAKER_BUILD_SCRIPT}>)
   add_test(NAME baker_shape_tests COMMAND baker_shape_tests)
 endif()
 
 if(BAKER_BUILD_SCRIPT)
   # Its own binary, because main installs the default allocator before anything runs.
   add_executable(baker_alloc_tests alloc/main.cpp alloc/test_allocators.cpp)
-  target_link_libraries(baker_alloc_tests PRIVATE baker::script baker_doctest baker_alloc_counter)
+  target_link_libraries(baker_alloc_tests PRIVATE baker::tools baker_doctest baker_alloc_counter)
   add_test(NAME baker_alloc_tests COMMAND baker_alloc_tests)
 endif()
 
@@ -132,10 +159,16 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
   add_test(NAME baker_header_allowlist
            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/check_headers.py)
+  # A test that calls what shipping refuses handles shipping, or is a BAKER_DEV_TEST_CASE.
+  add_test(NAME baker_tests_handle_shipping
+           COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/check_tests.py)
 endif()
 file(GLOB baker_public_headers CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/include/baker/*.hpp)
 if(TARGET baker::host)
   file(GLOB baker_host_headers CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/include/baker/host/*.hpp)
+endif()
+if(TARGET baker::tools)
+  file(GLOB baker_tools_headers CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/include/baker/tools/*.hpp)
 endif()
 set(baker_header_units)
 foreach(header ${baker_public_headers})
@@ -151,11 +184,17 @@ foreach(header ${baker_host_headers})
   file(CONFIGURE OUTPUT ${unit} CONTENT "#include <baker/host/${name}.hpp>\n")
   list(APPEND baker_header_units ${unit})
 endforeach()
+foreach(header ${baker_tools_headers})
+  get_filename_component(name ${header} NAME_WE)
+  set(unit ${CMAKE_CURRENT_BINARY_DIR}/header_alone/tools_${name}.cpp)
+  file(CONFIGURE OUTPUT ${unit} CONTENT "#include <baker/tools/${name}.hpp>\n")
+  list(APPEND baker_header_units ${unit})
+endforeach()
 add_library(baker_header_alone OBJECT ${baker_header_units})
 if(TARGET baker::host)
   target_link_libraries(baker_header_alone PRIVATE baker::host)
 elseif(BAKER_BUILD_SCRIPT)
-  target_link_libraries(baker_header_alone PRIVATE baker::script)
+  target_link_libraries(baker_header_alone PRIVATE baker::tools)
 else()
   target_link_libraries(baker_header_alone PRIVATE baker::data)
 endif()

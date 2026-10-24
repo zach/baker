@@ -648,11 +648,19 @@ struct Declared {
                        ? p.values
                        : std::span<const std::string_view>(&p.type, 1);
         };
+        // A list's element's, likewise.
+        auto element = [](const ParamDescription& p) {
+            const ListElement& e = p.element;
+            return !e.values.empty() || !detail::value_type_known(e.type)
+                       ? e.values
+                       : std::span<const std::string_view>(&e.type, 1);
+        };
         size_t length = 0, count = 0;
         for (const ParamDescription& p : od.params) {
-            length += p.type.size();
-            for (const std::string_view v : given(p)) length += v.size();
-            count += given(p).size();
+            length += p.type.size() + p.element.type.size();
+            for (const auto set : {given(p), element(p)})
+                for (const std::string_view v : set) length += v.size();
+            count += given(p).size() + element(p).size();
         }
         names.reserve(length);  // so the views below stay where they point
         values.reserve(count);
@@ -662,9 +670,17 @@ struct Declared {
             const std::string_view type = keep(p.type);
             const size_t first = values.size();
             for (const std::string_view v : given(p)) values.push_back(keep(v));
-            texts.push_back({type, {values.data() + first, given(p).size()}});
+            ListElement listed{};
+            if (!p.element.type.empty()) {
+                listed = {keep(p.element.type), {}, p.element.count, p.element.length};
+                const size_t at = values.size();
+                for (const std::string_view v : element(p)) values.push_back(keep(v));
+                listed.values = {values.data() + at, element(p).size()};
+            }
+            texts.push_back({type, {values.data() + first, given(p).size()}, p.count, listed});
             params.push_back(infos[i]);
             params.back().text = &texts.back();
+            params.back().listed = !listed.values.empty();
         }
     }
     std::string_view keep(std::string_view text) {
@@ -684,12 +700,20 @@ struct Declared {
 
 // Whether an argument has a described parameter's type: by its match, or by the value types
 // of a type only described, read as Values::read reads a compound value.
+// A list argument's elements, out of the way of the common call.
+BAKER_COLD bool has_elements(const detail::ParamInfo& p, const Node& v) {
+    const Array* a = v.try_array();
+    return a && detail::reads_list(p.element(), Values(a->nodes(), a));
+}
+
 bool has_type(const detail::ParamInfo& p, const Node& v) {
-    if (p.match) return p.match(v, true);
+    if (p.match) return p.match(v, true) && (!p.listed || has_elements(p, v));
+    if (p.listed) return has_elements(p, v);
     if (p.values().empty()) return true;
     const Array* a = v.try_array();
     return detail::reads_as(
-        p.values(), a ? Values(a->nodes(), a) : Values(std::span<const Node>(&v, 1), nullptr));
+        p.values(), p.count(),
+        a ? Values(a->nodes(), a) : Values(std::span<const Node>(&v, 1), nullptr));
 }
 
 Expected<Node> call_declared(const void* callable, Args& args) {
@@ -778,8 +802,15 @@ bool builtin_match(std::string_view type, Match& match) {
 
 // A type of the game's own the description gives the value types of: checked by them.
 bool described(const ParamDescription& p) {
-    return !p.values.empty() && std::all_of(p.values.begin(), p.values.end(),
-                                            [](auto v) { return detail::value_type_known(v); });
+    auto known = [](std::span<const std::string_view> types) {
+        return std::all_of(types.begin(), types.end(),
+                           [](auto v) { return detail::value_type_known(v); });
+    };
+    // A list described by its element: of Baker's type, or of the game's with its values.
+    if (!p.element.type.empty() && (detail::value_type_known(p.element.type) ||
+                                    (!p.element.values.empty() && known(p.element.values))))
+        return known(p.values);
+    return !p.values.empty() && known(p.values);
 }
 
 // A type a native function or method of this Context takes (a host's own, `vec2`), with
@@ -802,12 +833,12 @@ bool registered_match(const Context::Impl& impl, std::string_view type, Match& m
     return false;
 }
 
-// Builds each overload of `name` from its description into `built`; why not, if one
-// cannot be, and then `built` is not to be added.
-std::optional<Str> build_described(Context::Impl& impl, Symbol name,
-                                   std::span<const OverloadDescription> overloads,
-                                   Vec<detail::Overload>& built,
-                                   const Callback<Expected<Node>(Args&)>& body = {}) {
+}  // namespace
+
+std::optional<Str> detail::build_described(Context::Impl& impl, Symbol name,
+                                           std::span<const OverloadDescription> overloads,
+                                           Vec<detail::Overload>& built,
+                                           const Callback<Expected<Node>(Args&)>& body) {
     if (overloads.empty()) return Str("it has no overloads");
     Vec<detail::ParamInfo> infos(impl.alloc);
     for (const OverloadDescription& od : overloads) {
@@ -851,8 +882,6 @@ std::optional<Str> build_described(Context::Impl& impl, Symbol name,
     return std::nullopt;
 }
 
-}  // namespace
-
 Expected<FuncRef> Context::declare(Symbol name, std::span<const OverloadDescription> overloads) {
     return declare(name, overloads, {});
 }
@@ -866,65 +895,12 @@ Expected<FuncRef> Context::declare(Symbol name, std::span<const OverloadDescript
     // Every overload is built before any is added, so a description with a mistake adds
     // nothing.
     Vec<detail::Overload> built(impl_->alloc);
-    if (auto why = build_described(*impl_, name, overloads, built, body)) return refuse(*why);
+    if (auto why = detail::build_described(*impl_, name, overloads, built, body))
+        return refuse(*why);
     Expected<FuncRef> ref = refuse("unreachable");
     for (detail::Overload& o : built)
         if (ref = add_overload(name, std::move(o)); !ref) return ref;
     return ref;
-}
-
-Expected<void> Context::declare_type(Symbol name, std::span<const Symbol> bases,
-                                     std::span<const MethodDescription> methods) {
-    auto refuse = [&](std::string_view why) {
-        return Unexpected(
-            make_error(ErrorCode::Type, "cannot declare type " + quoted(name) + ": " + Str(why)));
-    };
-    if (name.empty()) return refuse("it has no name");
-    if (impl_->type_named(name))
-        return Unexpected(make_error(ErrorCode::Refused, "cannot declare type " + quoted(name) +
-                                                             ": this Context already has a "
-                                                             "type of that name"));
-    Vec<const detail::TypeRecord*> found(impl_->alloc);
-    for (const Symbol b : bases) {
-        const detail::TypeRecord* t = impl_->type_named(b);
-        if (!t) return refuse("its base " + quoted(b) + " is not a type this Context knows");
-        found.push_back(t);
-    }
-    Vec<Vec<detail::Overload>> built(impl_->alloc);
-    for (const MethodDescription& m : methods) {
-        built.emplace_back(impl_->alloc);
-        if (auto why = build_described(*impl_, m.name, m.overloads, built.back()))
-            return refuse("method " + quoted(m.name) + ": " + *why);
-    }
-    detail::TypeRecord* type = detail::new_type_record(name.str());
-    for (const detail::TypeRecord* b : found) detail::inherit(*type, *b);
-    for (size_t i = 0; i < methods.size(); ++i)
-        for (detail::Overload& o : built[i])
-            (void)detail::add_method(*type, methods[i].name, std::move(o));
-    type->sort();
-    impl_->declared_types.push_back(type);
-    add_type(*type);
-    return {};
-}
-
-bool Context::has_type(Symbol name) const noexcept {
-    return impl_->type_named(name) != nullptr;
-}
-
-Expected<void> Context::declare_object(Symbol name, Symbol type) {
-    auto refuse = [&](std::string_view why) {
-        return Unexpected(
-            make_error(ErrorCode::Type, "cannot declare object " + quoted(name) + ": " + Str(why)));
-    };
-    if (!impl_->type_named(type))
-        return refuse("its type " + quoted(type) + " is not a type this Context knows");
-    if (impl_->find(name) || impl_->slot(impl_->named(name)) ||
-        !impl_->declared_object(name).empty())
-        return Unexpected(make_error(ErrorCode::Refused, "cannot declare object " + quoted(name) +
-                                                             ": it is already a function or an "
-                                                             "object"));
-    impl_->declared_objects.emplace_back(name, type);
-    return {};
 }
 
 FuncRef& FuncRef::doc(std::string_view text) {

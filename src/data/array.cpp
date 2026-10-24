@@ -1,8 +1,11 @@
 #include <baker/array.hpp>
 
 #include "arena.hpp"
+#include "text.hpp"
 
+#include <bit>
 #include <cstdlib>
+#include <cstring>
 #include <new>
 #include <type_traits>
 
@@ -117,6 +120,57 @@ bool structurally_equal(const Array& a, const Array& b) noexcept {
     for (uint32_t i = 0; i < a.size(); ++i)
         if (!structurally_equal(a[i], b[i])) return false;
     return true;
+}
+
+// --- Digest ---
+
+namespace {
+struct Digest {
+    uint64_t state;
+    void word(uint64_t w) noexcept {  // splitmix64's finalizer over state ^ w
+        uint64_t z = (state ^ w) + 0x9e3779b97f4a7c15ULL;
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        state = z ^ (z >> 31);
+    }
+    void text(std::string_view s) noexcept {
+        word(s.size());
+        for (size_t i = 0; i < s.size(); i += 8) {
+            uint64_t w = 0;
+            for (size_t k = 0; k < 8 && i + k < s.size(); ++k)
+                w |= uint64_t{static_cast<unsigned char>(s[i + k])} << (8 * k);
+            word(w);
+        }
+    }
+    void node(const Node& n) noexcept {
+        word(static_cast<uint64_t>(n.type()) + 1);
+        switch (n.type()) {
+            case Type::Int: word(static_cast<uint64_t>(*n.try_int())); break;
+            case Type::Float: {
+                double d = *n.try_float();
+                if (d == 0) d = 0;  // -0.0 is 0.0
+                word(d != d ? 0x7ff8000000000000ULL : std::bit_cast<uint64_t>(d));
+                break;
+            }
+            case Type::Symbol: text(n.try_sym()->str()); break;
+            case Type::String: text(*n.try_str()); break;
+            case Type::Array:
+            case Type::Command:
+            case Type::Property: array(*n.array()); break;
+            default: text(detail::text_of(n)); break;  // a variable, a function: as written
+        }
+    }
+    void array(const Array& a) noexcept {
+        word(a.size());
+        for (const Node& n : a) node(n);
+    }
+};
+}  // namespace
+
+uint64_t digest(const Array& tree, uint64_t seed) noexcept {
+    Digest d{seed};
+    d.array(tree);
+    return d.state;
 }
 
 }  // namespace baker

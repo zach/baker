@@ -5,6 +5,7 @@
 #include <baker/std_interop.hpp>
 
 #include "alloc_counter.hpp"
+#include "dev_only.hpp"
 #include "ok.hpp"
 #include "temp_dir.hpp"
 
@@ -427,8 +428,7 @@ TEST_CASE("a text-only session refuses caches and reads the text") {
     CHECK_FALSE(read_cache(cache, copy));
 }
 
-TEST_CASE("a define's body decides freshness, by structure") {
-    if constexpr (kShipping) return;  // freshness is development's
+BAKER_DEV_TEST_CASE("a define's body decides freshness, by structure") {
     test::TempDir dir;
     const std::string main = dir.write("main.dta", "(a BODY)");
     const std::string cache = dir.path("main.datb");

@@ -8,6 +8,7 @@
 // includes the standard containers, and nothing else in Baker includes it.
 
 #include <baker/array.hpp>
+#include <baker/config.hpp>
 #include <baker/error.hpp>
 #include <baker/list.hpp>
 #include <baker/path.hpp>
@@ -66,6 +67,13 @@ inline std::string to_dta(const Array& root, const WriteOptions& options = {}) {
     return out;
 }
 
+// A layer as text for a peer (Config::layer_text).
+inline Expected<std::string> layer_text(const Config& config, std::string_view name) {
+    std::string out;
+    if (auto ok = config.layer_text(name, string_out(out)); !ok) return Unexpected(ok.error());
+    return out;
+}
+
 // --- Convert<T> for standard types. ---
 
 template <>
@@ -79,21 +87,6 @@ struct Convert<std::string> {
         return true;
     }
     static void to(const std::string& v, ValueList& out) { out.push(Node(String::make(v))); }
-};
-
-// Every value, each read as T: (tags fast loud blue) as std::vector<Symbol>.
-template <class T>
-struct Convert<std::vector<T>> {
-    static constexpr std::string_view name = "list";
-    static bool from(const Values& v, std::vector<T>& out) {
-        out.assign(v.size(), T{});
-        for (size_t i = 0; i < v.size(); ++i)
-            if (!v.read(i, out[i])) return false;
-        return true;
-    }
-    static void to(const std::vector<T>& v, ValueList& out) {
-        for (const T& x : v) out.add(x);
-    }
 };
 
 namespace detail {
@@ -111,6 +104,26 @@ template <class T, size_t N>
 }
 }  // namespace detail
 
+// Every value, each read as T: (tags fast loud blue) as std::vector<Symbol>.
+template <class T>
+struct Convert<std::vector<T>> {
+    static constexpr std::string_view name = "list";
+    // Any number of T's value type, for a T of one value: {"symbol"} for std::vector<Symbol>.
+    // None for a T of several, whose values nest in each element.
+    static constexpr auto values = detail::repeated_value_types<T, 1>();
+    static constexpr ValueCount count = ValueCount::Any;
+    using element = T;  // what each value is, for a T of several values too
+    static bool from(const Values& v, std::vector<T>& out) {
+        out.assign(v.size(), T{});
+        for (size_t i = 0; i < v.size(); ++i)
+            if (!v.read(i, out[i])) return false;
+        return true;
+    }
+    static void to(const std::vector<T>& v, ValueList& out) {
+        for (const T& x : v) out.add(x);
+    }
+};
+
 // Exactly N values, each read as T: (color 1 0.5 0) as std::array<float, 3>.
 template <class T, size_t N>
 struct Convert<std::array<T, N>> {
@@ -118,6 +131,8 @@ struct Convert<std::array<T, N>> {
     // {"float32", "float32", "float32"} for std::array<float, 3>: the reference writes them,
     // and a tool checks without the game by them.
     static constexpr auto values = detail::repeated_value_types<T, N>();
+    using element = T;  // what each value is, for a T of several values too
+    static constexpr size_t length = N;
     static bool from(const Values& v, std::array<T, N>& out) {
         if (v.size() != N) return false;
         for (size_t i = 0; i < N; ++i)

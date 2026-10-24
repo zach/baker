@@ -5,6 +5,7 @@
 #include <baker/script.hpp>
 
 #include "alloc_counter.hpp"
+#include "dev_only.hpp"
 #include "ok.hpp"
 
 #include <algorithm>
@@ -54,8 +55,7 @@ TEST_CASE("calls are counted without profiling, and not timed") {
     CHECK(find(s, "func")->calls == 2);  // built-ins count too: setup defined two functions
 }
 
-TEST_CASE("profiling times calls: total includes callees, self does not") {
-    if constexpr (kShipping) return;
+BAKER_DEV_TEST_CASE("profiling times calls: total includes callees, self does not") {
     Context ctx;
     setup(ctx);
     ctx.reset_stats();

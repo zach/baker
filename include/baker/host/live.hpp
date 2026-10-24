@@ -18,7 +18,7 @@
 //     data sits beside the executable does;
 //   - opens it (open_project, with `open`'s options);
 //   - adds the check validator, and the shape validator when baker::shape is built;
-//   - binds the Config's tools (bind_config_tools), and those that write files only with
+//   - binds the Config's tools (tools::bind_config_tools), and those that write files only with
 //     `console_write`;
 //   - runs every enabled layer's #autorun commands, then calls `changed`;
 //   - watches the stack's files and the project file, and serves the console on
@@ -61,6 +61,8 @@ struct LiveOptions {
     // roots); the watcher's hooks: where those paths are on the disk, and the stamps of
     // those that are not.
     LoadSession::Reader reader{};
+    // Lists the project's directories of layers, if not on the disk (LoadSession::Lister).
+    LoadSession::Lister lister{};
     DiskPathHook disk_path{};
     StampHook stamp{};
     bool watch = true;          // false: reload only when asked (tests, a headless runner)

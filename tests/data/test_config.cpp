@@ -23,6 +23,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "dev_only.hpp"
 #include "ok.hpp"
 
 using namespace baker;
@@ -139,25 +140,26 @@ TEST_CASE("a layer that sets a whole section shares it, and a merge allocates li
     CHECK(merged->try_find("t") == base->try_find("t"));
     // A Config merging layers that override whole sections allocates the same for 20
     // sections as for 200: only what it keeps, the roots.
-    auto allocations_for = [](int sections) {
-        std::string lo, hi;
-        for (int i = 0; i < sections; ++i) {
-            lo += "(s" + std::to_string(i) + " (speed 1) (count 1) (sub (x 1) (y 1)))";
-            if (i % 2 == 0)
-                hi += "(s" + std::to_string(i) + " (speed 2) (count 2) (sub (x 2) (y 2)))";
-        }
-        Config cfg({.tweaks = nullptr});
-        REQUIRE(cfg.push_layer("lo", parse(lo.c_str())));
-        REQUIRE(cfg.push_layer("hi", parse(hi.c_str())));
-        REQUIRE(cfg.set_layer_enabled("hi", false));
-        REQUIRE(cfg.set_layer_enabled("hi", true));  // warm the scratch
-        REQUIRE(cfg.set_layer_enabled("hi", false));
-        const test::AllocationScope scope;
-        (void)cfg.set_layer_enabled("hi", true);
-        return scope.count();
-    };
-    if constexpr (!kShipping)  // shipping refuses toggling a layer
+    if constexpr (!kShipping) {  // shipping refuses toggling a layer
+        auto allocations_for = [](int sections) {
+            std::string lo, hi;
+            for (int i = 0; i < sections; ++i) {
+                lo += "(s" + std::to_string(i) + " (speed 1) (count 1) (sub (x 1) (y 1)))";
+                if (i % 2 == 0)
+                    hi += "(s" + std::to_string(i) + " (speed 2) (count 2) (sub (x 2) (y 2)))";
+            }
+            Config cfg({.tweaks = nullptr});
+            REQUIRE(cfg.push_layer("lo", parse(lo.c_str())));
+            REQUIRE(cfg.push_layer("hi", parse(hi.c_str())));
+            REQUIRE(cfg.set_layer_enabled("hi", false));
+            REQUIRE(cfg.set_layer_enabled("hi", true));  // warm the scratch
+            REQUIRE(cfg.set_layer_enabled("hi", false));
+            const test::AllocationScope scope;
+            (void)cfg.set_layer_enabled("hi", true);
+            return scope.count();
+        };
         if (test::counting_allocations()) CHECK(allocations_for(200) == allocations_for(20));
+    }
 }
 
 TEST_CASE("edit mode records where every node is written") {
@@ -355,13 +357,6 @@ TEST_CASE("source names a generated file's origin and tool") {
     s = *cfg.source("shop.tax");  // written by hand
     CHECK(s.origin.empty());
     CHECK(s.tool.empty());
-    // Layer tooling reports it too.
-    const auto effect = *cfg.layer_effect("default");
-    const auto price = std::find_if(effect.begin(), effect.end(), [](const LayerEffectEntry& e) {
-        return e.path == Symbol("econ.price");
-    });
-    REQUIRE(price != effect.end());
-    CHECK(price->source.tool == Symbol("sheets-export"));
 }
 
 #if !BAKER_SHIPPING  // reload is inert under BAKER_SHIPPING (tested below)
@@ -435,8 +430,7 @@ TEST_CASE("reload callbacks fire per group; punting rebuilds, migrating does not
 
 #endif
 
-TEST_CASE("callbacks may change the Config and their own lists while notified") {
-    if constexpr (kShipping) return;  // set() and reload() are refused
+BAKER_DEV_TEST_CASE("callbacks may change the Config and their own lists while notified") {
     TweakRegistry reg;
     Tweak<int> a{"t.a", 1, {}, reg};
     Tweak<int> b{"t.b", 1, {}, reg};
@@ -928,8 +922,7 @@ TEST_CASE("cache_dir: file layers load through caches outside edit mode") {
     CHECK(writes == before);
 }
 
-TEST_CASE("cache_dir names a cache by the normalized path") {
-    if constexpr (kShipping) return;  // shipping writes no caches
+BAKER_DEV_TEST_CASE("cache_dir names a cache by the normalized path") {
     TempDir dir;
     fs::create_directories(dir.path("cache"));
     dir.write("dlc/axe.dta", "(axe (damage 10))");
@@ -951,8 +944,7 @@ TEST_CASE("cache_dir names a cache by the normalized path") {
     CHECK(std::distance(fs::directory_iterator(cache_dir), fs::directory_iterator()) == 1);
 }
 
-TEST_CASE("cache_dir reads a cache through a custom reader, and from disk without one") {
-    if constexpr (kShipping) return;  // shipping writes no caches
+BAKER_DEV_TEST_CASE("cache_dir reads a cache through a custom reader, and from disk without one") {
     TempDir dir;
     fs::create_directories(dir.path("cache"));
     const std::string text = dir.write("pak.dta", "(pak (size 7))");
@@ -1125,10 +1117,9 @@ TEST_CASE("write-back keeps an integer token's form when a float value is whole"
 }
 #endif
 
-TEST_CASE(
+BAKER_DEV_TEST_CASE(
     "a tool keeps a Config and reloads: unchanged layers are kept, the result a fresh load's "
     "") {
-    if constexpr (kShipping) return;  // reload() is refused
     std::map<std::string, std::string> files = {{"mem/default.dta", "(a 1)\n(b 2)\n"},
                                                 {"mem/local.dta", "(b 3)\n"}};
     const LoadSession::Reader reader = [&](std::string_view p, TextSink out) {
@@ -1167,4 +1158,87 @@ TEST_CASE(
     REQUIRE(ok(kept.reload()));
     CHECK(kept.get<int>("b") == 6);
     CHECK(kept.layer_root("default").get() == below.get());
+}
+
+TEST_CASE("a digest of the data: by value, stable, and the stack's apart") {
+    auto tree = [](const char* text, const char* name = "a.dta") {
+        return ok(read_string(text, name));
+    };
+    const char* kGolden =
+        "(player (speed 4.5) (lives 3) (name \"Kestrel\") (team red) (pos -0.0 1))\n"
+        "{say hi}\n";
+    // The encoding is fixed: this value is the same on every platform and build.
+    CHECK(digest(*tree(kGolden)) == 0xf55df12c7d1466a3ULL);
+
+    // By value: the file, the layout and the comments are not part of it.
+    CHECK(digest(*tree("(a 1)\n(b (c x))\n")) ==
+          digest(*tree("; a comment\n(a 1)   (b\n  (c x))", "elsewhere/b.dta")));
+    CHECK(digest(*tree("(a 0.0)")) == digest(*tree("(a -0.0)")));
+    // Every value counts, with its type.
+    CHECK(digest(*tree("(a 1)")) != digest(*tree("(a 2)")));
+    CHECK(digest(*tree("(a 1)")) != digest(*tree("(a 1.0)")));
+    CHECK(digest(*tree("(a x)")) != digest(*tree("(a \"x\")")));
+    CHECK(digest(*tree("(a (b c))")) != digest(*tree("(a b c)")));
+
+    // A Config: two stacks that merge to the same values share digest() but not
+    // stack_digest(); a live edit and a toggle move them.
+    Config one({.tweaks = nullptr}), two({.tweaks = nullptr});
+    REQUIRE(one.push_layer("default", tree("(speed 4)\n(lives 3)\n")));
+    REQUIRE(two.push_layer("default", tree("(speed 9)\n(lives 3)\n")));
+    REQUIRE(two.push_layer("tuned", tree("(speed 4)\n")));
+    CHECK(one.digest() == two.digest());
+    CHECK(one.stack_digest() != two.stack_digest());
+    if constexpr (!kShipping) {
+        const uint64_t before = two.digest(), stack = two.stack_digest();
+        REQUIRE(two.set("speed", 5));
+        CHECK(two.digest() != before);  // a live edit is data the game reads
+        CHECK(two.stack_digest() != stack);
+        REQUIRE(two.set("speed", 4));
+        CHECK(two.digest() == before);  // back to the same values
+        REQUIRE(two.toggle_layer("tuned"));
+        CHECK(two.stack_digest() != stack);
+    }
+}
+
+namespace {
+struct UnitRecord {
+    int64_t price = -1, hp = -1;
+};
+}  // namespace
+
+template <>
+struct baker::Convert<UnitRecord> {
+    static constexpr std::string_view name = "unit";
+    static bool from(const Values& v, UnitRecord& out) {
+        for (const Node& n : v)
+            if (const Array* a = n.try_array(); a && a->size() == 2) {
+                if ((*a)[0].is("price")) out.price = (*a)[1].try_int().value_or(-1);
+                if ((*a)[0].is("hp")) out.hp = (*a)[1].try_int().value_or(-1);
+            }
+        return true;
+    }
+};
+
+BAKER_DEV_TEST_CASE("a read of a record or table above a live edit sees it") {
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer(
+        "default", ok(read_string("(units (tank (price 40) (hp 100)) (scout (price 10) (hp 30)))\n",
+                                  "d.dta"))));
+    REQUIRE(cfg.set("units.tank.price", 45));
+    CHECK(cfg.get<int>("units.tank.price") == 45);  // the field, as before
+    // The record and the table above it: the edit, and nothing else changed.
+    const UnitRecord tank = ok(cfg.get<UnitRecord>("units.tank"));
+    CHECK(tank.price == 45);
+    CHECK(tank.hp == 100);
+    const UnitRecord scout = ok(cfg.get<UnitRecord>("units.scout"));  // no edit beneath
+    CHECK(scout.price == 10);
+    // root() is the last full merge until the edits are applied.
+    CHECK(cfg.root()->get<int>("units.tank.price") == 40);
+    cfg.apply_edits();
+    CHECK(cfg.root()->get<int>("units.tank.price") == 45);
+    CHECK(cfg.root()->get<int>("units.tank.hp") == 100);
+    cfg.apply_edits();  // nothing pending: nothing to do
+    // A clear goes back to the files' value everywhere.
+    REQUIRE(cfg.clear_scratch("units.tank.price"));
+    CHECK(ok(cfg.get<UnitRecord>("units.tank")).price == 40);
 }

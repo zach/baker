@@ -21,7 +21,7 @@ set_target_properties(baker_imgui PROPERTIES COMPILE_WARNING_AS_ERROR OFF)
 target_compile_options(baker_imgui PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/w,-w>)
 
 add_library(baker_harness_panels STATIC panels.cpp)
-target_link_libraries(baker_harness_panels PUBLIC baker::script baker::shape baker_imgui)
+target_link_libraries(baker_harness_panels PUBLIC baker::tools baker::shape baker_imgui)
 
 if(BAKER_BUILD_TESTS)
   add_executable(baker_harness_test test_panels.cpp)

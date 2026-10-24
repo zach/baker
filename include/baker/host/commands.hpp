@@ -4,31 +4,44 @@
 // agent with a shell calls `mygame check`, and the game answers with Baker's JSON. They
 // live in the game's binary because only it has its script functions.
 //
-//   check                          baker.check/1.3 JSON; exit 1 on an error, a load
+// The kit's flags begin --baker-, so they never take a name the game's own flags use; any
+// other flag is the game's.
+//
+//   check                          baker.check/1.4 JSON; exit 1 on an error, a load
 //                                  problem, a shape error, or a call to an undefined
 //                                  function
-//   reference [--json]             the script vocabulary, as Markdown; --json:
+//   reference [--baker-json]       the script vocabulary, as Markdown; --baker-json:
 //                                  {"reference", "tweaks", "shapes"}, Baker's three documents
-//   diff [--layer L]               what layer L (default agent) changes, value by value
-//   promote [--from L] [--to T] [--write | --patch FILE]
+//   diff [--baker-layer L]         what layer L (default agent) changes, value by value
+//   promote [--baker-from L] [--baker-to T] [--baker-write | --baker-patch FILE]
 //                                  layer L into T (default default): what it would write;
-//                                  --write writes; --patch writes the change as a unified
-//                                  diff against the files, and nothing else
-//   eval [--seed N] [--json] "{command}"...
+//                                  --baker-write writes; --baker-patch writes the change as a
+//                                  unified diff against the files, and nothing else
+//   eval [--baker-seed N] [--baker-json] "{command}"...
 //                                  each command's result on the game reset with seed N
-//                                  (default 1); --json: one baker.reply/1.1 line each
-//   sim [--scenario NAME]... [--seed N | --seeds A-B] [--step-hz N] [--json] [--results DIR]
+//                                  (default 1); --baker-json: one baker.reply/1.1 line each
+//   sim [--baker-scenario NAME]... [--baker-seed N | --baker-seeds A-B]
+//       [--baker-step-hz N] [--baker-json] [--baker-results DIR]
 //                                  runs the project's scenarios (all, or those named, by
 //                                  name or file name) for each seed, stepping the game
 //                                  (`step`) at N Hz (default 60), then judges them by its
-//                                  objectives; --json: baker.sim/1.1; --results: DIR gets
-//                                  results.json and results.dta, what compare reads. Exit 1
-//                                  if an objective failed
-//   compare --before DIR --after DIR
-//                                  which objectives moved between two --results
+//                                  objectives; --baker-json: baker.sim/1.3; --baker-results:
+//                                  DIR gets results.json and results.dta, what compare
+//                                  reads. Exit 1 if an objective failed
+//   compare --baker-before DIR --baker-after DIR
+//                                  which objectives moved between two --baker-results
 //                                  directories: baker.compare/1; exit 1 if one broke
-//   every command: --project PATH  the stack: the nearest baker-project.dta from PATH
-//                  --output FILE   the output in FILE, not on stdout (a failure to write
+//   format [--baker-check] [--baker-json] [FILE...]
+//                                  lays out each file as Baker writes it, keeping its
+//                                  comments (tools::format_text), with the project's
+//                                  (format ...); no FILE: the files the stack reads under
+//                                  the project's directory. --baker-check writes nothing
+//                                  and exits 1 if a file would change, listing it;
+//                                  --baker-json: baker.format/1, each file's edits
+//   every command: --baker-project PATH
+//                                  the stack: the nearest baker-project.dta from PATH
+//                  --baker-output FILE
+//                                  the output in FILE, not on stdout (a failure to write
 //                                  it is exit 2); the host may route it instead (`output`)
 //
 // Exit status: 0, kCommandFailed (1) when something failed, kCommandError (2) when it
@@ -61,28 +74,30 @@ inline constexpr int kCommandError = 2;
 // A command line, as the kit reads it. Views point into argv.
 struct CommandLine {
     std::string_view command;          // argv[1]
-    std::string_view project;          // --project PATH; the host may set it
+    std::string_view project;          // --baker-project PATH; the host may set it
     std::string_view patch_root;       // a patch's names are relative to this directory;
                                        // empty: the project file's
-    std::string_view layer = "agent";  // diff --layer, promote --from
-    std::string_view to = "default";   // promote --to
-    std::string_view patch;            // promote --patch FILE
-    std::string_view output;           // --output FILE: the command's output there
-    uint64_t seed = 1;                 // eval and sim --seed; sim --seeds A-B: A
-    uint64_t seed_last = 0;            // sim --seeds A-B: B; 0: seed alone
-    double step_hz = 60;               // sim --step-hz
-    List<std::string_view> scenarios;  // sim --scenario NAME, each
-    std::string_view results;          // sim --results DIR
-    std::string_view before, after;    // compare --before DIR --after DIR
-    bool json = false;                 // --json
-    bool write = false;                // promote --write
+    std::string_view layer = "agent";  // diff --baker-layer, promote --baker-from
+    std::string_view to = "default";   // promote --baker-to
+    std::string_view patch;            // promote --baker-patch FILE
+    std::string_view output;           // --baker-output FILE: the command's output there
+    uint64_t seed = 1;                 // eval and sim --baker-seed; sim --baker-seeds A-B: A
+    uint64_t seed_last = 0;            // sim --baker-seeds A-B: B; 0: seed alone
+    double step_hz = 60;               // sim --baker-step-hz
+    List<std::string_view> scenarios;  // sim --baker-scenario NAME, each
+    std::string_view results;          // sim --baker-results DIR
+    std::string_view before, after;    // compare --baker-before DIR --baker-after DIR
+    bool json = false;                 // --baker-json
+    bool write = false;                // promote --baker-write
+    bool check = false;                // format --baker-check: change nothing, list what would
     List<std::string_view> commands;   // eval's {commands}
     List<std::string_view> rest;       // every argument the kit does not read, in order
 };
 
-// Reads argv[1] as the command, the kit's flags and their values, and arguments that are
-// commands ({...}); everything else goes to `rest`, in order, for the host. An error for a
-// flag missing its value, or a seed that is not a number.
+// Reads argv[1] as the command, the kit's flags (--baker-...) and their values, and
+// arguments that are commands ({...}); everything else goes to `rest`, in order, for the
+// host. An error for a flag missing its value, a seed that is not a number, or a --baker-
+// flag the kit does not know.
 [[nodiscard]] Expected<CommandLine> parse_command_line(int argc, const char* const* argv);
 
 // What the game gives the commands.
@@ -114,9 +129,9 @@ struct CommandHooks {
     // with each entry's path and returns true, or returns false if `dir` is not one of its
     // directories. The kit keeps the .dta files, in name order, and reads each through
     // `reader`. Empty, or false: the disk's directory, as without it. For the project's
-    // scenarios and objectives.
+    // scenarios and objectives, and its directories of layers (LoadSession::Lister).
     Callback<bool(std::string_view dir, Callback<void(std::string_view path)> file)> list{};
-    // Where the output goes when the command line names no --output file; empty: stdout.
+    // Where the output goes when the command line names no --baker-output file; empty: stdout.
     // An engine that writes its own lines to stdout keeps the result apart from them.
     Callback<void(std::string_view text)> output{};
 };
@@ -154,7 +169,7 @@ public:
 
     [[nodiscard]] Wants wants() const noexcept;
     [[nodiscard]] uint64_t seed() const noexcept;  // the run's seed; $seed is set
-    // One step, as the run counts it: 1 / --step-hz, in whole nanoseconds. Set the game's
+    // One step, as the run counts it: 1 / --baker-step-hz, in whole nanoseconds. Set the game's
     // fixed rate to match.
     [[nodiscard]] double step_seconds() const noexcept;
     [[nodiscard]] Context& context() noexcept;
@@ -174,7 +189,7 @@ private:
     Impl* impl_;
 };
 
-// The commands and flags above, for a host's usage text. It leaves out --project, which a
+// The commands and flags above, for a host's usage text. It leaves out --baker-project, which a
 // host may read under a name of its own (a data directory, say) and set in CommandLine.
 [[nodiscard]] std::string_view command_help() noexcept;
 

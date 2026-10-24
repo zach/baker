@@ -4,6 +4,7 @@
 #include <baker/parse.hpp>
 #include <baker/script.hpp>
 #include <baker/std_script.hpp>
+#include <baker/tools/std_tools.hpp>
 
 #include "alloc_counter.hpp"
 
@@ -12,6 +13,7 @@
 #include "ok.hpp"
 
 using namespace baker;
+using namespace baker::tools;
 using baker::test::ok;
 
 namespace {

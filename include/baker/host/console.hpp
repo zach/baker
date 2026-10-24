@@ -17,7 +17,7 @@
 //   each frame: console.poll();       // on the thread that owns the Context
 //
 // It listens on 127.0.0.1 only: a console runs any command it is sent, so it is never
-// reachable from another machine. Bind the Config's tools first (bind_config_tools) to
+// reachable from another machine. Bind the Config's tools first (tools::bind_config_tools) to
 // offer them. A quiet frame (no new client, no complete line) allocates nothing. Under
 // BAKER_SHIPPING it is inert: listen() refuses, and nothing opens a socket.
 

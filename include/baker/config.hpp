@@ -242,6 +242,9 @@ struct StackFile {
     Symbol layer;
     Symbol path;  // as the session's reader was given it
     bool present = false;
+    // A directory of layers (Config::push_layer_dir), as its lister was given it: a file
+    // added to it, or removed, changes the stack. `present`: it could be listed.
+    bool directory = false;
 };
 
 struct LayerEffectEntry {
@@ -251,27 +254,6 @@ struct LayerEffectEntry {
     Source source;              // provenance, as source() returns it
     std::optional<Source> below_source;
     bool shadowed = false;  // a higher enabled layer (or scratch) overrides this path
-};
-
-struct DiffEntry {
-    Symbol path;
-    std::optional<Node> a, b;  // empty: that layer does not set this path
-    std::optional<Source> source_a, source_b;
-};
-
-// How one contributor to a path's value stands in the merged value (Config::explain).
-enum class Standing : uint8_t {
-    Wins,      // supplies the value get() returns
-    Shadowed,  // supplies a value that a higher contributor overrides or removes
-    Removes,   // (key #remove) at the path or an ancestor: below it, the key is gone
-    Disabled,  // a disabled layer (or scratch) that has the path: what enabling it would bring
-};
-
-struct ExplainEntry {
-    Symbol layer{};  // a layer's name, "scratch", or "code" for a tweak's default
-    Node value{};    // packed as LayerEffectEntry::value; the symbol #remove for Removes
-    Source source{};
-    Standing standing = Standing::Wins;
 };
 
 // What a LayerReport was made against, so that a push can tell whether it still holds
@@ -374,6 +356,10 @@ private:
     State* state_ = nullptr;
 };
 
+namespace detail {
+struct ToolsAccess;  // baker::tools' way to the internals (src/tools/access.hpp)
+}
+
 class Config {
 public:
     using Writer = Callback<bool(std::string_view path, std::string_view text)>;
@@ -399,6 +385,44 @@ public:
     // below changes; reload() never does. Write-back refuses its values: it has no file.
     [[nodiscard]] Expected<void> push_layer_text(std::string_view name, std::string_view text,
                                                  LayerOptions options = {});
+    // A text layer's text replaced in place, for a peer that receives the layer again (a
+    // server resending a match's settings, a lobby host's edits): the layer keeps its
+    // place and options, and the layers above are read again with its macros. The same
+    // bytes as it holds change nothing: no read, no merge, no reload record. With
+    // `policy`, the new text is checked against the layers below it, without the version
+    // it replaces, and refused, changing nothing, if the policy refuses it. NotFound for
+    // an unknown layer; Refused for a file layer (reload() reads one again) or scratch.
+    [[nodiscard]] Expected<void> set_layer_text(std::string_view name, std::string_view text,
+                                                const LayerPolicy* policy = nullptr);
+    // The host's own flags, for #ifdef, replaced after the stack is open: a server switching
+    // mode, a demo unlocked. Each layer whose read tested, defined or undefined a name that
+    // changed is read again, in place, with the sessions below it; every other layer keeps
+    // its tree. One merge follows, recorded as a reload whose trigger is "defines". The same
+    // set changes nothing. Works in a shipping build: a mode is decided there too. A layer
+    // a cache replayed, which records no tests, is read again. If a layer does not read, the
+    // defines and every layer stay as they were.
+    [[nodiscard]] Expected<void> set_defines(std::span<const std::string_view> names);
+
+    // A directory of layers, for mods, DLC and plugin packs: a layer named `name`, which holds
+    // nothing, with a layer above it for each *.dta file directly in `dir` (named by its file
+    // name, without .dta) and each subdirectory that holds a layer.dta (named by the
+    // subdirectory, read from its layer.dta). They stand in the order `dir`/order.dta lists,
+    // (order a b c); the rest follow in name order. A name order.dta lists that the directory
+    // lacks is a warning, located there; order.dta is not a layer. A layer whose name is
+    // taken is left out, with a warning.
+    //
+    // The directory is listed through the session's lister and its files read through its
+    // reader. Every reload() lists it again: a new file adds a layer, a removed one removes
+    // it, and an order.dta changed reorders them. A layer keeps its enabled state across that
+    // for as long as it is there; a new one takes the directory's (set_layer_enabled on
+    // `name` sets them all). A layer that does not read is left empty, its error passed to
+    // the warning handler, and read again when its files change; the others stand. With
+    // `options.optional`, a directory that cannot be listed is empty. A policy is refused:
+    // check each layer's text instead. remove_layer(name) removes them all; a layer found
+    // in it cannot be removed alone (remove its file, or disable it), nor be a placement's
+    // anchor (place below or above `name`).
+    [[nodiscard]] Expected<void> push_layer_dir(std::string_view name, std::string_view dir,
+                                                LayerOptions options = {});
     [[nodiscard]] Expected<void> remove_layer(std::string_view name);
     // Removes the topmost layer below scratch.
     [[nodiscard]] Expected<void> pop_layer();
@@ -430,26 +454,59 @@ public:
     // scratch. For tools such as shape::validator, which read it; changing it changes
     // nothing until the next merge, and is not supported.
     [[nodiscard]] Ref<Array> layer_root(std::string_view name) const;
+    // The layer's own tree as text, for a peer that must hold the same layer: a server
+    // sending a match's settings to its clients, which push it with push_layer_text under
+    // their own LayerPolicy. The tree is as read (includes spliced in, macros expanded,
+    // #remove kept) and reads back to an equal tree; comments and layout are not kept, and
+    // the layer's file is not touched. "scratch" writes the live edits as a layer, each
+    // edited path with its value. The same tree writes the same bytes, so text sent again
+    // unchanged is a no-op on a receiver's reload. NotFound for an unknown layer. Allocates
+    // only for the text; <baker/std_interop.hpp> has a std::string form.
+    [[nodiscard]] Expected<void> layer_text(std::string_view name, TextSink out) const;
+
+    // A digest of the data, for hosts that must agree on it: lockstep peers, a replay, a
+    // save loaded under other data. 64 bits, the same on every platform and build for the
+    // same data and different when any value differs (detail in baker::digest). It finds a
+    // difference; it is not a cryptographic hash, and no defence against tampering.
+    // digest(): of the merged tree as the game reads it, live edits included, whatever
+    // layers produced it. stack_digest(): of each enabled layer's name and tree, in order,
+    // then scratch's: it moves when a layer is toggled or edited even if the values agree.
+    // Linear in the data; asked for, never on a frame's path.
+    [[nodiscard]] uint64_t digest() const;
+    [[nodiscard]] uint64_t stack_digest() const;
 
     // --- Reading. ---
-    // The merged tree, including scratch as of the last full merge. Holding the Ref keeps
-    // this version alive across reloads.
+    // The merged tree, including scratch as of the last full merge or apply_edits(): a live
+    // edit since is in get() and not here until then. Holding the Ref keeps this version
+    // alive across reloads.
     [[nodiscard]] Ref<Array> root() const noexcept { return root_; }
+    // Merges the live edits made since the last full merge into root(), so every reader of
+    // the tree sees them: between frames, before the game reads its structured data (Live
+    // does, before `changed`). Nothing to do when there are none.
+    void apply_edits();
+    // A value as the game reads it, live edits included. A record or a table above a live
+    // edit not yet applied is read from a fresh merge, so it holds the edit; a T that keeps
+    // views into the tree (std::string_view, Values) must not be read so, and should be read
+    // after apply_edits().
     template <class T>
     [[nodiscard]] Expected<T> get(const Path& path) const {
         Values v;
-        if (scratch_dirty_)
+        if (scratch_dirty_) {
             if (const ScratchHit hit = scratch_values(path, v); hit != ScratchHit::None)
                 return from_scratch<T>(path, hit, v);
+            if (edits_beneath(path)) return with_edits()->get<T>(path);
+        }
         return root_->get<T>(path);
     }
     template <class T>
     [[nodiscard]] Expected<T> get(const Path& path, T fallback) const {
         Values v;
-        if (scratch_dirty_)
+        if (scratch_dirty_) {
             if (const ScratchHit hit = scratch_values(path, v); hit != ScratchHit::None)
                 return hit == ScratchHit::PastEnd ? std::move(fallback)
                                                   : from_scratch<T>(path, hit, v);
+            if (edits_beneath(path)) return with_edits()->get<T>(path, std::move(fallback));
+        }
         return root_->get<T>(path, std::move(fallback));
     }
     [[nodiscard]] Expected<Source> source(const Path& path) const;
@@ -539,15 +596,9 @@ public:
 
     [[nodiscard]] Expected<WriteReport> write_back(const Path& path);
     [[nodiscard]] Expected<WriteReport> write_back_to(const Path& path, std::string_view layer);
-    // Writes every entry of layer_effect(from) into `to`'s file, or nothing: on any refusal
-    // the report lists them all and no file changes. `from` stays in the stack.
+    // Writes every entry of tools::layer_effect(from) into `to`'s file, or nothing: on any
+    // refusal the report lists them all and no file changes. `from` stays in the stack.
     [[nodiscard]] Expected<WriteReport> promote(std::string_view from, std::string_view to);
-    [[nodiscard]] Expected<List<LayerEffectEntry>> layer_effect(std::string_view layer) const;
-    [[nodiscard]] Expected<List<DiffEntry>> diff(std::string_view a, std::string_view b) const;
-    // Every contributor to `path`'s value, bottom to top: the code default of a tweak at the
-    // path, each layer that holds a value there or removes it, and scratch. The one that
-    // Wins is the one source() names. Refuses a path that holds arrays rather than values.
-    [[nodiscard]] Expected<List<ExplainEntry>> explain(const Path& path) const;
     // Checks a candidate layer, changing nothing: its effect on top of the stack as it
     // stands, the policy's refusals, and the validators' warnings over the stack with it.
     // Available in shipping builds: it is what makes live_layers safe there.
@@ -572,6 +623,7 @@ public:
 private:
     struct Impl;
     friend class TweakBase;
+    friend struct detail::ToolsAccess;
 
     void bind(TweakBase& t);
     // LayerOptions::checked: stamps a report on the layer `subject` names, and tells whether
@@ -584,6 +636,8 @@ private:
     // an element past the end of a scratch value, which hides the layers' longer one.
     enum class ScratchHit : uint8_t { None, Found, PastEnd };
     [[nodiscard]] ScratchHit scratch_values(const Path& path, Values& out) const noexcept;
+    [[nodiscard]] bool edits_beneath(const Path& path) const noexcept;
+    [[nodiscard]] Ref<Array> with_edits() const;  // a fresh merge, live edits included
     // `info` null: past the end.
     [[nodiscard]] static Error scratch_error(const Path& path, const detail::ConvertInfo* info);
     template <class T>

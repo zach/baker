@@ -1,4 +1,4 @@
-# Scenarios, `sim` and `compare`: schemas `baker.sim/1.1` and `baker.compare/1`
+# Scenarios, `sim` and `compare`: schemas `baker.sim/1.3` and `baker.compare/1`
 
 A scenario runs your game headless for a set number of seconds, then judges the run by its
 objectives. The host kit's `sim` command runs a project's scenarios and writes the results.
@@ -48,19 +48,52 @@ scenario and the seed.
 An objective `(over median)` does not fail a run. It is judged once per scenario, by its
 pass on the median of its values over the seeds run.
 
+### A game that steps in turns or events
+
+A game whose step is a turn, a tick or an event writes its scenarios in steps, and ends
+them on its own state:
+
+```dta
+(scenario siege (desc "The attacker breaks through")
+   (steps 40)                            ; at most 40 steps, whatever the rate
+   (at step 5 {board.reinforce red})     ; before the 6th step
+   (every step 3 {board.supply blue})    ; at steps 0, 3, 6, ...
+   (until {board.outcome}))              ; after each step: 0 goes on, victory ends it so
+(objective siege.turns (measure {+ $steps 0}) (pass {<= $value 12}))
+(objective siege.won (measure {if {== $ended victory} 1 0}) (pass {== $value 1}))
+```
+
+- `(steps N)` gives a scenario's length as a count, in place of `(seconds N)`; a scenario
+  gives one of the two. `(at step N {...})` runs its commands before step N + 1, beside
+  `(at SECONDS {...})`.
+- `(every SECONDS {...})` and `(every step N {...})` run their commands at each multiple of
+  their period, from step 0: a wave every 5 turns, an income tick each second. A period in
+  seconds that the step rate does not divide is due at each multiple by the half-step rule,
+  as `(at ...)` is. At one step, the `(at ...)`s due run first, then the `(every ...)`s, each
+  in the order written. A period of zero or less is an error.
+- `(until {command})` is evaluated after each step, with `$steps` set to the steps taken.
+  It gives 0 to go on; a symbol to end the run with that name (`victory`, `defeat`,
+  `draw`); any other nonzero value to end it named `until`. The run is judged where it
+  ends. The length is the ceiling, so a run always ends, named `length` when it reaches it.
+  A condition that fails ends the run, which then fails.
+- `$steps` holds the steps a run took when its objectives are measured, and `$ended` how it
+  ended: the name `(until ...)` gave, `until`, or `length`.
+- The project's `(step_name turn)` names a step in the results (`"step_name"`) and in
+  `sim`'s text, `walk seed 1: passed (ended at turn 12)`. It changes nothing a run counts.
+
 `check` reads the scenarios and objectives with the data, so a call to an undefined
 function or a wrong argument count in one is a check error.
 
 ## The commands
 
 ```
-my_game sim [--scenario NAME]... [--seed N | --seeds A-B] [--step-hz N] [--json] [--results DIR]
-my_game compare --before DIR --after DIR
+my_game sim [--baker-scenario NAME]... [--baker-seed N | --baker-seeds A-B] [--baker-step-hz N] [--baker-json] [--baker-results DIR]
+my_game compare --baker-before DIR --baker-after DIR
 ```
 
-- `--scenario` picks a scenario by its name, or by its file's name without `.dta`.
-- `sim` prints a line per run, or, with `--json`, the `baker.sim/1.1` document.
-- `--results DIR` also writes `results.json` (`baker.sim/1.1`) and `results.dta`, which is
+- `--baker-scenario` picks a scenario by its name, or by its file's name without `.dta`.
+- `sim` prints a line per run, or, with `--baker-json`, the `baker.sim/1.3` document.
+- `--baker-results DIR` also writes `results.json` (`baker.sim/1.3`) and `results.dta`, which is
   what `compare` reads.
 - `compare` writes `baker.compare/1`.
 - Both exit 0 when everything passed (`sim`) or nothing broke (`compare`), 1 when something
@@ -91,7 +124,7 @@ case baker::host::SimRun::Wants::Done:          // run.status() is the exit stat
 ```
 
 - The run counts steps, never time. Set your game's fixed rate to `step_seconds()`, which
-  is `--step-hz` in whole nanoseconds, and report one `step()` per fixed step.
+  is `--baker-step-hz` in whole nanoseconds, and report one `step()` per fixed step.
 - `SimRun` sets `$seed`, then waits. It never calls `CommandHooks::reset` or `step`, and
   frames spent waiting for a reset count no steps.
 - `stop()` ends early (a window closed, a timeout). The run in progress is kept as not
@@ -99,15 +132,16 @@ case baker::host::SimRun::Wants::Done:          // run.status() is the exit stat
   the status is 2.
 - A step with nothing due allocates nothing.
 
-## `baker.sim/1.1`
+## `baker.sim/1.3`
 
 ```json
 {
-  "schema": "baker.sim/1.1",
+  "schema": "baker.sim/1.3",
   "status": "passed",
+  "step_name": "step",
   "runs": [
     {"scenario": "walk", "file": "sim/walk.dta", "line": 2, "seed": 0, "steps": 120,
-     "finished": true, "passed": true, "errors": [], "objectives": [
+     "finished": true, "ended": "length", "passed": true, "errors": [], "objectives": [
        {"name": "scored", "file": "metrics/objectives.dta", "line": 4, "value": 0,
         "pass": false, "over": "median", "error": null},
        {"name": "steps", "file": "metrics/objectives.dta", "line": 2, "value": 120,
@@ -120,12 +154,19 @@ case baker::host::SimRun::Wants::Done:          // run.status() is the exit stat
   "summary": [
     {"objective": "steps", "file": "metrics/objectives.dta", "line": 2,
      "tally": {"passed": 2, "failed": 0, "min": 120, "median": 120, "max": 120}}
+  ],
+  "endings": [
+    {"scenario": "walk", "endings": {"length": 2}}
   ]
 }
 ```
 
 - `status` is `"passed"` or `"failed"`, as the exit code is 0 or 1, or `"stopped"` when a
   `SimRun` was stopped before its last run ended (exit 2).
+- `ended` is how the run ended: the name the scenario's `(until ...)` gave (`"victory"`),
+  `"until"` when it gave a number, or `"length"`; `steps` is how many it took. A reader
+  must allow any name. `step_name` at the top is what a step is called, `"step"` unless the
+  project names it. (Added in 1.2; names in 1.3.)
 - `finished` is false for a run that was stopped. It has the steps it took, no objectives,
   and does not pass. (New in 1.1.)
 - `runs` are sorted by scenario, then seed. Each objective within a run is sorted by name.
@@ -140,6 +181,8 @@ case baker::host::SimRun::Wants::Done:          // run.status() is the exit stat
   run is for information. Its entry in `medians` decides.
 - `summary` tallies each objective over every run: the passes, the failures, and the
   smallest, median and largest value.
+- `endings` tallies how each scenario's runs ended, by name, in scenario order. (Added in
+  1.3.)
 
 ## `baker.compare/1`
 

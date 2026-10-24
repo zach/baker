@@ -32,7 +32,7 @@ class Stack:
     def run(self, *args, agent=None):
         if agent is not None:
             (self.dir / "data" / "agent.dta").write_text(agent)
-        p = subprocess.run([self.game, *args, "--project", "data"], cwd=self.dir,
+        p = subprocess.run([self.game, *args, "--baker-project", "data"], cwd=self.dir,
                            capture_output=True, text=True, timeout=120)
         return p.returncode, p.stdout, p.stderr
 
@@ -40,7 +40,7 @@ class Stack:
 def check(s):
     code, out, _ = s.run("check")
     r = json.loads(out)
-    expect(code == 0 and r["passed"] and r["schema"] == "baker.check/1.3", "clean data passes")
+    expect(code == 0 and r["passed"] and r["schema"] == "baker.check/1.4", "clean data passes")
     code, out, err = s.run("check", agent="(waves {spawnn grunt 3})\n")
     r = json.loads(out)
     expect(code == 1 and [d["name"] for d in r["demand"]] == ["spawnn"] and "spawnn" in err,
@@ -68,23 +68,23 @@ def check(s):
 
 
 def reference(s):
-    code, out, _ = s.run("reference", "--json", agent="")
+    code, out, _ = s.run("reference", "--baker-json", agent="")
     r = json.loads(out)
     names = [f["name"] for f in r["reference"]["functions"]]
-    expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.2" and "spawn" in names,
-           "reference --json: the game's functions")
-    expect(r["shapes"]["schema"] == "baker.shapes/1.1" and r["tweaks"]["schema"] == "baker.tweaks/1.3",
-           "reference --json: tweaks and shapes")
+    expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.5" and "spawn" in names,
+           "reference --baker-json: the game's functions")
+    expect(r["shapes"]["schema"] == "baker.shapes/1.4" and r["tweaks"]["schema"] == "baker.tweaks/1.5",
+           "reference --baker-json: tweaks and shapes")
     code, out, _ = s.run("reference")
     expect(code == 0 and "spawn" in out, "reference: Markdown")
 
 
 def eval_json(s):
-    code, out, _ = s.run("eval", "--seed", "4", "--json", "{+ $score 1}", "{nosuch}", agent="")
+    code, out, _ = s.run("eval", "--baker-seed", "4", "--baker-json", "{+ $score 1}", "{nosuch}", agent="")
     lines = [json.loads(l) for l in out.splitlines()]
     expect(code == 1 and len(lines) == 2 and lines[0]["value"] == 41 and lines[0]["id"] == 1,
-           "eval --json: on the game reset with the seed; one reply a command")
-    expect(not lines[1]["ok"] and lines[1]["id"] == 2, "eval --json: an error is a reply")
+           "eval --baker-json: on the game reset with the seed; one reply a command")
+    expect(not lines[1]["ok"] and lines[1]["id"] == 2, "eval --baker-json: an error is a reply")
     code, out, _ = s.run("eval", "{config.get player.speed}", agent="(player (speed 4.5))\n")
     expect(code == 0 and out == "4.5\n", "eval: the stack with the agent layer")
 
@@ -93,16 +93,37 @@ def diff_and_promote(s):
     code, out, _ = s.run("diff", agent="(player (speed 4.5))\n")
     expect(code == 0 and "player.speed  3.5 -> 4.5" in out, "diff: what the agent layer changes")
     before = (s.dir / "data" / "default.dta").read_text()
-    code, out, _ = s.run("promote", "--patch", "change.patch")
+    code, out, _ = s.run("promote", "--baker-patch", "change.patch")
     patch = (s.dir / "change.patch").read_text()
     expect(code == 0 and (s.dir / "data" / "default.dta").read_text() == before,
-           "promote --patch writes nothing in the stack")
+           "promote --baker-patch writes nothing in the stack")
     expect(patch.startswith("--- a/data/default.dta\n+++ b/data/default.dta\n@@ ") and
            "-   (speed 3.5)   ; how fast\n+   (speed 4.5)   ; how fast\n" in patch,
-           "promote --patch: one line, its comment kept, named from the project's directory")
-    code, out, _ = s.run("promote", "--write")
+           "promote --baker-patch: one line, its comment kept, named from the project's directory")
+    code, out, _ = s.run("promote", "--baker-write")
     expect(code == 0 and "(speed 4.5)   ; how fast" in (s.dir / "data" / "default.dta").read_text(),
-           "promote --write writes the line")
+           "promote --baker-write writes the line")
+
+
+def format_files(s):
+    messy = s.dir / "data" / "messy.dta"
+    text = "(a   1) ; one\n\n\n(b\n 2)\n"
+    messy.write_text(text)
+    code, out, _ = s.run("format", "--baker-check", "data/messy.dta")
+    expect(code == 1 and "messy.dta" in out and messy.read_text() == text,
+           "format --baker-check lists an unformatted file and changes nothing")
+    code, out, _ = s.run("format", "--baker-json", "data/messy.dta")
+    r = json.loads(out)
+    expect(code == 0 and r["schema"] == "baker.format/1" and r["files"][0]["changed"]
+           and len(r["files"][0]["edits"]) >= 2 and messy.read_text() == text,
+           "format --baker-json gives the edits and changes nothing")
+    code, _, _ = s.run("format", "data/messy.dta")
+    expect(code == 0 and messy.read_text() == "(a 1) ; one\n\n(b 2)\n", "format rewrites the file")
+    code, out, _ = s.run("format", "--baker-check", "data/messy.dta")
+    expect(code == 0 and out == "", "a formatted file passes --baker-check")
+    messy.unlink()
+    code, out, _ = s.run("format", "--baker-check")
+    expect(code in (0, 1), "with no files, format takes the stack's own files")
 
 
 def shipping(s):
@@ -123,18 +144,18 @@ def host_io(s):
                          agent="(player (speed 4.5))\n")
     expect(code == 0 and out == "4.5\n", "eval reads through the host's reader")
     if sys.argv[3:] != ["shipping"]:
-        code, _, _ = s.run("promote", "--patch", "p.diff", "--root", str(s.dir))
+        code, _, _ = s.run("promote", "--baker-patch", "p.diff", "--root", str(s.dir))
         patch = (s.dir / "p.diff").read_text()
         expect(code == 0 and "-   (speed 3.5)   ; how fast\n+   (speed 4.5)   ; how fast\n" in patch,
-               "promote --patch compares against what the reader reads")
+               "promote --baker-patch compares against what the reader reads")
 
-    code, out, _ = s.run("check", "--output", "report.json", agent="")
+    code, out, _ = s.run("check", "--baker-output", "report.json", agent="")
     expect(code == 0 and out == "" and
            json.loads((s.dir / "report.json").read_text())["passed"],
-           "--output FILE: the output in the file, nothing on stdout")
-    code, out, err = s.run("check", "--output", "no/such/dir/report.json")
+           "--baker-output FILE: the output in the file, nothing on stdout")
+    code, out, err = s.run("check", "--baker-output", "no/such/dir/report.json")
     expect(code == 2 and out == "" and "cannot write" in err,
-           "--output to a file that cannot be written: exit 2")
+           "--baker-output to a file that cannot be written: exit 2")
     code, out, err = s.run("eval", "{+ 1 2}", "--to-stderr")
     expect(code == 0 and out == "" and err == "3\n", "the host routes the output")
 
@@ -142,45 +163,45 @@ def host_io(s):
 def scenarios(s):
     if sys.argv[3:] == ["shipping"]:
         return
-    code, out, err = s.run("sim", "--seed", "1")
+    code, out, err = s.run("sim", "--baker-seed", "1")
     expect(code == 0 and "walk seed 1: passed" in out, "sim runs the project's scenarios")
-    code, out, _ = s.run("sim", "--seeds", "0-2", "--json")
+    code, out, _ = s.run("sim", "--baker-seeds", "0-2", "--baker-json")
     r = json.loads(out)
-    expect(code == 0 and r["schema"] == "baker.sim/1.1" and len(r["runs"]) == 3 and
+    expect(code == 0 and r["schema"] == "baker.sim/1.3" and len(r["runs"]) == 3 and
            r["runs"][0]["file"].endswith("walk.dta") and r["runs"][0]["line"] == 2,
-           "sim --json: every run, located")
+           "sim --baker-json: every run, located")
     # The median of seeds 0-2 is 10: it passes, though seed 0 alone does not.
-    code, out, _ = s.run("sim", "--seed", "0", "--json")
+    code, out, _ = s.run("sim", "--baker-seed", "0", "--baker-json")
     expect(code == 1 and json.loads(out)["status"] == "failed",
            "an objective that fails its median: exit 1")
-    code, _, err = s.run("sim", "--scenario", "nosuch")
+    code, _, err = s.run("sim", "--baker-scenario", "nosuch")
     expect(code == 2 and "no scenario" in err, "a scenario that is not there: exit 2")
-    code, out, _ = s.run("sim", "--scenario", "walk", "--step-hz", "30", "--json")
+    code, out, _ = s.run("sim", "--baker-scenario", "walk", "--baker-step-hz", "30", "--baker-json")
     expect(code == 1 and json.loads(out)["runs"][0]["steps"] == 60,
-           "--step-hz sets the step rate (the steps objective wants 120)")
+           "--baker-step-hz sets the step rate (the steps objective wants 120)")
     # Through the host's reader and lister: game://sim is a directory only the host knows.
-    code, out, _ = s.run("sim", "--seed", "1", "--json", "--root", str(s.dir))
+    code, out, _ = s.run("sim", "--baker-seed", "1", "--baker-json", "--root", str(s.dir))
     r = json.loads(out)
     expect(code == 0 and len(r["runs"]) == 1 and r["runs"][0]["file"] == "game://sim/walk.dta",
            "sim lists a scenario directory through the host, and reads it through its reader")
     # compare: the same results, then an objective that broke.
-    expect(s.run("sim", "--seeds", "1-2", "--results", "before")[0] == 0,
-           "--results DIR writes the results")
+    expect(s.run("sim", "--baker-seeds", "1-2", "--baker-results", "before")[0] == 0,
+           "--baker-results DIR writes the results")
     expect((s.dir / "before" / "results.json").exists() and
            (s.dir / "before" / "results.dta").exists(), "results.json and results.dta")
     (s.dir / "data" / "agent.dta").write_text("")
     (s.dir / "metrics" / "objectives.dta").write_text(
         (s.dir / "metrics" / "objectives.dta").read_text().replace("120", "121"))
-    s.run("sim", "--seeds", "1-2", "--results", "after")
-    code, out, _ = s.run("compare", "--before", "before", "--after", "after")
+    s.run("sim", "--baker-seeds", "1-2", "--baker-results", "after")
+    code, out, _ = s.run("compare", "--baker-before", "before", "--baker-after", "after")
     r = json.loads(out)
     steps = [o for o in r["objectives"] if o["name"] == "steps"]
     expect(code == 1 and r["schema"] == "baker.compare/1" and r["broke"] == 1 and
            steps and steps[0]["moved"] == "broke" and steps[0]["line"] == 2,
            "compare: an objective that broke, located: exit 1")
-    code, out, _ = s.run("compare", "--before", "before", "--after", "before")
+    code, out, _ = s.run("compare", "--baker-before", "before", "--baker-after", "before")
     expect(code == 0 and json.loads(out)["broke"] == 0, "compare: nothing moved: exit 0")
-    code, _, _ = s.run("compare", "--before", "before", "--after", "nosuch")
+    code, _, _ = s.run("compare", "--baker-before", "before", "--baker-after", "nosuch")
     expect(code == 2, "compare: results that are not there: exit 2")
     # check reads the scenarios and objectives with the data.
     (s.dir / "sim" / "walk.dta").write_text("(scenario walk (seconds 1) (start {spawn grunt}))\n")
@@ -194,8 +215,8 @@ def command_line(s):
     expect(code == 0 and out == "hello\n", "a command of the game's own")
     code, _, err = s.run("nosuch")
     expect(code == 2 and "check" in err, "an unknown command: exit 2, with the commands")
-    code, _, err = s.run("eval", "--seed", "x", "{+ 1 1}")
-    expect(code == 2 and "--seed" in err, "a bad flag: exit 2")
+    code, _, err = s.run("eval", "--baker-seed", "x", "{+ 1 1}")
+    expect(code == 2 and "--baker-seed" in err, "a bad flag: exit 2")
 
 
 def main():
@@ -203,7 +224,8 @@ def main():
         print(__doc__)
         return 2
     writes = shipping if sys.argv[3:] == ["shipping"] else diff_and_promote
-    for case in (check, reference, eval_json, writes, host_io, scenarios, command_line):
+    for case in (check, reference, eval_json, writes, host_io, scenarios, command_line,
+                 format_files):
         case(Stack(sys.argv[1], sys.argv[2]))
     print(f"{len(FAILURES)} failures" if FAILURES else "all passed")
     return 1 if FAILURES else 0

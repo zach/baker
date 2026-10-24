@@ -1,5 +1,5 @@
 {
-  "schema": "baker.check/1.3",
+  "schema": "baker.check/1.4",
   "passed": false,
   "errors": [
     {"code": "type", "file": "game.dta", "line": 5, "column": 0, "path": "", "message": "no overload of '+' takes 1 argument"}
@@ -24,5 +24,6 @@
   "packs": [
     {"name": "boss_task", "level": "task", "file": "task.dta", "requires": [], "owners": ["td-encounter"], "for": ["designers"], "stage": "custom"},
     {"name": "game_rules", "level": "game", "file": "game.dta", "requires": ["boss_task"], "owners": ["a", "b"], "for": [], "stage": ""}
-  ]
+  ],
+  "defines": []
 }

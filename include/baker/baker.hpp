@@ -6,6 +6,7 @@
 #include <baker/array.hpp>
 #include <baker/cache.hpp>
 #include <baker/config.hpp>
+#include <baker/curve.hpp>
 #include <baker/error.hpp>
 #include <baker/node.hpp>
 #include <baker/object.hpp>

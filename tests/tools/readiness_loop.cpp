@@ -4,6 +4,7 @@
 #include <doctest.h>
 #include <baker/config.hpp>
 #include <baker/std_interop.hpp>
+#include <baker/tools/layers.hpp>
 
 #include "alloc_counter.hpp"
 #include "temp_dir.hpp"
@@ -12,6 +13,7 @@
 #include <vector>
 
 using namespace baker;
+using namespace baker::tools;
 
 #if !BAKER_SHIPPING
 namespace {
@@ -102,7 +104,7 @@ TEST_CASE("readiness loop: edit, see, tune, save, experiment, and return") {
     // 5. An experiment layer, compared A/B by toggling, without touching shared files.
     REQUIRE(cfg.push_layer("experiment", dir.write("experiment.dta", "(warden (cadence 0.9))\n")));
     CHECK(float(cadence) == 0.9f);
-    const auto effect = cfg.layer_effect("experiment");
+    const auto effect = layer_effect(cfg, "experiment");
     REQUIRE(effect);
     REQUIRE(effect->size() == 1);
     CHECK((*effect)[0].path == "warden.cadence");

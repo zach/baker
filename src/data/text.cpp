@@ -140,22 +140,121 @@ size_t print_g(double v, int precision, char (&out)[64]) noexcept {
 
 }  // namespace
 
+namespace {
+
+// A double's significant digits and the power of ten of the first: 120 is "12" and 2.
+struct Digits {
+    char d[20] = {};
+    int count = 0;
+    int exp10 = 0;
+};
+
+// Whether d.ddd e exp10 reads back as exactly `a`.
+bool reads_back(const Digits& s, double a) noexcept {
+    char text[40];
+    size_t len = 0;
+    text[len++] = s.d[0];
+    if (s.count > 1) text[len++] = '.';
+    for (int i = 1; i < s.count; ++i) text[len++] = s.d[i];
+    text[len++] = 'e';
+    len = static_cast<size_t>(std::to_chars(text + len, text + sizeof text, s.exp10).ptr - text);
+    double back = 0;
+    bool out_of_range = false;
+    return parse_double(std::string_view(text, len), back, out_of_range) && back == a;
+}
+
+// `s` with one added to (`step` 1) or taken from (-1) its last digit; false when it would
+// lose its first digit.
+bool step_last(Digits& s, int step) noexcept {
+    int i = s.count - 1;
+    if (step > 0) {
+        while (i >= 0 && s.d[i] == '9') s.d[i--] = '0';
+        if (i >= 0) {
+            ++s.d[i];
+        } else {  // 99 + 1: 10, one power of ten up
+            s.d[0] = '1';
+            ++s.exp10;
+        }
+        return true;
+    }
+    while (i >= 0 && s.d[i] == '0') s.d[i--] = '9';
+    if (i < 0 || (s.count == 1 && s.d[0] == '1')) return false;
+    --s.d[i];
+    if (s.d[0] == '0') {  // 10 - 1: 9 and a power of ten down
+        for (int k = 0; k + 1 < s.count; ++k) s.d[k] = s.d[k + 1];
+        s.d[s.count - 1] = '9';
+        --s.exp10;
+    }
+    return true;
+}
+
+// The fewest digits that read back as `a` (finite, above zero), and of those the nearest:
+// the digits std::to_chars gives. At each count the nearest are tried, then their
+// neighbours, since where the doubles around `a` are unevenly spaced (at a power of two) a
+// neighbour can read back where the nearest does not.
+Digits shortest_digits(double a) noexcept {
+    Digits s;
+    for (int count = 1; count <= 17; ++count) {
+        char buf[64];
+        const int n = std::snprintf(buf, sizeof buf, "%.*e", count - 1, a);
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof buf) break;
+        // The digits before 'e', whatever the locale's decimal point, then the exponent.
+        s.count = 0;
+        int i = 0;
+        for (; buf[i] != 'e'; ++i)
+            if (is_digit(buf[i])) s.d[s.count++] = buf[i];
+        const bool negative = buf[++i] == '-';
+        int exp = 0;
+        for (++i; is_digit(buf[i]); ++i) exp = exp * 10 + (buf[i] - '0');
+        s.exp10 = negative ? -exp : exp;
+        if (reads_back(s, a)) return s;
+        for (const int step : {-1, 1}) {
+            Digits near = s;
+            if (step_last(near, step) && reads_back(near, a)) return near;
+        }
+    }
+    return s;
+}
+
+}  // namespace
+
 Str format_double_fallback(double v) {
     if (std::isnan(v)) return "nan";
     if (std::isinf(v)) return v < 0 ? "-inf" : "inf";
-    // The shortest %g precision that reads back exactly.
-    Str text;
-    for (int precision = 1; precision <= 17; ++precision) {
-        char buf[64];
-        text.assign(std::string_view(buf, print_g(v, precision, buf)));
-        std::string_view digits = text;
-        const bool neg = !digits.empty() && digits[0] == '-';
-        if (neg) digits.remove_prefix(1);
-        double back = 0;
-        bool out_of_range = false;
-        if (parse_double(digits, back, out_of_range) && (neg ? -back : back) == v) break;
+    Str out(std::signbit(v) ? "-" : "");
+    const double a = std::fabs(v);
+    if (a == 0) return out + "0";
+    // std::to_chars's plain form: fixed or scientific, whichever is shorter, fixed on a tie.
+    Digits s = shortest_digits(a);
+    while (s.count > 1 && s.d[s.count - 1] == '0') --s.count;
+    const int count = s.count, e = s.exp10;
+    const int fixed = e >= count - 1 ? e + 1 : e >= 0 ? count + 1 : count + 1 - e;
+    const int exp_digits = std::abs(e) >= 100 ? 3 : 2;
+    const int scientific = count + (count > 1 ? 1 : 0) + 2 + exp_digits;
+    const std::string_view d(s.d, static_cast<size_t>(count));
+    if (scientific < fixed) {
+        out += d.substr(0, 1);
+        if (count > 1) {
+            out += '.';
+            out += d.substr(1);
+        }
+        out += e < 0 ? "e-" : "e+";
+        if (std::abs(e) < 10) out += '0';
+        return out + decimal(std::abs(e));
     }
-    return text;
+    if (e >= count - 1) {
+        // A whole number: its exact digits, as std::to_chars gives them, which past 17
+        // digits are not the shortest digits' zeros. %.0f prints no decimal point.
+        char buf[320];
+        const int n = std::snprintf(buf, sizeof buf, "%.0f", a);
+        return out + std::string_view(buf, static_cast<size_t>(n));
+    }
+    if (e >= 0)
+        return out + d.substr(0, static_cast<size_t>(e) + 1) + "." +
+               d.substr(static_cast<size_t>(e) + 1);
+    out += "0.";
+    for (int i = -1; i > e; --i) out += '0';
+    return out + d;
 }
 
 Str format_double(double v) {
