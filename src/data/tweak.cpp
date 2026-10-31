@@ -18,29 +18,12 @@ constinit TweakRegistry g_registry;
 
 // The metadata keys, interned once: a panel reads them for every tweak every frame.
 struct Keys {
-    Symbol range{"range"}, step{"step"}, desc{"desc"}, note{"note"}, kind{"kind"}, group{"group"},
-        one_of{"one_of"};
+    Symbol range{"@range"}, step{"@step"}, desc{"@desc"}, note{"@note"}, kind{"@kind"},
+        group{"@group"}, one_of{"@one_of"};
 };
 const Keys& keys() {
     static const Keys k;
     return k;
-}
-
-// A tweak's value without the metadata written after it: (color 1 0.5 0 (range 0 1)) is
-// three numbers. Only trailing arrays tagged with the keys a tweak reads are left out,
-// so a value whose own elements are tagged arrays reads as before.
-Values without_metadata(const Values& v) {
-    const Keys& k = keys();
-    size_t n = v.size();
-    for (; n > 0; --n) {
-        const Array* a = v[n - 1].try_array();
-        if (!a || a->empty()) break;
-        const Node& tag = (*a)[0];
-        if (!(tag.is(k.range) || tag.is(k.step) || tag.is(k.desc) || tag.is(k.note) ||
-              tag.is(k.kind) || tag.is(k.group) || tag.is(k.one_of)))
-            break;
-    }
-    return Values(v.nodes().first(n), v.source());
 }
 
 }  // namespace
@@ -76,7 +59,7 @@ struct TweakBase::Extra {
     bool notifying = false;  // a change made from inside a callback does not notify again
 };
 
-void TweakBase::attach() {
+void TweakBase::attach(detail::Configuration) {
     registry_->lock();
     next_ = registry_->head_;
     if (next_) next_->prev_ = this;
@@ -98,12 +81,12 @@ void TweakBase::detach() noexcept {
     }
     prev_ = next_ = nullptr;
     registry_->unlock();
-    detail::destroy(default_allocator(), extra_);
+    detail::destroy(default_allocator(MemoryKind::Tweaks), extra_);
     extra_ = nullptr;
 }
 
 const Path& TweakBase::parsed() {
-    if (!extra_) extra_ = detail::create<Extra>(default_allocator());
+    if (!extra_) extra_ = detail::create<Extra>(default_allocator(MemoryKind::Tweaks));
     if (!extra_->parsed) extra_->parsed.emplace(path_);
     return *extra_->parsed;
 }
@@ -127,7 +110,7 @@ bool TweakBase::bind(const Array& root, const Callback<void(const Error&)>& warn
             warn(detail::get_error(root, path, nullptr));
         return unbind();
     }
-    const Values values = without_metadata(r.values);
+    const Values& values = r.values;
     const Array* holder = values.source();
     const auto first = static_cast<uint32_t>(values.begin() - holder->begin());
     const auto count = static_cast<uint32_t>(values.size());
@@ -158,7 +141,7 @@ void TweakBase::notify() {
 }
 
 void TweakBase::on_change(Callback<void()> callback) {
-    if (!extra_) extra_ = detail::create<Extra>(default_allocator());
+    if (!extra_) extra_ = detail::create<Extra>(default_allocator(MemoryKind::Tweaks));
     extra_->on_change.push_back(std::move(callback));
 }
 
@@ -257,16 +240,9 @@ std::string_view TweakBase::kind() const {
     return kind_of(values, k, range());
 }
 
-ValueMetadata split_metadata(const Values& all) noexcept {
-    const Values values = without_metadata(all);
-    return {values, all.nodes().subspan(values.size())};
-}
-
-std::string_view presented_kind(const Values& all, std::string_view kind,
+std::string_view presented_kind(const Values& values, std::string_view kind,
                                 TweakRange range) noexcept {
-    const ValueMetadata vm = split_metadata(all);
-    for (const Node& n : vm.metadata) {
-        const Array& a = *n.try_array();
+    for (const Array& a : values.source() ? values.source()->metadata() : Metadata()) {
         if (a[0].is(keys().kind) && a.size() >= 2) {
             if (const auto s = a[1].try_sym()) kind = s->str();
             if (const auto t = a[1].try_str()) kind = *t;
@@ -275,17 +251,17 @@ std::string_view presented_kind(const Values& all, std::string_view kind,
             if (lo && hi) range = {*lo, *hi};
         }
     }
-    return kind_of(vm.values.nodes(), kind, range);
+    return kind_of(values.nodes(), kind, range);
 }
 
 namespace {
-// What a tweak may be, from (one_of ...) after its value if the data has it, else from its
+// What a tweak may be, from (@one_of ...) after its value if the data has it, else from its
 // code: symbols or strings, as text; integers, with their names.
 struct Allowed {
     Vec<Symbol> texts;
     Vec<TweakChoice> numbers;
 };
-Allowed allowed(const Array* data, const TweakMeta& code) {
+Allowed allowed(const Array* data, const detail::KeptTweakMeta& code) {
     Allowed out;
     if (data) {
         for (const Node& n : data->values()) {
@@ -333,15 +309,10 @@ std::string_view TweakBase::group() const {
 
 namespace {
 
-// The metadata array tagged `key` written after a value, as (range 0 10) in
-// (speed 4 (range 0 10)); null if none.
-const Array* trailing_meta(const Values& all, Symbol key) {
-    for (size_t n = all.size(); n > 0; --n) {
-        const Array* a = all[n - 1].try_array();
-        if (!a || a->empty()) break;
-        if ((*a)[0].is(key)) return a;
-    }
-    return nullptr;
+// The metadata array tagged `key` written after a value, as (@range 0 10) in
+// (speed 4 (@range 0 10)); null if none.
+const Array* trailing_meta(const Values& values, Symbol key) {
+    return values.source() ? values.source()->meta(key) : nullptr;
 }
 
 // The path without its last segment, or empty for a top-level tweak; separators '.' and '/'.
@@ -390,7 +361,7 @@ TweakFindings check_tweaks(const Array& root, const TweakRegistry& tweaks) {
             add(errors, detail::get_error(root, t.parsed(), nullptr));
             return;
         }
-        const Values values = without_metadata(r.values);
+        const Values& values = r.values;
         const Array* where = values.source();
         if (!t.assign(values, false)) {
             const detail::ConvertInfo want = t.info();
@@ -575,7 +546,7 @@ void write_json(const TweakRegistry& tweaks, TextSink text) {
         detail::json_string(out, t.kind());
         out += ", \"group\": ";
         detail::json_string(out, t.group());
-        out += Str(", \"dev_only\": ") + (t.code_meta().dev_only ? "true" : "false");
+        out += Str(", \"dev_only\": ") + (t.dev_only() ? "true" : "false");
         out += ", \"one_of\": ";
         const List<Symbol> one_of = t.one_of();
         detail::json_names(out, one_of.items());

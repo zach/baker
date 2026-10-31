@@ -4,6 +4,7 @@
 #include <baker/std_interop.hpp>
 #include <baker/write.hpp>
 
+#include "temp_dir.hpp"
 #include "text.hpp"
 
 #include <bit>
@@ -158,13 +159,14 @@ TEST_CASE("printing round-trips random trees") {
 }
 
 TEST_CASE("write_file writes the file form") {
-    const auto path = (std::filesystem::temp_directory_path() / "baker_write_test.dta").string();
+    // A directory of the process's own: test binaries of other builds may run at once.
+    const baker::test::TempDir dir;
+    const std::string path = dir.path("write_test.dta");
     auto root = parse("(a 1) (b \"two\")");
     REQUIRE(write_file(path, *root).has_value());
     auto back = read_file(path);
     REQUIRE(back.has_value());
     CHECK(structurally_equal(*root, **back));
-    std::remove(path.c_str());
     CHECK(write_file("/definitely/not/a/dir/x.dta", *root).error().code() == ErrorCode::Io);
 }
 
@@ -266,4 +268,94 @@ TEST_CASE("both double formatters round-trip exactly") {
         std::setlocale(LC_NUMERIC, "C");
         break;
     }
+}
+
+// --- Infix ---
+
+namespace {
+Node command_of(std::vector<Node> nodes) {
+    return Node(Array::make_from(nodes), Type::Command);
+}
+Ref<Array> root_of(std::vector<Node> nodes) {
+    return Array::make_from(nodes);
+}
+}  // namespace
+
+TEST_CASE("a prefix command quotes an operator at an odd slot, so every tree round-trips") {
+    // Built in C++, never flagged: the reader must not take any of these infix.
+    const Node plus = command_of({Node(Symbol("+")), Node(Symbol("-")), Node(1)});
+    const Node minus = command_of({Node(Symbol("-")), Node(Symbol("-")), Node(Symbol("-"))});
+    const Node tern = command_of({Node(Symbol("a")), Node(Symbol("?")), Node(Symbol("b")),
+                                  Node(Symbol(":")), Node(Symbol("c"))});
+    const Node tern_num =
+        command_of({Node(1), Node(Symbol("?")), Node(2), Node(Symbol(":")), Node(3)});
+    const Node call = command_of({Node(Symbol("f")), Node(Symbol("+")), Node(1), Node(2)});
+    const Node prefix =
+        command_of({Node(Symbol("<=")), Node(0.3), Node::var(Symbol("v")), Node(0.7)});
+    const Node f_minus = command_of({Node(Symbol("f")), Node(Symbol("-")), Node(1)});
+    // An even brace whose head is an operand would read as malformed infix: quoted too.
+    const Node handler =
+        command_of({Node::var(Symbol("obj")), Node(Symbol("<=")), Node(1), Node(2)});
+    const Node bare = command_of({Node(0.3), Node(Symbol("-"))});
+    CHECK(to_string(plus) == "{+ '-' 1}");
+    CHECK(to_string(minus) == "{- - -}");  // bare symbols only: the guard keeps it a command
+    CHECK(to_string(tern) == "{a ? b : c}");
+    CHECK(to_string(tern_num) == "{1 ? 2 : 3}");  // `?` is no operator
+    CHECK(to_string(call) == "{f + 1 2}");        // an even count under a call's head: today's text
+    CHECK(to_string(prefix) == "{<= 0.3 $v 0.7}");
+    CHECK(to_string(f_minus) == "{f '-' 1}");
+    CHECK(to_string(handler) == "{$obj '<=' 1 2}");
+    CHECK(to_string(bare) == "{0.3 '-'}");
+    const auto root = root_of({plus, minus, tern, tern_num, call, prefix, f_minus, handler, bare});
+    check_round_trip(*root);
+    const auto again = parse(to_dta(*root));
+    for (const Node& n : *again) CHECK_FALSE(n.array()->written_infix());
+}
+
+TEST_CASE("a command flagged written infix prints infix and reads back flagged") {
+    const std::string text =
+        "(pass {0.3 <= $value <= 0.7})\n{$i += 1}\n{- - 5}\n{$kind == 'bacon and eggs'}\n"
+        "{1 + - + 2}\n";
+    auto root = parse(text);
+    CHECK(to_dta(*root) == text);
+    auto again = parse(to_dta(*root));
+    CHECK(structurally_equal(*root, *again));
+    for (size_t i = 1; i < again->size(); ++i) CHECK((*again)[i].array()->written_infix());
+    // A C++-built chain a tool flags prints infix; flagged but unfit (symbols only), prefix.
+    auto sum = root_of({Node(Symbol("+")), Node(1), Node(2), Node(3)});
+    sum->set_written_infix(true);
+    CHECK(to_string(Node(sum, Type::Command)) == "{1 + 2 + 3}");
+    auto syms = root_of({Node(Symbol("+")), Node(Symbol("a")), Node(Symbol("b"))});
+    syms->set_written_infix(true);
+    CHECK(to_string(Node(syms, Type::Command)) == "{+ a b}");
+    auto one = root_of({Node(Symbol("-")), Node(5)});
+    one->set_written_infix(true);
+    CHECK(to_string(Node(one, Type::Command)) == "{- 5}");
+    auto four = root_of({Node(Symbol("if")), Node(1), Node(2), Node(3), Node(4)});
+    four->set_written_infix(true);
+    CHECK(to_string(Node(four, Type::Command)) == "{if 1 2 3 4}");
+    // An operator that would open a comment, `/*`, never prints between operands.
+    auto comment = root_of({Node(Symbol("/*")), Node(1), Node(2)});
+    comment->set_written_infix(true);
+    CHECK(to_string(Node(comment, Type::Command)) == "{'/*' 1 2}");
+    // The flag is not equality, and set() on a flagged command keeps the printer honest.
+    CHECK(structurally_equal(*sum, *parse("{+ 1 2 3}")->begin()->array()));
+    const_cast<Array&>(*sum).set(1, Node(Symbol("a")));
+    CHECK(to_string(Node(sum, Type::Command)) == "{a + 2 + 3}");
+    const_cast<Array&>(*sum).set(2, Node(Symbol("b")));
+    const_cast<Array&>(*sum).set(3, Node(Symbol("c")));
+    CHECK(to_string(Node(sum, Type::Command)) == "{+ a b c}");
+}
+
+TEST_CASE("a long infix command wraps one operand a line, the operator ending each line") {
+    auto root = parse(
+        "(measure {{hearth.events stuck} + {hearth.events oscillating} + "
+        "{hearth.events starving} + {hearth.events script_errors}})");
+    CHECK(to_dta(*root, {.indent = 3, .width = 60}) ==
+          "(measure\n"
+          "   {{hearth.events stuck} +\n"
+          "      {hearth.events oscillating} +\n"
+          "      {hearth.events starving} +\n"
+          "      {hearth.events script_errors}})\n");
+    check_round_trip(*root);
 }

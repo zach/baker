@@ -19,12 +19,12 @@ namespace fs = std::filesystem;
 namespace {
 
 const char* const kBase =
-    "(pack game_data (level game) (version \"1.2\"))\n"
+    "#pack (game_data (level game) (version \"1.2\"))\n"
     "(event (xp 1) (drops 5))\n";
 
 const char* const kOverlay =
-    "(pack double_xp (level live) (requires (game_data \"1.2\")))\n"
-    "(origin \"liveops ticket 7\" (tool publisher))\n"
+    "#pack (double_xp (level live) (requires (game_data \"1.2\")))\n"
+    "#origin (\"liveops ticket 7\" (tool publisher))\n"
     "(event (xp 2))\n";
 
 bool has_pack(const Config& cfg, const char* name) {
@@ -144,7 +144,7 @@ TEST_CASE("a push with a policy sees the warnings its read adds") {
     cfg.session().set_pack_levels({"game", "live"});
     REQUIRE(cfg.push_layer("default", dir.write("default.dta", kBase)));
     const char* const newer =
-        "(pack season_two (level live) (requires (game_data \"1.3\")))\n(event (xp 3))\n";
+        "#pack (season_two (level live) (requires (game_data \"1.3\")))\n(event (xp 3))\n";
     const LayerPolicy strict{.data_only = true, .warnings_refuse = true};
     auto pushed = cfg.push_layer_text("season_two", newer, {.policy = &strict});
     REQUIRE_FALSE(pushed);
@@ -389,4 +389,26 @@ TEST_CASE("set_layer_text replaces a text layer in place; the same bytes change 
     CHECK(client.set_layer_text("nope", "").error().code() == ErrorCode::NotFound);
     CHECK(client.set_layer_text("base", "").error().code() == ErrorCode::Refused);
     CHECK(client.set_layer_text("scratch", "").error().code() == ErrorCode::Refused);
+}
+
+TEST_CASE("a received layer's #shape is refused under data_only or scalars_only") {
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer_text("default",
+                                "#shape (item (price int (@range 0 1000)))\n"
+                                "(shop (sword (price 50)))\n"));
+    // The overlay widens the range its own value is checked against.
+    const char* overlay =
+        "#shape (item (price int (@range 0 99999)))\n(shop (sword (price 5000)))\n";
+    for (const LayerPolicy policy :
+         {LayerPolicy{.data_only = true}, LayerPolicy{.scalars_only = true}}) {
+        const LayerReport r = ok(cfg.check_layer_text("overlay", overlay, policy));
+        REQUIRE(r.refusals.size() == 1);
+        CHECK(std::string(r.refusals[0].message()) ==
+              "#shape 'item' declares a shape; the layer may change data only");
+        CHECK(r.refusals[0].line() == 1);
+    }
+    CHECK(ok(cfg.check_layer_text("overlay", "(shop (sword (price 60)))\n",
+                                  {.data_only = true, .scalars_only = true}))
+              .ok());
+    CHECK(ok(cfg.check_layer_text("overlay", overlay, {.existing_only = true})).refusals.empty());
 }

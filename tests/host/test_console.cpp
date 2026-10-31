@@ -79,7 +79,7 @@ TEST_CASE("the console answers a person and a tool, each reply ending with an em
         c.send_text("{double 21}\n");
         CHECK(c.reply(console) == "=> 42");
         c.send_text("(7 {double 4})\r\n");  // a tool's request; \r\n is a line end too
-        CHECK(c.reply(console) == R"({"schema":"baker.reply/1.1","id":7,"ok":true,)"
+        CHECK(c.reply(console) == R"({"schema":"baker.reply/1.2","id":7,"ok":true,)"
                                   R"("text":"8","value":8})");
         c.send_text("{double}\n");  // a mistake, for a person: the error and its stack
         const std::string error = c.reply(console);
@@ -131,7 +131,7 @@ TEST_CASE("a large reply reaches the client whole") {
         c.send_text("(1 {big 2000000})\n");
         const std::string reply = c.reply(console);
         CHECK(reply.size() > 4'000'000);
-        CHECK(reply.rfind(R"({"schema":"baker.reply/1.1","id":1,"ok":true,)", 0) == 0);
+        CHECK(reply.rfind(R"({"schema":"baker.reply/1.2","id":1,"ok":true,)", 0) == 0);
     }
 }
 

@@ -40,6 +40,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -184,6 +185,8 @@ public:
     [[nodiscard]] Expected<void> store(Node v) const;
     // The variable's value (Int 0 if unset); for a property, its value or Int 0.
     [[nodiscard]] Node load() const;
+    // Whether the variable is set; a property counts as set.
+    [[nodiscard]] bool is_set() const noexcept;
 
 private:
     Node* cell_ = nullptr;
@@ -230,6 +233,38 @@ inline constexpr bool is_raw<Raw<T>> = true;
 template <class T>
 inline constexpr bool is_raw<std::optional<Raw<T>>> = true;
 
+// A callable to be copied or moved into a Shared out of line, so that a binding's
+// registration inlines only these words. `construct` makes it at `to` from `from`;
+// size 0 is an empty callable, which invoke makes where it calls it and nothing keeps.
+struct ErasedCallable {
+    void* from = nullptr;
+    size_t size = 0;
+    size_t align = 0;
+    void (*construct)(void* to, void* from) = nullptr;
+    void (*destroy)(void* object) noexcept = nullptr;
+};
+
+// A callable with no state, which invoke makes for each call instead of reading one. Trivially
+// default-constructible, so it can be made as a constant: a functor whose default constructor
+// its author wrote is boxed like one with state.
+template <class Fn>
+inline constexpr bool kStateless = std::is_empty_v<Fn> && std::is_trivially_copyable_v<Fn> &&
+                                   std::is_trivially_default_constructible_v<Fn>;
+
+template <class F>
+ErasedCallable erase_callable(F&& f) noexcept {
+    using Fn = std::remove_cvref_t<F>;
+    if constexpr (kStateless<Fn>) {
+        return {};
+    } else {
+        return {const_cast<void*>(static_cast<const void*>(&f)), sizeof(Fn), alignof(Fn),
+                [](void* to, void* from) {
+                    ::new (to) Fn(std::forward<F>(*static_cast<std::remove_reference_t<F>*>(from)));
+                },
+                [](void* object) noexcept { static_cast<Fn*>(object)->~Fn(); }};
+    }
+}
+
 // A refcounted, type-erased, immutable object: the callable behind a function. get() is
 // one load, as std::shared_ptr's is. From an owner's allocator, which must outlive it (a
 // Context's natives and script bodies), else the default allocator.
@@ -245,6 +280,8 @@ public:
         s.object_ = &box->value;
         return s;
     }
+    // Boxes the callable `c` describes, out of line: what a binding registers.
+    [[nodiscard]] static Shared make_erased(const Allocator& alloc, const ErasedCallable& c);
     template <class T, class... A>
     [[nodiscard]] static Shared make(A&&... a) {
         return make_in<T>(default_allocator(), std::forward<A>(a)...);
@@ -552,7 +589,15 @@ Expected<Node> invoke(const void* callable, [[maybe_unused]] Args& args,
               ...);
     }
     if (ok) {
-        const F& f = *static_cast<const F*>(callable);
+        // A stateless callable is not kept, so nothing is read for it.
+        const F& f = [&]() -> const F& {
+            if constexpr (kStateless<F>) {
+                static constexpr F kMade{};
+                return kMade;
+            } else {
+                return *static_cast<const F*>(callable);
+            }
+        }();
         if constexpr (std::is_void_v<R>)
             f(Param<P>::pass(*slot<I>(held))...);
         else
@@ -603,27 +648,29 @@ struct ParamTable {
     static constexpr Storage kStorage = build();
 };
 
+// A native binding as its registration needs it: built inline, all constants but the
+// callable's address, and made into an Overload out of line by make_native.
+struct NativeDesc {
+    Overload::Thunk thunk = nullptr;
+    std::span<const ParamInfo> params;
+    std::string_view result;
+    ErasedCallable callable;
+};
+
 template <class F, class R, class... P>
-Overload make_overload(F&& f, TypeList<P...>*, const Allocator& alloc = default_allocator()) {
+NativeDesc describe_native(F&& f, TypeList<P...>*) noexcept {
     using Fn = std::remove_cvref_t<F>;
     using Table = ParamTable<P...>;
-    Overload o;
-    o.thunk = [](const void* c, Args& a) {
-        return invoke<Fn, R, P...>(c, a, std::index_sequence_for<P...>{});
-    };
-    o.callable = Shared::make_in<Fn>(alloc, std::forward<F>(f));
-    o.result = result_name<R>();
-    o.params = std::span<const ParamInfo>(Table::kStorage.items, Table::kCount);
-    for (const ParamInfo& p : o.params) {
-        if (p.kind == ParamKind::Rest) {
-            o.max_args = UINT32_MAX;
-            break;
-        }
-        ++o.max_args;
-        if (p.kind != ParamKind::Optional) o.min_args = o.max_args;
-    }
-    return o;
+    return {[](const void* c, Args& a) {
+                return invoke<Fn, R, P...>(c, a, std::index_sequence_for<P...>{});
+            },
+            std::span<const ParamInfo>(Table::kStorage.items, Table::kCount), result_name<R>(),
+            erase_callable(std::forward<F>(f))};
 }
+
+// The Overload `native` describes, its callable boxed in `alloc`, and its arity counted.
+[[nodiscard]] Overload make_native(const NativeDesc& native,
+                                   const Allocator& alloc = default_allocator());
 
 }  // namespace detail
 
@@ -631,11 +678,17 @@ Overload make_overload(F&& f, TypeList<P...>*, const Allocator& alloc = default_
 class FuncRef {
 public:
     explicit FuncRef(void* function) noexcept : f_(function) {}
-    FuncRef& doc(std::string_view text);
+    // Inline, and nothing under BAKER_SHIPPING: a shipping build carries no doc text, the
+    // game's own included.
+    FuncRef& doc(std::string_view text) {
+        if constexpr (!kShipping) set_doc(text);
+        return *this;
+    }
     // `replacement` names what to use instead of a Deprecated function.
     FuncRef& status(Status status, Symbol replacement = {});
 
 private:
+    void set_doc(std::string_view text);
     void* f_;
 };
 
@@ -749,6 +802,14 @@ struct CallFrame {
     const CallFrame* parent;
 };
 
+// Whether calls count steps for Context::set_step_budget: CMake's BAKER_STEP_BUDGET, on
+// unless a game turns it off.
+#if defined(BAKER_STEP_BUDGET) && !BAKER_STEP_BUDGET
+inline constexpr bool kStepBudget = false;
+#else
+inline constexpr bool kStepBudget = true;
+#endif
+
 class Context {
 public:
     // Everything the Context keeps comes from `allocator`, which must outlive it.
@@ -795,9 +856,9 @@ public:
     template <class F>
     [[nodiscard]] Expected<FuncRef> func(Symbol name, F&& f) {
         using Sig = detail::signature_of<F>;
-        return add_overload(name, detail::make_overload<F, typename Sig::result>(
-                                      std::forward<F>(f),
-                                      static_cast<typename Sig::params*>(nullptr), allocator()));
+        return add_native(name,
+                          detail::describe_native<F, typename Sig::result>(
+                              std::forward<F>(f), static_cast<typename Sig::params*>(nullptr)));
     }
     [[nodiscard]] bool has_func(Symbol name) const noexcept;
     // Registers `name` from a description of its overloads rather than from a C++ callable:
@@ -825,7 +886,11 @@ public:
     // The variable `name`, created unset if new.
     [[nodiscard]] VarRef var(Symbol name);
     // A documented global: sets `name` to `initial` and lists it in the reference.
-    VarRef global(Symbol name, Node initial, std::string_view doc = {});
+    // `doc` is for the reference: a shipping build does not keep it.
+    VarRef global(Symbol name, Node initial, std::string_view doc = {}) {
+        if constexpr (kShipping) return add_global(name, std::move(initial), {});
+        return add_global(name, std::move(initial), doc);
+    }
 
     // --- Objects (object.hpp: Object<T>, Binder<T>). ---
 
@@ -861,6 +926,27 @@ public:
     // thread; release builds nest about 400 calls in it, debug builds fewer. Raise it on a
     // thread with a larger stack.
     void set_stack_budget(size_t bytes) noexcept;
+
+    // The execution budget: every call (of a native or script function, or a message to an
+    // object) spends one step, so the count is the same on every run of the same script, as
+    // a replay or a headless simulation needs. Script has no loop that is not a call, so a
+    // runaway {func} from a mod or a live overlay spends it too. When the last step is
+    // spent, the hook, if set, is asked for more: it returns how many it grants (it may check
+    // the time, or sample the call stack, as a profiler would), and 0 ends the call that ran
+    // out with a Limit error, which unwinds as any error does. The hook sees steps_left() at
+    // 0, and its grant adds to a budget it sets; a call it makes cannot ask it again. Without
+    // a hook the call fails at once. The steps left stay at 0 until set again, so the scripts
+    // that follow fail too: set them once a frame, or before each command a console runs. A
+    // Scheduler's tick stops there: the task that ran out has the error, and the tasks after
+    // it run at the next tick, in order. The default,
+    // kUnlimitedSteps, is never spent in practice. Costs one decrement a call; a build with
+    // BAKER_STEP_BUDGET off (kStepBudget false) compiles the check out, and then
+    // set_step_budget and set_step_hook do nothing and steps_left is kUnlimitedSteps.
+    static constexpr uint64_t kUnlimitedSteps = UINT64_MAX;
+    using StepHook = uint64_t (*)(void* user, Context& ctx);
+    void set_step_budget(uint64_t steps) noexcept;
+    [[nodiscard]] uint64_t steps_left() const noexcept;
+    void set_step_hook(StepHook hook, void* user = nullptr) noexcept;
 
     // --- Debugging. ---
 
@@ -916,6 +1002,9 @@ public:
 private:
     friend struct detail::ToolsAccess;
     [[nodiscard]] Expected<FuncRef> add_overload(Symbol name, detail::Overload overload);
+    VarRef add_global(Symbol name, Node initial, std::string_view doc);
+    // func(), out of line: everything a binding does but describe itself.
+    [[nodiscard]] Expected<FuncRef> add_native(Symbol name, const detail::NativeDesc& native);
     void add_type(const detail::TypeRecord& type);
     [[nodiscard]] Error resolve_error(const Node& object, std::string_view type) const;
 
@@ -939,7 +1028,8 @@ void script_backtrace(TextSink out);
 // Given `options.packs`, the session that loaded the trees, it also applies the one-way
 // rule to calls: a call, in a pack's file, to a script function defined in a
 // softer pack's file is a warning, once per pack and function; and each pack that declares
-// (owners ...) with fewer than two is a finding.
+// (owners ...) with fewer than two is a finding. The #shape forms the session read are
+// checked with the trees, so a rule's calls are demand too.
 void check(std::span<const Array* const> trees, const Context& ctx, CheckReport& report,
            const CheckOptions& options = {});
 void check(const Array& tree, const Context& ctx, CheckReport& report,
@@ -962,7 +1052,7 @@ void check(const Config& cfg, const Context& ctx, CheckReport& report,
 [[nodiscard]] Callback<void(const ValidatorStack& stack, const Callback<void(const Error&)>& warn)>
 check_validator(const Context& ctx, const CheckOptions& options = {});
 
-// Evaluates one line from a tool and writes one line of JSON (schema baker.reply/1.1,
+// Evaluates one line from a tool and writes one line of JSON (schema baker.reply/1.2,
 // docs/reply-json.md). A request is (ID {command}), its ID an int, symbol or string that
 // the reply echoes; any other line is evaluated whole, with a null id, as eval(text) would.
 // The reply holds the result's printed form ("text", the authority) and a JSON projection
@@ -972,12 +1062,26 @@ void eval_request(Context& ctx, std::string_view line, TextSink reply);
 
 // --- Template definitions. ---
 
+namespace detail {
+// Whether argument `n` is read as written, not evaluated first: a literal, or anything once
+// the arguments are evaluated. A command, a [property] or a $variable is evaluated.
+// The test is made for a number too: leaving it to the read saved 14 instructions and made
+// {add $x 1} 24% slower, a read that must fail first.
+[[nodiscard]] constexpr bool evaluated_first(Type t) noexcept {
+    return t == Type::Command || t == Type::Property || t == Type::Var;
+}
+template <class T>
+[[nodiscard]] constexpr bool read_as_written(const Node& n, bool evaluated) noexcept {
+    return evaluated || !evaluated_first(n.type());
+}
+}  // namespace detail
+
 template <class T>
 Expected<T> Args::get(size_t i) const {
     // The common case: a literal that converts.
     if (i < size_) {
         const Node& n = base_[i];
-        if (evaluated_ || (n.type() != Type::Command && n.type() != Type::Var)) {
+        if (detail::read_as_written<T>(n, evaluated_)) {
             T out{};
             if (Values(std::span<const Node>(&n, 1), command_).read(0, out)) return out;
         }
@@ -989,7 +1093,7 @@ template <class T>
 bool Args::read_into(size_t i, T& out, Expected<Node>& error) const {
     if (i < size_) {
         const Node& n = base_[i];
-        if (evaluated_ || (n.type() != Type::Command && n.type() != Type::Var))
+        if (detail::read_as_written<T>(n, evaluated_))
             if (Values(std::span<const Node>(&n, 1), command_).read(0, out)) return true;
     }
     return read_slow(i, out, error);
@@ -1012,7 +1116,7 @@ Expected<T> Args::get_slow(size_t i) const {
     if (i >= size_) return Unexpected(type_error(i, Node(), kInfo.name));
     const Node* n = base_ + i;
     Node value;
-    if (!evaluated_ && (n->type() == Type::Command || n->type() == Type::Var)) {
+    if (!evaluated_ && detail::evaluated_first(n->type())) {
         auto r = eval_node(*n);
         if (!r) return Unexpected(std::move(r).error());
         value = std::move(*r);

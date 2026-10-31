@@ -1,0 +1,8 @@
+; Doubl
+(origin "liveops console, ticket 4412" (tool baker-pub) (requires (game_data "1.0")))
+(origin "liveops console, ticket 4412" (tool baker-publish))
+
+(event
+   (xp_multiplier 2)
+   (banner "Double XP all w)))
+(or"))

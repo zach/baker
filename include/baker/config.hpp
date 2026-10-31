@@ -14,8 +14,8 @@
 //
 // Layers merge bottom to top. For each tagged array of a layer, the array with the same
 // tag below is merged into recursively; the layer's values (everything that is not a tagged
-// array) replace the ones below, so (width 3) over (width 2 (range 0 10)) gives
-// (width 3 (range 0 10)). Each layer is read in its own pass, but macros and defines carry
+// array) replace the ones below, so (width 3) over (width 2 (@range 0 10)) gives
+// (width 3 (@range 0 10)). Each layer is read in its own pass, but macros and defines carry
 // upward from the layers below, as from earlier files in one load. load() and merge() are
 // shorthands that push a layer named after the file. A layer pushed with
 // {.optional = true} whose file is missing is an empty layer, and reload() picks the file
@@ -77,6 +77,7 @@
 #include <baker/path.hpp>
 #include <baker/source_map.hpp>
 #include <baker/tweak.hpp>
+#include <baker/write.hpp>
 
 #include <baker/callback.hpp>
 #include <baker/list.hpp>
@@ -106,7 +107,7 @@ struct Source {
     Symbol layer{};  // "scratch" for an unsaved live edit
     Symbol file{};   // empty for a layer with no file (an overlay, scratch)
     int32_t line = 0;
-    // When the file declares (origin "economy.xlsx" (tool sheets-export)): what it was
+    // When the file declares #origin ("economy.xlsx" (tool sheets-export)): what it was
     // generated from, and by what (parse.hpp). Empty otherwise.
     Symbol origin{};
     Symbol tool{};
@@ -125,13 +126,19 @@ struct ConfigOptions {
     // must exist. Shipping builds write none: run the same layers through a development
     // build's Config (a build step), and ship the directory.
     std::string_view cache_dir = {};
+    // The caches it writes leave out metadata (without_metadata): for the build step's
+    // Config whose directory ships to a build that reads no metadata. A tree it reads
+    // from such a cache has none either.
+    bool cache_drop_metadata = false;
 };
 
 // What a layer may change (Config::check_layer, LayerOptions::policy). Each rule is off by
 // default; a refusal names the rule's reason, the path, and the file and line.
 struct LayerPolicy {
-    bool data_only = false;         // no {commands}, [properties], $variables, or #autorun
-    bool scalars_only = false;      // every value an int, float, symbol, or string; no removals
+    // no {commands}, [properties], $variables, #autorun, or #shape
+    bool data_only = false;
+    // every value an int, float, symbol, or string; no removals, no #shape
+    bool scalars_only = false;
     bool existing_only = false;     // change only values the stack already has: no new keys, no
                                     // removals
     bool warnings_refuse = false;   // a validator's or the read's warning refuses too
@@ -162,6 +169,11 @@ struct ValidatorOptions {
 struct LayerOptions {
     bool optional = false;  // a missing file is not an error; the layer exists, empty
     bool enabled = true;    // disabled layers keep their position but are skipped by merge
+    // A condition on the session's defines, as #ifdef reads them, written as a project file's
+    // (when COND) holds it: a define's name, (not C), (and C C...) or (or C C...), read
+    // unexpanded. While it does not hold, the layer is skipped by merge as a disabled
+    // one is; set_defines and set_layer_enabled apply it again. Read at the push and kept.
+    std::string_view when = {};
     // Where push_layer places the layer: directly below or above the named layer, instead of
     // on top. A file layer placed under others re-reads them, as remove_layer does,
     // because they read with the macros below them. Read at the push, never kept.
@@ -249,11 +261,17 @@ struct StackFile {
 
 struct LayerEffectEntry {
     Symbol path;                // dotted, as get<T>() takes it
-    Node value;                 // this layer's value
+    Node value;                 // this layer's value; a verb's operands; #remove
     std::optional<Node> below;  // the stack's value without this layer, if any
     Source source;              // provenance, as source() returns it
     std::optional<Source> below_source;
     bool shadowed = false;  // a higher enabled layer (or scratch) overrides this path
+    Symbol op;              // the row's verb: #append, #drop or #remove; empty for a value
+    bool stale = false;     // the row's (@was ...) pin is not `below`
+    // A declaration the layer's read made, not a value: #shape, #pack or #origin. `path` is
+    // then the shape's or pack's name, or the file an origin describes; `value` its form;
+    // `below` the same declaration from a layer below, if any.
+    Symbol declares;
 };
 
 // What a LayerReport was made against, so that a push can tell whether it still holds
@@ -448,8 +466,12 @@ public:
     [[nodiscard]] Expected<void> set_layer_enabled(std::string_view name, bool enabled);
     // Returns the new state.
     [[nodiscard]] Expected<bool> toggle_layer(std::string_view name);
-    // False for an unknown layer.
+    // Whether the layer is in the merge: enabled, and its condition (LayerOptions::when)
+    // holding. False for an unknown layer.
     [[nodiscard]] bool layer_enabled(std::string_view name) const;
+    // The layer's condition as read, `(and PC (not DEMO))`, or nothing for a layer without
+    // one or an unknown layer.
+    [[nodiscard]] std::optional<Node> layer_condition(std::string_view name) const;
     // The layer's own tree, as read, before any merge; null for an unknown layer and for
     // scratch. For tools such as shape::validator, which read it; changing it changes
     // nothing until the next merge, and is not supported.
@@ -463,6 +485,11 @@ public:
     // unchanged is a no-op on a receiver's reload. NotFound for an unknown layer. Allocates
     // only for the text; <baker/std_interop.hpp> has a std::string form.
     [[nodiscard]] Expected<void> layer_text(std::string_view name, TextSink out) const;
+    // The layout of the text this Config writes: layer_text, and the forms write-back and
+    // promote add to a layer's file. WriteOptions' house layout until set;
+    // open_project sets the project's (format ...).
+    void set_layout(const WriteOptions& layout) noexcept;
+    [[nodiscard]] const WriteOptions& layout() const noexcept;
 
     // A digest of the data, for hosts that must agree on it: lockstep peers, a replay, a
     // save loaded under other data. 64 bits, the same on every platform and build for the
@@ -595,7 +622,10 @@ public:
     void set_journal_history(size_t capacity);
 
     [[nodiscard]] Expected<WriteReport> write_back(const Path& path);
-    [[nodiscard]] Expected<WriteReport> write_back_to(const Path& path, std::string_view layer);
+    // `pin`: the row also carries `(@was v...)`, the stack's value below `layer` as it is now,
+    // so that a check of the layer warns once that value moves.
+    [[nodiscard]] Expected<WriteReport> write_back_to(const Path& path, std::string_view layer,
+                                                      bool pin = false);
     // Writes every entry of tools::layer_effect(from) into `to`'s file, or nothing: on any
     // refusal the report lists them all and no file changes. `from` stays in the stack.
     [[nodiscard]] Expected<WriteReport> promote(std::string_view from, std::string_view to);

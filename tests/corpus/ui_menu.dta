@@ -23,16 +23,16 @@
          (text "Quit")
          (color WHITE)
          (select
-            {if {== $platform pc}
+            {if {$platform == pc}
                {game quit}
                {ui show_message "quit_unavailable"}})))
    (enter
-      {set $menu_enter_count {+ $menu_enter_count 1}}
+      {$menu_enter_count += 1}
       {do ($i)
          {set $i 0}
-         {while {< $i kMaxPlayers}
+         {while {$i < kMaxPlayers}
             {player_join $i}
-            {set $i {+ $i 1}}}})
+            {$i += 1}}})
    (focus_ring [focus_ring color])
    (scroll_speed 600.0))
 

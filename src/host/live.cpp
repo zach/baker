@@ -61,7 +61,7 @@ struct Live::Impl {
 };
 
 Live::Live(Context& ctx, const ConfigOptions& config)
-    : impl_(detail::create<Impl>(default_allocator(), ctx, config)) {
+    : impl_(detail::create<Impl>(default_allocator(MemoryKind::Tools), ctx, config)) {
     Impl& im = *impl_;
     im.cfg.set_warning_handler([this](const Error& e) { impl_->log(e); });
     im.cfg.set_time_source([](void*) { return file_clock_now_ns(); });
@@ -71,7 +71,7 @@ Live::Live(Context& ctx, const ConfigOptions& config)
 }
 
 Live::~Live() {
-    detail::destroy(default_allocator(), impl_);
+    detail::destroy(default_allocator(MemoryKind::Tools), impl_);
 }
 
 Expected<void> Live::open(const LiveOptions& options) {
@@ -132,7 +132,7 @@ Expected<void> Live::open(const LiveOptions& options) {
             im.rewatch();
         }
         if (options.console_port || options.console_any_port) {
-            im.console = Own<Console>::make(default_allocator(), im.ctx);
+            im.console = Own<Console>::make(default_allocator(MemoryKind::Tools), im.ctx);
             if (!im.console->listen(options.console_any_port ? 0 : options.console_port)) {
                 im.log(make_error(ErrorCode::Io, "the console cannot listen on 127.0.0.1:" +
                                                      detail::decimal(options.console_port)));

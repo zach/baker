@@ -67,6 +67,7 @@ Symbol standing_name(Standing s) {
         case Standing::Shadowed: return Symbol("shadowed");
         case Standing::Removes: return Symbol("removes");
         case Standing::Disabled: return Symbol("disabled");
+        case Standing::Composes: return Symbol("composes");
     }
     return {};
 }
@@ -88,6 +89,7 @@ Expected<Node> explain_node(Config& cfg, std::string_view path) {
         fields.push_back(tagged("layer", Node(e.layer)));
         fields.push_back(tagged("value", e.value));
         fields.push_back(tagged("standing", Node(standing_name(e.standing))));
+        if (!e.op.empty()) fields.push_back(tagged("op", Node(e.op)));
         add_source(fields, e.source, false);
         if (e.section) {  // (chosen_by server ifdef): the define behind the value
             Vec<Node> by;
@@ -98,6 +100,7 @@ Expected<Node> explain_node(Config& cfg, std::string_view path) {
                                                           : "ifdef"));
             fields.push_back(list(by));
         }
+        if (e.when) fields.push_back(tagged("when", *e.when));  // (when (not DEMO))
         out.push_back(list(fields));
     }
     return list(out);
@@ -176,7 +179,8 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
     bind(
         "config.explain", [tools](Name path) { return explain_node(tools->cfg, path.text); },
         "Every contributor to a path's value, bottom to top: each entry's layer, value, "
-        "standing (wins, shadowed, removes, disabled), file, and line.");
+        "standing (wins, shadowed, removes, composes, disabled), op (#append, #drop, #remove), "
+        "file, and line.");
     bind(
         "config.layers",
         [tools]() -> Node {
@@ -199,16 +203,20 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             for (const LayerEffectEntry& e : *effect) {
                 Vec<Node> f;
                 f.push_back(tagged("path", Node(e.path)));
+                if (!e.declares.empty()) f.push_back(tagged("declares", Node(e.declares)));
                 f.push_back(tagged("value", e.value));
+                if (!e.op.empty()) f.push_back(tagged("op", Node(e.op)));
                 if (e.below) f.push_back(tagged("below", *e.below));
                 add_source(f, e.source, false);
                 f.push_back(tagged("shadowed", Node(int64_t{e.shadowed})));
+                if (e.stale) f.push_back(tagged("stale", Node(int64_t{1})));
                 out.push_back(list(f));
             }
             return list(out);
         },
-        "What a layer changes: each path, its value, the value below it, its file and line, "
-        "and whether a layer above shadows it.");
+        "What a layer changes: each path, its value, its verb (op) if it composes or removes, "
+        "the value below it, its file and line, whether a layer above shadows it, and (stale 1) "
+        "when its (@was ...) pin no longer names the value below.");
     bind(
         "config.diff",
         [tools](Name a, Name b) -> Expected<Node> {
@@ -218,13 +226,17 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             for (const DiffEntry& d : *diff) {
                 Vec<Node> f;
                 f.push_back(tagged("path", Node(d.path)));
+                if (!d.declares.empty()) f.push_back(tagged("declares", Node(d.declares)));
                 if (d.a) f.push_back(tagged("a", *d.a));
+                if (!d.op_a.empty()) f.push_back(tagged("op_a", Node(d.op_a)));
                 if (d.b) f.push_back(tagged("b", *d.b));
+                if (!d.op_b.empty()) f.push_back(tagged("op_b", Node(d.op_b)));
                 out.push_back(list(f));
             }
             return list(out);
         },
-        "The paths two layers set differently, with each one's value (absent: not set).");
+        "The paths two layers set differently, with each one's value (absent: not set) and "
+        "verb (op_a, op_b).");
 
     if constexpr (!kShipping) {
         // --- Live edits and telemetry: development builds only. ---

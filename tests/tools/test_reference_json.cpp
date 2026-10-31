@@ -69,17 +69,19 @@ TEST_CASE("the reference as JSON lists functions, types, classes, globals, and p
     // A built-in that takes the rest of its arguments.
     CHECK(has(json, R"j("max_args": null)j"));
     // A type: its method, property, and the handler script attached to it.
-    CHECK(has(json, R"j({"name": "Lamp", "bases": [], "methods": [{"name": "dim", )j"
-                    R"j("status": "normal", "replacement": "", "doc": "Dims by `by`.",)j"));
-    CHECK(has(json, R"j("properties": [{"name": "level", "type": "float32", )j"
-                    R"j("doc": "Brightness, 0 to 1."}], "handlers": ["flicker"]})j"));
+    if constexpr (!kShipping) {  // a shipping build keeps no doc text
+        CHECK(has(json, R"j({"name": "Lamp", "bases": [], "methods": [{"name": "dim", )j"
+                        R"j("status": "normal", "replacement": "", "doc": "Dims by `by`.",)j"));
+        CHECK(has(json, R"j("properties": [{"name": "level", "type": "float32", )j"
+                        R"j("doc": "Brightness, 0 to 1."}], "handlers": ["flicker"]})j"));
+    }
     // A class only script defines.
     CHECK(has(json, R"j("script_classes": [)j"
                     "\n"
                     R"j(    {"name": "Ghost", "handlers": ["haunt"]})j"));
-    CHECK(has(json, R"j("globals": [)j"
-                    "\n"
-                    R"j(    {"name": "difficulty", "doc": "1 to 5."})j"));
+    CHECK(has(json, std::string(R"j("globals": [)j") + "\n" +
+                        (kShipping ? R"j(    {"name": "difficulty", "doc": ""})j"
+                                   : R"j(    {"name": "difficulty", "doc": "1 to 5."})j")));
     CHECK(has(json,
               "  \"objects\": [\n"
               R"j(    {"name": "scheduler", "type": "Scheduler"})j"  // the Context's own
@@ -117,8 +119,8 @@ TEST_CASE("given a session, the reference lists its packs and origins") {
     LoadSession session;
     session.set_pack_levels({"engine", "game", "task"});
     REQUIRE(
-        read_string("(pack boss (level game) (owners \"td\") (stage custom))\n"
-                    "(origin \"economy.xlsx\" (tool sheets-export))\n",
+        read_string("#pack (boss (level game) (owners \"td\") (stage custom))\n"
+                    "#origin (\"economy.xlsx\" (tool sheets-export))\n",
                     "boss.dta", session));
     const std::string json = reference_json(ctx, &session);
     CHECK(has(json, R"j({"name": "boss", "level": "game", "file": "boss.dta", )j"

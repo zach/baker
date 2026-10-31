@@ -36,15 +36,16 @@ reads `passed` and shows the lists:
   end. Strings escape `"`, `\`, and control characters (`\n`, `\t`, `\u00XX`); other
   characters are written as they are. Numbers are integers.
 - **Versioning.** `schema` is `baker.check/MAJOR` while the minor version is 0, then
-  `baker.check/MAJOR.MINOR` (now `baker.check/1.4`). A field is only ever added with a new minor version, which old
+  `baker.check/MAJOR.MINOR` (now `baker.check/1.5`). A field is only ever added with a new minor version, which old
   readers can ignore; a field is removed or renamed, or its meaning changed, only with a new
-  major version.
+  major version. 1.5 adds no field: a path to metadata is spelled with its sigil,
+  `box.width.@note`, as the data spells it.
 
 ## The object
 
 | Field | Type | Contents |
 |---|---|---|
-| `schema` | string | `"baker.check/1.4"` |
+| `schema` | string | `"baker.check/1.5"` |
 | `passed` | boolean | `CheckReport::ok()`: no errors, no load problems, no shape or tweak errors, and, when unresolved calls fail, no unresolved demand (1.1; tweak errors 1.3) |
 | `errors` | list of problems | calls with the wrong arguments for every overload |
 | `warnings` | list of problems | the one-way rule: a harder pack calling a softer one's function |
@@ -66,7 +67,7 @@ then `message`:
 
 | Field | Type | Contents |
 |---|---|---|
-| `code` | string | the `ErrorCode`: `syntax`, `range`, `directive`, `io`, `limit`, `type`, `not found`, `refused` |
+| `code` | string | the `ErrorCode`: `syntax`, `range`, `directive`, `io`, `limit`, `type`, `not found`, `refused`, `collision` |
 | `file` | string | where it was found; `""` if unknown |
 | `line` | integer | the line; 0 if unknown (a pack's finding names only its file) |
 | `column` | integer | the column, 1-based, in characters from the line's start; 0 if unknown. A parse error has one; a call or shape problem, located by its array's line, does not (1.2) |

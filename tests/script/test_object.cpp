@@ -129,6 +129,30 @@ TEST_CASE("inheritance: methods and properties are flattened, a derived method r
     CHECK(ok(ctx.eval("{hero heal 2}")).as_int() == 10);
 }
 
+TEST_CASE("a [property] argument is evaluated for a function of one overload") {
+    // `%` has one overload, so its arguments are read as it takes them, not all at once as
+    // an overload set's are; a property among them is read the same either way.
+    Context ctx;
+    Hero hero;
+    ok(ctx.add(hero, "hero"));
+    ok(ctx.eval("{class Creature (rem ($n) {% [hp] $n}) (alive () {not {== [hp] 0}})}"));
+    CHECK(ok(ctx.eval("{hero rem 3}")).as_int() == 1);
+    CHECK(ok(ctx.eval("{hero alive}")).as_int() == 1);
+}
+
+TEST_CASE("+= and -= store through a [property] in a handler") {
+    Context ctx;
+    Hero hero;
+    ok(ctx.add(hero, "hero"));
+    ok(ctx.eval("{class Creature (mend ($n) {+= [hp] $n}) (wound ($n) {-= [hp] $n})}"));
+    CHECK(ok(ctx.eval("{hero mend 2}")).as_int() == 12);
+    CHECK(ok(ctx.eval("{hero wound 5}")).as_int() == 7);
+    CHECK(ok(ctx.eval("{hero get hp}")).as_int() == 7);
+    // Written infix, the same tree.
+    ok(ctx.eval("{class Creature (wound2 ($n) {[hp] -= $n})}"));
+    CHECK(ok(ctx.eval("{hero wound2 1}")).as_int() == 6);
+}
+
 TEST_CASE("a destroyed object leaves a stale handle, never a dangling pointer") {
     Context ctx;
     Node old;
@@ -347,11 +371,17 @@ TEST_CASE("the reference lists types, their methods and properties, and script c
     ctx.add_type<Hero>();
     ok(ctx.eval("{class Person (miss whoosh)} {class Goblin (hit ($n) 0)}"));
     const std::string ref = reference(ctx);
-    CHECK(ref.find("### `Person`\n\n"
-                   "- `{<Person> grow float32}` → float32: Grows by `amount`.\n"
-                   "- `{<Person> shrink float32}` → nothing\n"
-                   "- property `height`: float32\n"
-                   "- `{<Person> miss}` (script)\n") != std::string::npos);
+    // A shipping build keeps no doc text.
+    CHECK(ref.find(kShipping ? "### `Person`\n\n"
+                               "- `{<Person> grow float32}` → float32\n"
+                               "- `{<Person> shrink float32}` → nothing\n"
+                               "- property `height`: float32\n"
+                               "- `{<Person> miss}` (script)\n"
+                             : "### `Person`\n\n"
+                               "- `{<Person> grow float32}` → float32: Grows by `amount`.\n"
+                               "- `{<Person> shrink float32}` → nothing\n"
+                               "- property `height`: float32\n"
+                               "- `{<Person> miss}` (script)\n") != std::string::npos);
     CHECK(ref.find("### `Hero`\n\nDerives from `Creature`.\n") != std::string::npos);
     CHECK(ref.find("### `Goblin` (script class)\n\n- `{<Goblin> hit $n}` (script)\n") !=
           std::string::npos);
@@ -371,10 +401,11 @@ TEST_CASE("the reference shows a method's status as it does a function's") {
     Context ctx;
     ctx.add_type<Robot>();
     const std::string ref = reference(ctx);
-    CHECK(ref.find("- `{<Robot> fly}` → nothing *(stub)*\n"
-                   "- `{<Robot> stride int32}` → int32 *(provisional)*\n"
-                   "- `{<Robot> walk int32}` → int32 *(deprecated: use `stride`)*: Walks `n` "
-                   "steps.\n") != std::string::npos);
+    if constexpr (!kShipping)
+        CHECK(ref.find("- `{<Robot> fly}` → nothing *(stub)*\n"
+                       "- `{<Robot> stride int32}` → int32 *(provisional)*\n"
+                       "- `{<Robot> walk int32}` → int32 *(deprecated: use `stride`)*: Walks `n` "
+                       "steps.\n") != std::string::npos);
 }
 
 TEST_CASE("an object deleted during a call stays until the host's eval returns") {

@@ -18,6 +18,7 @@ enum class TextTokenKind : uint8_t {
     Variable,      // $name
     Directive,     // #name
     Macro,         // a symbol this text defines as a macro, [name ...] at the top level
+    PathKey,       // a row's key: (/a.b.c ...) at the top level
 };
 struct TextToken {
     TextTokenKind kind{};
@@ -32,6 +33,13 @@ struct TextBracket {
     uint32_t end = 0;     // past its close; the text's end when it is not closed
     int32_t parent = -1;  // the bracket it is in, as an index; -1 at the top level
     int32_t tag = -1;     // its first token, as an index, when that is a symbol; else -1
+    // The directive whose one form it is, as a token's index, at the top level: #pack,
+    // #origin or #shape (NAME ...), a declaration the tree does not hold. -1 for data.
+    int32_t declares = -1;
+    // A brace that reads infix, `{0.3 <= $value <= 0.7}`: its first operator's token, as an
+    // index, which is the command's head; -1 otherwise. A brace with a macro use in it is
+    // left as written, since a macro's body is not known here.
+    int32_t infix = -1;
     bool closed = false;
 };
 struct TextComment {

@@ -98,3 +98,52 @@ TEST_CASE("a layer that does not read under the new defines leaves everything as
     CHECK(cfg.get<int>("mode") == 30);
     CHECK(made(cfg.session()) == std::vector<std::string>{"server host"});
 }
+
+TEST_CASE("a layer's (when COND) keeps it in the merge while its defines hold") {
+    TempDir dir;
+    dir.write("base.dta", "(speed 1) (store open)\n");
+    dir.write("handheld.dta", "(speed 2)\n");
+    dir.write("demo.dta", "(store closed)\n");
+    const Project p =
+        ok(read_project(dir.write("baker-project.dta",
+                                  "(project (layers (base \"base.dta\")\n"
+                                  "   (handheld \"handheld.dta\" (when (and HANDHELD (not PC))))\n"
+                                  "   (demo \"demo.dta\" (when DEMO_BUILD))))\n")));
+    REQUIRE(p.layers[1].when == Symbol("(and HANDHELD (not PC))"));
+    Config cfg({.tweaks = nullptr});
+    static constexpr std::string_view kHandheld[] = {"HANDHELD"};
+    REQUIRE(ok(open_project(cfg, p, {.defines = kHandheld})).empty());
+    CHECK(cfg.get<int>("speed") == 2);
+    CHECK(cfg.get<Symbol>("store") == Symbol("open"));
+    CHECK(cfg.layer_enabled("handheld"));
+    CHECK_FALSE(cfg.layer_enabled("demo"));
+    REQUIRE(cfg.layer_condition("demo"));
+    CHECK(to_string(*cfg.layer_condition("demo")) == "DEMO_BUILD");
+    CHECK_FALSE(cfg.layer_condition("base"));
+    // A change of defines applies every condition again, in its one merge.
+    static constexpr std::string_view kDemoOnPc[] = {"HANDHELD", "PC", "DEMO_BUILD"};
+    REQUIRE(cfg.set_defines(kDemoOnPc));
+    CHECK(cfg.get<int>("speed") == 1);
+    CHECK(cfg.get<Symbol>("store") == Symbol("closed"));
+    CHECK_FALSE(cfg.layer_enabled("handheld"));
+    if constexpr (!kShipping) {
+        // Disabled by hand, a layer stays out whatever its condition; enabled, it is under
+        // it again. A toggle says the state that results.
+        REQUIRE(cfg.set_layer_enabled("demo", false));
+        CHECK(cfg.get<Symbol>("store") == Symbol("open"));
+        REQUIRE(cfg.set_defines(kDemoOnPc));
+        CHECK_FALSE(cfg.layer_enabled("demo"));
+        CHECK(ok(cfg.toggle_layer("demo")));
+        CHECK(cfg.get<Symbol>("store") == Symbol("closed"));
+        CHECK_FALSE(ok(cfg.toggle_layer("handheld")));  // PC is defined: it stays out
+        CHECK(cfg.get<int>("speed") == 1);
+    }
+    // A condition that is not one is refused at the push, naming the layer.
+    Config bad({.tweaks = nullptr});
+    for (const std::string_view when : {"(xor A B)", "(not A B)", "(and)", "1", "(A)"}) {
+        auto r = bad.push_layer("odd", dir.path("demo.dta"), {.when = when});
+        REQUIRE_FALSE(r);
+        CHECK(std::string(r.error().message()).find("layer 'odd': its condition is a define") !=
+              std::string::npos);
+    }
+}

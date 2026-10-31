@@ -6,6 +6,7 @@
 // Allocator: the default allocator unless the owner passes its own.
 
 #include <baker/allocator.hpp>
+#include <baker/error.hpp>
 #include <baker/symbol.hpp>
 #include <baker/text.hpp>
 
@@ -59,7 +60,8 @@ public:
         return detail::allocate(*a_, n, __STDCPP_DEFAULT_NEW_ALIGNMENT__);
     }
     void* allocate(size_t n, size_t align, size_t offset, int = 0) {
-        if (offset != 0) std::abort();  // only EASTL's fixed containers ask for an offset
+        // Only EASTL's fixed containers ask for an offset, and Baker uses none.
+        if (offset != 0) detail::fatal("EASTL asked for an allocation at an offset");
         return detail::allocate(*a_, n, align);
     }
     void deallocate(void* p, size_t n) noexcept { detail::deallocate(*a_, p, n); }
@@ -229,7 +231,7 @@ private:
 template <>
 struct Hash<Str> {
     size_t operator()(const Str& s) const noexcept {
-        return static_cast<size_t>(hash_symbol_text(s.view()));
+        return static_cast<size_t>(symbol_hash(s.view()));
     }
 };
 

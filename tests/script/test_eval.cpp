@@ -72,8 +72,11 @@ TEST_CASE("errors name the function and the call site") {
     CHECK(e.line() == 1);
 
     e = eval_error(ctx, "\n\n{+ 1 two}");
-    CHECK(e.message() == "no overload of '+' takes (int symbol); it has (int int) (float float)");
+    CHECK(e.message() == "argument 2 of '+' is symbol, not number");
     CHECK(e.line() == 3);
+    CHECK(eval_error(ctx, "{+ two 1}").message() == "argument 1 of '+' is symbol, not number");
+    CHECK(eval_error(ctx, "{< 1 2 x}").message() == "argument 3 of '<' is symbol, not number");
+    CHECK(eval_error(ctx, "{/ 1}").message() == "'/' takes 2 arguments, given 1");
 
     e = eval_error(ctx, "{not two}");
     CHECK(e.message() == "argument 1 of 'not' is symbol, not bool");
@@ -174,10 +177,10 @@ TEST_CASE("a script stub replaced by a native function runs unchanged call sites
             static_cast<std::vector<std::string>*>(user)->emplace_back(e.message());
         },
         &notices);
-    auto tree =
-        ok(read_string("{func boss.find_cover ($p) (status stub) (doc \"placeholder\") {+ $p 1}}\n"
-                       "(encounter (cover {boss.find_cover 10}))\n",
-                       "boss.dta"));
+    auto tree = ok(
+        read_string("{func boss.find_cover ($p) (@status stub) (@doc \"placeholder\") {+ $p 1}}\n"
+                    "(encounter (cover {boss.find_cover 10}))\n",
+                    "boss.dta"));
     REQUIRE(ctx.run(tree->nodes()));
     const Array& encounter = *tree->try_find("encounter");
     CHECK(encounter.find_int("cover") == 11);  // the stub
@@ -190,6 +193,12 @@ TEST_CASE("a script stub replaced by a native function runs unchanged call sites
     CHECK(reference(ctx).find(
               "### `boss.find_cover`\n\n- `{boss.find_cover int}` → int\n\n*Native.*") !=
           std::string::npos);
+
+    // The metadata is spelled with the sigil: (status 1) as the first form is the body, and
+    // an unknown @word is an error.
+    eval_ok(ctx, "{func first () (@doc \"d\") (status 1)}");
+    CHECK(eval_ok(ctx, "{first}").type() == Type::Array);
+    CHECK(!ctx.eval("{func typo () (@stauts stub) 1}", "test.dta"));
 
     // An arity mismatch is noted.
     eval_ok(ctx, "{func two ($a $b) $a}");
@@ -345,4 +354,189 @@ TEST_CASE("run_autorun restores what the last run's commands defined") {
     const List<Error> failed = ctx.run_autorun(mixed);
     REQUIRE(failed.size() == 1);
     CHECK(ok(ctx.eval("{after}")).try_int() == 1);
+}
+
+TEST_CASE("the step budget: a call a step, the same on every run, refilled by a hook") {
+    Context ctx;
+    ok(ctx.eval("{func fib ($n) {if {< $n 2} $n {+ {fib {- $n 1}} {fib {- $n 2}}}}}"));
+    if constexpr (!kStepBudget) {  // BAKER_STEP_BUDGET off: nothing is counted
+        ctx.set_step_budget(10);
+        CHECK(ok(ctx.eval("{fib 15}")).try_int() == 610);
+        CHECK(ctx.steps_left() == Context::kUnlimitedSteps);
+        return;
+    }
+    int64_t native_calls = 0;
+    ok(ctx.func("tick", [&native_calls] { return ++native_calls; }));
+
+    // Every call spends one, natives too, and the same script spends the same.
+    ctx.set_step_budget(1'000'000);
+    CHECK(ok(ctx.eval("{fib 10}")).try_int() == 55);
+    const uint64_t spent = 1'000'000 - ctx.steps_left();
+    CHECK(spent > 177);  // fib itself is called 177 times
+    ctx.set_step_budget(1'000'000);
+    (void)ok(ctx.eval("{fib 10}"));
+    CHECK(1'000'000 - ctx.steps_left() == spent);
+    ctx.set_step_budget(10);
+    (void)ok(ctx.eval("{tick}"));
+    CHECK(ctx.steps_left() == 9);
+
+    // A runaway recursion ends with a Limit error, and later scripts fail until refilled.
+    ctx.set_step_budget(1000);
+    const auto r = ctx.eval("{fib 30}");
+    REQUIRE_FALSE(r);
+    CHECK(r.error().code() == ErrorCode::Limit);
+    CHECK(r.error().message() == "the step budget ran out (Context::set_step_budget)");
+    CHECK(ctx.steps_left() == 0);
+    CHECK_FALSE(ctx.eval("{tick}"));
+    ctx.set_step_budget(Context::kUnlimitedSteps);
+    CHECK(ok(ctx.eval("{tick}")).try_int() == 2);
+
+    // A hook grants more, as a time check would; 0 ends the call.
+    struct Grants {
+        int asked = 0;
+        int allowed = 3;
+    } grants;
+    ctx.set_step_hook(
+        [](void* user, Context&) -> uint64_t {
+            auto& g = *static_cast<Grants*>(user);
+            return ++g.asked <= g.allowed ? 100 : 0;
+        },
+        &grants);
+    ctx.set_step_budget(100);
+    CHECK(ok(ctx.eval("{fib 8}")).try_int() == 21);  // a few hundred steps, within the grants
+    CHECK(grants.asked >= 1);
+    CHECK_FALSE(ctx.eval("{fib 20}"));
+    CHECK(grants.asked == grants.allowed + 1);
+    // The hook sees the budget at 0, not wrapped; a budget it sets stands, and its grant adds
+    // to it. A call it makes cannot ask it again.
+    struct Seen {
+        uint64_t left = 1;
+        bool nested = false;
+    } seen;
+    ctx.set_step_hook(
+        [](void* user, Context& c) -> uint64_t {
+            auto& s = *static_cast<Seen*>(user);
+            s.left = c.steps_left();
+            c.set_step_budget(50);
+            s.nested = !c.eval("{fib 10}").has_value();  // more than 50: fails, no recursion
+            c.set_step_budget(40);
+            return 10;
+        },
+        &seen);
+    ctx.set_step_budget(0);
+    CHECK(ok(ctx.eval("{tick}")).try_int() == 3);
+    CHECK(seen.left == 0);
+    CHECK(seen.nested);
+    CHECK(ctx.steps_left() == 49);  // 40 set, 10 granted, 1 spent
+    ctx.set_step_hook(nullptr);
+    ctx.set_step_budget(Context::kUnlimitedSteps);
+}
+
+// --- The operators as a vocabulary: variadic, chained, assigning ---
+
+TEST_CASE(
+    "arithmetic folds left over any number of arguments; ints stay ints until a float joins") {
+    Context ctx;
+    CHECK(eval_ok(ctx, "{- 1 2 3}").as_int() == -4);
+    CHECK(eval_ok(ctx, "{+ 1 2 3 4}").as_int() == 10);
+    CHECK(eval_ok(ctx, "{* 2 3 4}").as_int() == 24);
+    CHECK(eval_error(ctx, "{+ 1}").message() == "'+' takes at least 2 arguments, given 1");
+    CHECK(eval_ok(ctx, "{- 5}").as_int() == -5);
+    CHECK(eval_ok(ctx, "{- 2.5}").as_float() == -2.5);
+    CHECK(eval_ok(ctx, "{+ 1 2 0.5}").as_float() == 3.5);
+    CHECK(eval_ok(ctx, "{+ 1 2 0.5}").type() == Type::Float);
+    CHECK(eval_ok(ctx, "{/ 100 4}").as_float() == 25.0);
+    CHECK(eval_ok(ctx, "{/ 100 4}").type() == Type::Float);
+    CHECK(eval_error(ctx, "{/ 100 4 5}").message() == "'/' takes 2 arguments, given 3");
+    CHECK(eval_ok(ctx, "{+ 9223372036854775807 1 1}").as_int() == INT64_MIN + 1);  // wraps
+    CHECK(eval_error(ctx, "{% 7 3 2}").message() == "'%' takes 2 arguments, given 3");
+}
+
+TEST_CASE(
+    "a comparison chain tests every adjacent pair, evaluates each argument once, and stops at the "
+    "first miss") {
+    Context ctx;
+    int evaluations = 0;
+    REQUIRE(ctx.func("value", [&] {
+        ++evaluations;
+        return 0.5;
+    }));
+    ctx.var("value") = 0.5;
+    CHECK(eval_ok(ctx, "{<= 0.3 $value 0.7}").as_int() == 1);
+    CHECK(eval_ok(ctx, "{<= 0.3 {value} 0.7}").as_int() == 1);
+    CHECK(evaluations == 1);
+    ctx.var("value") = 0.8;
+    CHECK(eval_ok(ctx, "{<= 0.3 $value 0.7}").as_int() == 0);
+    CHECK(eval_ok(ctx, "{>= 0.7 $value 0.3}").as_int() == 0);
+    ctx.var("value") = 0.3;
+    CHECK(eval_ok(ctx, "{<= 0.3 $value 0.7}").as_int() == 1);
+    CHECK(eval_ok(ctx, "{< 0.3 $value 0.7}").as_int() == 0);
+    CHECK(eval_ok(ctx, "{< 1 2 3 4}").as_int() == 1);
+    CHECK(eval_ok(ctx, "{< 1 2 2 4}").as_int() == 0);
+    // Equality is not chained: two values, as on main.
+    CHECK(eval_ok(ctx, "{== 1 1.0}").as_int() == 1);
+    CHECK(eval_error(ctx, "{== 1 1 1}").message() == "'==' takes 2 arguments, given 3");
+    // Stops at the first pair that fails: nothing after it is evaluated.
+    int untaken = 0;
+    REQUIRE(ctx.func("untaken", [&] { return ++untaken; }));
+    CHECK(eval_ok(ctx, "{< 3 2 {untaken}}").as_int() == 0);
+    CHECK(untaken == 0);
+    CHECK(eval_error(ctx, "{< 1 two}").message() == "argument 2 of '<' is symbol, not number");
+    CHECK(eval_error(ctx, "{< 1 2 x}").message() == "argument 3 of '<' is symbol, not number");
+    CHECK(eval_error(ctx, "{<= 1}").message() == "'<=' takes at least 2 arguments, given 1");
+}
+
+TEST_CASE(
+    "+= and friends load, apply, store and return the value, over $variables and [properties]") {
+    Context ctx;
+    ctx.var("i") = 0;
+    CHECK(eval_ok(ctx, "{+= $i 1}").as_int() == 1);
+    CHECK(eval_ok(ctx, "{+= $i 1}").as_int() == 2);
+    CHECK(ctx.var("i")->as_int() == 2);
+    CHECK(eval_ok(ctx, "{*= $i 10}").as_int() == 20);
+    CHECK(eval_ok(ctx, "{-= $i 5}").as_int() == 15);
+    CHECK(eval_ok(ctx, "{/= $i 2}").as_float() == 7.5);
+    CHECK(ctx.var("i")->type() == Type::Float);
+    CHECK(eval_ok(ctx, "{do ($n) {set $n 0} {+= $n 1} {+= $n 1} {+= $n 1} $n}").as_int() == 3);
+    // An unset variable is an error, as reading it is; so is a place that holds no number.
+    CHECK(eval_error(ctx, "{+= $fresh 1}").message() == "$fresh is not set");
+    ctx.var("name") = Symbol("bob");
+    CHECK(eval_error(ctx, "{+= $name 1}").message() == "$name holds symbol, not a number");
+    CHECK(eval_error(ctx, "{+= $i x}").message() == "argument 2 of '+=' is symbol, not number");
+    CHECK(eval_error(ctx, "{+= 3 1}").message() ==
+          "argument 1 of '+=' must be a $variable, not int");
+    // `=` is nothing: no silent assignment.
+    CHECK(eval_error(ctx, "{= $i 1}").message() == "'=' is not a function");
+}
+
+TEST_CASE("infix spellings are their prefix trees, so they evaluate as those") {
+    Context ctx;
+    CHECK(eval_ok(ctx, "{1 - 2 - 3}").as_int() == -4);
+    CHECK(eval_ok(ctx, "{1 + 2 + 0.5}").as_float() == 3.5);
+    CHECK(eval_ok(ctx, "{100 / 4}").as_float() == 25.0);
+    CHECK(eval_ok(ctx, "{7 % 3}").as_int() == 1);
+    CHECK(structurally_equal(eval_ok(ctx, "{+ {+ 1 2} 3}"), eval_ok(ctx, "{1 + 2 + 3}")));
+    // A band evaluates $value once, through a counting native.
+    int evaluations = 0;
+    REQUIRE(ctx.func("value", [&] {
+        ++evaluations;
+        return 0.5;
+    }));
+    CHECK(eval_ok(ctx, "{0.3 <= {value} <= 0.7}").as_int() == 1);
+    CHECK(evaluations == 1);
+    ctx.var("value") = 0.8;
+    CHECK(eval_ok(ctx, "{0.3 <= $value <= 0.7}").as_int() == 0);
+    ctx.var("s") = Symbol("a");
+    CHECK(eval_ok(ctx, "{$s == a}").as_int() == 1);  // a variable fires the guard
+    CHECK(eval_ok(ctx, "{$s == b}").as_int() == 0);
+    CHECK(eval_error(ctx, "{$s == a == a}").message() == "'==' takes 2 arguments, given 3");
+    // A mixed pair is nested under and.
+    ctx.var("value") = 5;
+    CHECK(eval_ok(ctx, "{and {0 < $value} {$value <= 10}}").as_int() == 1);
+    CHECK(eval_error(ctx, "{&& 1 1}").message() == "'&&' is not a function");
+    ctx.var("i") = 0;
+    CHECK(eval_ok(ctx, "{$i += 1}").as_int() == 1);
+    CHECK(eval_ok(ctx, "{do ($n) {set $n 0} {$n += 1} {$n += 1} $n}").as_int() == 2);
+    // `=` is nothing: `{$i = 1}` is a call of `=`, never an assignment.
+    CHECK(eval_error(ctx, "{$i = 1}").message() == "'=' is not a function");
 }

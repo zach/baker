@@ -1,7 +1,7 @@
 #pragma once
 
-// Rules between values, declared in shapes and evaluated here: (rule "message" {expression}
-// (warn)) in a shape (<baker/shape.hpp>) holds over each record the shape governs. The shape
+// Rules between values, declared in shapes and evaluated here: (@rule "message" {expression}
+// (@warn)) in a shape (<baker/shape.hpp>) holds over each record the shape governs. The shape
 // library reads rules and cannot run script; this evaluates them. Part of baker::tools.
 
 #include <baker/config.hpp>
@@ -23,7 +23,7 @@ namespace baker::tools {
 void declare_rule_functions(Context& ctx);
 
 // Evaluates each rule of `shapes` over each record of `tree` its shape governs, in `ctx`,
-// into `report`. A rule whose expression is false is an error, or a warning if (warn),
+// into `report`. A rule whose expression is false is an error, or a warning if (@warn),
 // located at the record, its path the record's, carrying the rule's message and each
 // $variable the expression mentions with the record's value:
 //   starts at or below its maximum ($start_hp 12, $max_hp 10)

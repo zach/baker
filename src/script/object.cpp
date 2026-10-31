@@ -56,13 +56,17 @@ void TypeRecord::sort() {
 
 TypeRecord* new_type_record(std::string_view name) {
     // One per bound type, for the life of the program: from the default allocator.
-    auto* r = detail::create<TypeRecord>(default_allocator());
+    auto* r = detail::create<TypeRecord>(default_allocator(MemoryKind::Script));
     r->name = name;
     return r;
 }
 
 void set_type_name(TypeRecord& type, std::string_view name) {
     type.name = name;
+}
+
+MethodEntry* add_native_method(TypeRecord& r, Symbol name, const NativeDesc& native) {
+    return add_method(r, name, make_native(native));
 }
 
 MethodEntry* add_method(TypeRecord& r, Symbol name, Overload o) {
@@ -580,6 +584,10 @@ Node Raw<Var>::load() const {
     if (cell_) return VarRef(cell_, name_).value();
     auto r = ctx_->impl().property_path(*property_);
     return r ? std::move(*r) : Node();
+}
+
+bool Raw<Var>::is_set() const noexcept {
+    return !cell_ || VarRef(cell_, name_).is_set();
 }
 
 // --- Built-ins ---

@@ -66,6 +66,10 @@ BAKER_COLD Expected<Node> too_deep(const Array& command, uint32_t depth, uintptr
                     detail::decimal(static_cast<int64_t>(used / 1024)) + " KB of stack)");
 }
 
+BAKER_COLD Expected<Node> out_of_steps(const Array& command) {
+    return fail(command, ErrorCode::Limit, "the step budget ran out (Context::set_step_budget)");
+}
+
 BAKER_COLD Expected<Node> bad_arity(const Array& command, Symbol name, const detail::Overload& o,
                                     size_t n) {
     return fail(command, ErrorCode::Type, arity_message(name, o.min_args, o.max_args, n));
@@ -195,14 +199,15 @@ Node* Context::Impl::cell(Symbol name) {
     if (!pages[page]) {
         constexpr size_t cells = size_t{1} << kPageBits;
         auto* p = static_cast<Node*>(detail::allocate(alloc, cells * sizeof(Node), alignof(Node)));
-        for (size_t k = 0; k < cells; ++k) ::new (p + k) Node(kUnset);
+        for (size_t k = 0; k < cells; ++k) ::new (p + k) Node(unset_node());
         pages[page] = p;
     }
     return &pages[page][i & ((1u << kPageBits) - 1)];
 }
 
 Context::Impl::~Impl() {
-    for (detail::TypeRecord* t : declared_types) detail::destroy(default_allocator(), t);
+    for (detail::TypeRecord* t : declared_types)
+        detail::destroy(default_allocator(MemoryKind::Script), t);
     constexpr size_t cells = size_t{1} << kPageBits;
     for (Node* p : pages) {
         if (!p) continue;
@@ -236,6 +241,12 @@ Expected<Node> Context::Impl::eval(const Node& n) {
 
 BAKER_INLINE Expected<Node> Context::Impl::call_body(const Array& command, Counters** counted) {
     if (command.empty()) return bad_head(command);
+    // A step a call (Context::set_step_budget). At 0, the hook may grant more.
+    if constexpr (kStepBudget) {
+        if (steps-- == 0) [[unlikely]] {
+            if (!more_steps()) return out_of_steps(command);
+        }
+    }
     // The head names a function, or is an object: named, an Object node, or a command or
     // variable that evaluates to one ("Object commands evaluate slot 0").
     const Node& head = command[0];
@@ -343,23 +354,8 @@ Expected<Node> Context::Impl::invoke_set(Symbol name, const Vec<detail::Overload
         Args args(self, command, command.begin() + first, n, 0, false, first, object);
         return invoke(o, args, command);
     }
-    // Eight on the stack, more from the default allocator. Not a Vec: an empty std::vector
-    // allocates in MSVC's debug library. Not a NodeBuffer: it costs 70 instructions a call.
-    struct Spill {
-        Node* p = nullptr;
-        size_t n = 0;
-        ~Spill() {
-            for (size_t i = 0; i < n; ++i) p[i].~Node();
-            if (p) detail::default_free(p, n * sizeof(Node));
-        }
-    } spill;
-    Node small[8];
-    Node* values = small;
-    if (n > 8) {
-        spill.p = static_cast<Node*>(detail::default_alloc(n * sizeof(Node), alignof(Node)));
-        for (; spill.n < n; ++spill.n) ::new (spill.p + spill.n) Node();
-        values = spill.p;
-    }
+    ArgValues held(spill, n);
+    Node* values = held.data();
     for (size_t i = 0; i < n; ++i) {
         auto r = eval(command[i + first]);
         if (!r) {
@@ -404,8 +400,9 @@ const Allocator& Context::allocator() const noexcept {
 }
 
 Context::Context(const Allocator& allocator)
-    : impl_(detail::create<Impl>(allocator, *this, allocator)) {
+    : impl_(detail::create<Impl>(with_kind(allocator, MemoryKind::Script), *this, allocator)) {
     detail::set_evaluator(&evaluate_for_data);
+    detail::set_fatal_stack(&script_backtrace);  // a fatal error carries the script stack
     if (!t_current) t_current = this;
     impl_->sink = &stderr_sink;
     impl_->trace_sink = &stderr_trace;
@@ -485,7 +482,7 @@ VarRef Context::var(Symbol name) {
     return VarRef(impl_->cell(name), name);
 }
 
-VarRef Context::global(Symbol name, Node initial, std::string_view doc) {
+VarRef Context::add_global(Symbol name, Node initial, std::string_view doc) {
     VarRef v = var(name);
     v = std::move(initial);
     for (Global& g : impl_->globals)
@@ -499,6 +496,39 @@ VarRef Context::global(Symbol name, Node initial, std::string_view doc) {
 
 void Context::set_stack_budget(size_t bytes) noexcept {
     impl_->stack_budget = bytes;
+}
+
+void Context::set_step_budget(uint64_t steps) noexcept {
+    impl_->steps = steps;
+    impl_->steps_out = steps == 0;
+}
+
+uint64_t Context::steps_left() const noexcept {
+    return kStepBudget ? impl_->steps : kUnlimitedSteps;
+}
+
+void Context::set_step_hook(StepHook hook, void* user) noexcept {
+    impl_->step_hook = hook;
+    impl_->step_user = user;
+}
+
+// The decrement that found 0 wrapped: back to 0, so the hook sees what is left and a budget
+// it sets stands; its grant adds to that. A call the hook makes runs on what it set, and
+// cannot ask the hook again. Then one step for the call that asked.
+BAKER_COLD bool Context::Impl::more_steps() {
+    steps = 0;
+    if (step_hook && !in_step_hook) {
+        in_step_hook = true;
+        const uint64_t granted = step_hook(step_user, self);
+        in_step_hook = false;
+        steps = steps > kUnlimitedSteps - granted ? kUnlimitedSteps : steps + granted;
+    }
+    if (steps == 0) {
+        steps_out = true;
+        return false;
+    }
+    --steps;
+    return true;
 }
 
 // --- Debugging ---
@@ -588,6 +618,10 @@ void Context::set_notice_sink(NoticeSink sink, void* user) noexcept {
 
 void Context::notice(const Error& notice) const {
     if (impl_->sink) impl_->sink(impl_->sink_user, notice);
+}
+
+Expected<FuncRef> Context::add_native(Symbol name, const detail::NativeDesc& native) {
+    return add_overload(name, detail::make_native(native, allocator()));
 }
 
 Expected<FuncRef> Context::add_overload(Symbol name, detail::Overload o) {
@@ -723,24 +757,10 @@ Expected<Node> call_declared(const void* callable, Args& args) {
                                                              " was declared from a description, "
                                                              "and has no body to run"));
     if (d.raw) return d.body(args);
-    // Each argument evaluated once and held to its parameter, as a native's: eight on the
-    // stack, more from the default allocator (not a Vec: see Impl::call).
+    // Each argument evaluated once and held to its parameter, as a native's.
     const size_t n = args.size();
-    struct Spill {
-        Node* p = nullptr;
-        size_t n = 0;
-        ~Spill() {
-            for (size_t i = 0; i < n; ++i) p[i].~Node();
-            if (p) detail::default_free(p, n * sizeof(Node));
-        }
-    } spill;
-    Node small[8];
-    Node* values = small;
-    if (n > 8) {
-        spill.p = static_cast<Node*>(detail::default_alloc(n * sizeof(Node), alignof(Node)));
-        for (; spill.n < n; ++spill.n) ::new (spill.p + spill.n) Node();
-        values = spill.p;
-    }
+    ArgValues held(args.context().impl().spill, n);
+    Node* values = held.data();
     for (size_t i = 0; i < n; ++i) {
         auto v = args.eval(i);
         if (!v) return v;
@@ -903,9 +923,8 @@ Expected<FuncRef> Context::declare(Symbol name, std::span<const OverloadDescript
     return ref;
 }
 
-FuncRef& FuncRef::doc(std::string_view text) {
+void FuncRef::set_doc(std::string_view text) {
     static_cast<Function*>(f_)->doc = text;
-    return *this;
 }
 
 FuncRef& FuncRef::status(Status status, Symbol replacement) {
@@ -970,6 +989,55 @@ void Args::keep(Node n) const {
 }
 
 namespace detail {
+Shared Shared::make_erased(const Allocator& alloc, const ErasedCallable& c) {
+    if (c.size == 0) return {};
+    // The callable follows the box's header, at its own alignment.
+    struct Erased : Base {
+        void (*destroy_object)(void*) noexcept;
+        size_t bytes;
+        size_t offset;
+    };
+    const size_t align = c.align > alignof(Erased) ? c.align : alignof(Erased);
+    const size_t offset = (sizeof(Erased) + c.align - 1) / c.align * c.align;
+    const size_t bytes = offset + c.size;
+    auto* box = ::new (allocate(alloc, bytes, align)) Erased{};
+    box->alloc = &alloc;
+    box->destroy_object = c.destroy;
+    box->bytes = bytes;
+    box->offset = offset;
+    box->destroy = [](Base* b) {
+        auto* e = static_cast<Erased*>(b);
+        const Allocator& owner = *e->alloc;
+        const size_t size = e->bytes;
+        e->destroy_object(reinterpret_cast<char*>(e) + e->offset);
+        e->~Erased();
+        deallocate(owner, e, size);
+    };
+    void* object = reinterpret_cast<char*>(box) + offset;
+    c.construct(object, c.from);
+    Shared s;
+    s.base_ = box;
+    s.object_ = object;
+    return s;
+}
+
+Overload make_native(const NativeDesc& native, const Allocator& alloc) {
+    Overload o;
+    o.thunk = native.thunk;
+    o.callable = Shared::make_erased(alloc, native.callable);
+    o.result = native.result;
+    o.params = native.params;
+    for (const ParamInfo& p : o.params) {
+        if (p.kind == ParamKind::Rest) {
+            o.max_args = UINT32_MAX;
+            break;
+        }
+        ++o.max_args;
+        if (p.kind != ParamKind::Optional) o.min_args = o.max_args;
+    }
+    return o;
+}
+
 Expected<Raw<Var>> read_var(const Args& a, size_t i) {
     const Node& n = a.raw(i);
     if (n.type() == Type::Property) return Raw<Var>(a.context(), *n.array());
@@ -989,13 +1057,23 @@ bool VarRef::is_set() const noexcept {
     return !is_unset(*cell_);
 }
 
+namespace {
+// An unset variable's value: constant-initialized and never destroyed, so reading it needs no
+// guard. Its destructor is empty; Clang registers nothing for it, GCC an empty one.
+union Zero {
+    constexpr Zero() noexcept : node(detail::ConstantZero{}) {}
+    ~Zero() {}
+    Node node;
+};
+constinit const Zero kZero;
+}  // namespace
+
 const Node& VarRef::value() const noexcept {
-    static const Node kZero;
-    return is_unset(*cell_) ? kZero : *cell_;
+    return is_unset(*cell_) ? kZero.node : *cell_;
 }
 
 void VarRef::unset() noexcept {
-    *cell_ = kUnset;
+    *cell_ = unset_node();
 }
 
 }  // namespace baker

@@ -232,3 +232,26 @@ TEST_CASE("a C++ object destroyed during a tick leaves its Context at once") {
     ctx.scheduler().tick(1);
     CHECK(ctx.object("other").type() != Type::Object);
 }
+
+TEST_CASE("a spent step budget stops the tick, and the tasks after it run at the next") {
+    if constexpr (!kStepBudget) return;
+    Fixture f;
+    ok(f.ctx.eval("{func fib ($n) {if {< $n 2} $n {+ {fib {- $n 1}} {fib {- $n 2}}}}}"));
+    // A runaway task first, then a well-behaved one.
+    ok(
+        f.ctx.eval("{scheduler thread_task {fib 25}} "
+                   "{scheduler thread_task {log first} {wait_tick} {log second}}"));
+    f.ctx.set_step_budget(1000);
+    f.ctx.scheduler().tick(1);
+    CHECK(f.ctx.steps_left() == 0);
+    CHECK(f.notices.size() == 1);  // the runaway's error, and only its
+    CHECK(f.log.empty());          // the other waits: the budget is spent
+    f.ctx.set_step_budget(1000);
+    f.ctx.scheduler().tick(1);
+    CHECK(f.log == std::vector<std::string>{"first"});
+    f.ctx.set_step_budget(1000);
+    f.ctx.scheduler().tick(1);
+    CHECK(f.log == std::vector<std::string>{"first", "second"});
+    CHECK(f.notices.size() == 1);
+    f.ctx.set_step_budget(Context::kUnlimitedSteps);
+}

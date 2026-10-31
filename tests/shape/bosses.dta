@@ -1,16 +1,15 @@
 ; Corpus-style boss data with its shapes (dev/decisions.md D84). A layer above it,
 ; bosses_patch.dta, adds a field and retunes a range; the test loads both through Config.
-(shapes
-   (boss_phase (at bosses boss phases)
-      (enter_at float (range 0 1) (kind percent) (desc "HP fraction that starts this phase"))
-      (attacks (list symbol))
-      (cadence float (range 0.2 5))
-      (music string (optional)))
-   (boss
-      (name symbol)
-      (hp int (range 1 100000))
-      (arena symbol)
-      (phases any)))
+#shape (boss_phase (@at bosses boss phases)
+   (enter_at float (@range 0 1) (@kind percent) (@desc "HP fraction that starts this phase"))
+   (attacks (list symbol))
+   (cadence float (@range 0.2 5))
+   (music string (@optional)))
+#shape (boss
+   (name symbol)
+   (hp int (@range 1 100000))
+   (arena symbol)
+   (phases any))
 
 (bosses
    (boss

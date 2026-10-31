@@ -3,6 +3,91 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.7.0 - 2026-10-31
+
+This release changes how data spells metadata and declarations. Migrate your data with the
+two tools it ships before you take it (see **Breaking**).
+
+- **Breaking: metadata is spelled with `@`.** A child array whose tag starts with `@` is
+  metadata, and nothing else is: `(speed 4.5 (@range 0 10) (@desc "Run speed"))`. The old
+  words (`(range 0 10)`, `(desc ...)`) are fields now. Metadata comes after the value; a value
+  after it is a located error. Run `baker_migrate_metadata --write` over your data
+  (`--cpp` for text in C++ string literals, `--md` for Markdown, `--report` to list what it
+  leaves for a person). In return, `get<std::array<float, 3>>` of
+  `(tint 0.9 0.5 0.2 (@range 0 1))` reads three numbers, and a record may have a field named
+  `kind`, `desc` or `step`.
+- **Breaking: `#pack`, `#origin` and `#shape` declare a file's pack, origin and shapes;**
+  `(pack ...)`, `(origin ...)` and `(shapes ...)` are data. Run
+  `baker_migrate_declarations --write` over your data. A live-ops publisher switches its
+  overlays to `#pack`/`#origin` before the game takes this release: an overlay still in the
+  old form reads as data, and a game whose policy has `warnings_refuse` refuses it.
+- **Breaking: the `Allocator` takes a `MemoryKind`.** `alloc(user, size, align, kind)` and
+  `free(user, p, size, kind)`: each allocation says what it is for (symbols, trees, config,
+  script, tasks, tweaks, errors, tools, other), and a free names the kind its allocation
+  did, so a game can hold Baker to a budget per kind. `default_allocator(kind)` gives the
+  default's copy for a kind; `memory_kind_name` names one for a report.
+- **Breaking: a game must be built with the library's `BAKER_SHIPPING` and
+  `BAKER_ATOMIC_REFCOUNT`.** CMake's targets pass them on. A game built another way and
+  mismatched now fails to link (MSVC names both values) rather than crashing.
+- **Breaking, smaller:** `TweakBase::code_meta()` is `dev_only()`; `WriteOptions` defaults to
+  three spaces a level and a hundred columns (it was 2 and 80), and a Config opened from a
+  project writes in the project's `(format ...)` (`Config::set_layout`).
+- **New: rows.** `(/fighters.kestrel.health 1100)` at a file's top level is
+  `(fighters (kestrel (health 1100)))`: a layer written as one key per line. A key written
+  twice in a file of rows is an error.
+- **New: layer verbs.** `(items #append rope)` adds to the list below, `(items #drop glider)`
+  removes the first equal value, and `(reaction 26 (@was 30))` pins what a row was written
+  over: a check warns when the stack below has moved. For lists that mods and packs extend.
+- **New: braces written infix.** `{0.3 <= $value <= 0.7}`, one operator a brace; `+ - *` take
+  two numbers or more, comparisons chain, and `+= -= *= /=` store. Keep data that older
+  builds read, such as live-ops overlays, in the prefix spelling.
+- **New: shapes count a list.** `(pos (list float 3))`, `(spares (list T 0 1))`;
+  `shape::unused` names a shape that governs nothing; a received layer under `data_only` or
+  `scalars_only` may not declare shapes. `#` opens a directive only before a letter, so `#1`
+  and `#00aa00` are symbols.
+- **New: a layer's `(when COND)`** (a define, `not`, `and`, `or`) on a project's layer: it is
+  in the merge only while the defines say so, and `set_defines` applies it again;
+  `LayerOptions::when`, `Config::layer_condition`, `ExplainEntry::when`.
+- **New: stable IDs for names.** `symbol_hash(text)` and `"name"_hash` give a name's 64-bit
+  FNV-1a hash at compile time, the same in every build, for switches and saves; `"name"_sym`
+  interns with it. A build that is not shipping reports two names that share a hash
+  (`set_symbol_collision_handler`).
+- **New: limits for content you do not control.**
+  - `Context::set_step_budget(n)`: every call spends a step, the same on every run; when it
+    runs out the call fails with a Limit error, and a Scheduler's tick stops there, the
+    tasks after it running at the next tick. `set_step_hook` may grant more (a time check,
+    a profiler). `-DBAKER_STEP_BUDGET=OFF` compiles the check out.
+  - `ParseLimits::max_new_symbols` caps the names one read adds to the program
+    (1,048,576 by default); lower it for overlays and mods.
+- **New: `set_fatal_handler`.** Every fatal error (an allocator that returned null, a size
+  past 4 GB, reading an `Expected` that holds an error) goes to your handler with a message
+  and the script stack, for your crash reporter.
+- **New: `<baker/fwd.hpp>`** declares Baker's types and includes only `<cstdint>`, for a
+  header that only names them: a few milliseconds a file, where any other header costs about
+  half a second.
+- **New: a shipped cache without metadata.** `baker_bake --drop-metadata`,
+  `ConfigOptions::cache_drop_metadata`, `LoadSession::drop_metadata` and
+  `without_metadata(root)`: the tree's `(@...)` and the shapes' notes are left out.
+- **New: `BAKER_RTTI`** (on by default): `OFF` builds Baker without RTTI, for a game built
+  without it or one that never derives from `ObjectBase` with RTTI on.
+- **Shipping builds carry less.** A `Tweak` keeps no tool text (`desc`, `kind`, `group`,
+  `step`) and is 128 bytes, not 184; doc text (`.doc()`, a property's, a global's, the
+  built-ins') is dropped where it is written. Metadata in the data still applies.
+- **Faster.** Binding a function costs about half the code and compile time (and a lambda
+  that captures nothing is not stored); calls of nine arguments or more allocate nothing once
+  warm; `#append` and `#drop` are linear (16,000 operands merge in milliseconds); a file of
+  rows holds about what the nested file holds; a layer check takes fewer instructions.
+- **Fixed.**
+  - Curves sample to the same bits on every compiler: Baker's targets build with
+    `-ffp-contract=off` (`/fp:precise` under MSVC).
+  - Numbers written by the simulation tools no longer follow the C locale (`1,5`).
+  - Metadata past the 8,190th child stays metadata, also after a merge grows the array.
+  - A host Reader that switches fibers no longer disturbs the read's name count.
+  - Static initialization: nine dynamic initializers are one.
+- **Docs.** Read a tweak once into a local before a hot loop (the read is atomic, and blocks
+  vectorization); do not switch fibers inside a Baker call; budgets per memory kind; the
+  shipped link sizes, re-measured.
+
 ## 0.6.0 - 2026-10-23
 
 - **New: content that is a directory, not a list of files.**

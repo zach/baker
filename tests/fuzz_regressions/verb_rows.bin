@@ -1,0 +1,4 @@
+(/r.s #append q (@note "n"))
+(/r.s #drop q)
+(/r.t 1 (@was 0))
+(/r.u #remove)

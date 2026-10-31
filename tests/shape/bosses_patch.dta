@@ -1,4 +1,3 @@
 ; A later layer: retunes enter_at's range, and declares the golem's extra field.
-(shapes
-   (boss_phase (enter_at float (range 0 2)))
-   (boss (taunts string (optional))))
+#shape (boss_phase (enter_at float (@range 0 2)))
+#shape (boss (taunts string (@optional)))

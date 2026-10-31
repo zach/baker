@@ -34,7 +34,7 @@ std::string_view type_name(Type type) noexcept {
 
 Ref<String> String::make(std::string_view text) {
     // A string this large cannot come from a parse (inputs are bounded long before).
-    if (text.size() >= UINT32_MAX) std::abort();
+    if (text.size() >= UINT32_MAX) detail::fatal("a string of 4 GB or more");
     const auto size = static_cast<uint32_t>(text.size());
     void* mem = detail::solo_payload(detail::kSoloString, sizeof(String) + size + 1);
     auto* s = new (mem) String(detail::kSoloOffset, size);

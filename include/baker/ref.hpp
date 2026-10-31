@@ -15,6 +15,12 @@
 #include <cstring>
 #include <utility>
 
+// A game and Baker built with different values fail to link under MSVC (error.hpp).
+#if defined(_MSC_VER) && (!defined(BAKER_ATOMIC_REFCOUNT) || BAKER_ATOMIC_REFCOUNT)
+#pragma detect_mismatch("BAKER_ATOMIC_REFCOUNT", "1")
+#elif defined(_MSC_VER)
+#pragma detect_mismatch("BAKER_ATOMIC_REFCOUNT", "0")
+#endif
 #if !defined(BAKER_ATOMIC_REFCOUNT) || BAKER_ATOMIC_REFCOUNT
 #define BAKER_ATOMIC_REFCOUNT_ENABLED 1
 #include <atomic>

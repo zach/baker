@@ -1,4 +1,4 @@
-// eval_request and the reply form baker.reply/1.1.
+// eval_request and the reply form baker.reply/1.2.
 #include <doctest.h>
 #include <baker/script.hpp>
 #include <baker/std_interop.hpp>
@@ -19,7 +19,7 @@ std::string reply(Context& ctx, std::string_view line) {
     return out;
 }
 
-const std::string kHead = R"j({"schema":"baker.reply/1.1","id":)j";
+const std::string kHead = R"j({"schema":"baker.reply/1.2","id":)j";
 
 }  // namespace
 

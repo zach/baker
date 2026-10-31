@@ -40,7 +40,7 @@ class Stack:
 def check(s):
     code, out, _ = s.run("check")
     r = json.loads(out)
-    expect(code == 0 and r["passed"] and r["schema"] == "baker.check/1.4", "clean data passes")
+    expect(code == 0 and r["passed"] and r["schema"] == "baker.check/1.5", "clean data passes")
     code, out, err = s.run("check", agent="(waves {spawnn grunt 3})\n")
     r = json.loads(out)
     expect(code == 1 and [d["name"] for d in r["demand"]] == ["spawnn"] and "spawnn" in err,
@@ -48,6 +48,11 @@ def check(s):
     code, out, _ = s.run("check", agent="(player (speed 42))\n")
     r = json.loads(out)
     expect(code == 1 and len(r["shape_errors"]) == 1, "a value out of its shape's range fails")
+    code, out, _ = s.run("check", agent="#shape (enemy (@at foes) (@keyed) (hp int))\n")
+    r = json.loads(out)
+    expect(code == 0 and any("shape 'enemy' governs nothing: no array is a child of foes"
+                             in w["message"] for w in r["shape_warnings"]),
+           "a shape that governs no array is a shape warning, and passes")
     code, out, _ = s.run("check", agent="(player (speed 3\n")
     r = json.loads(out)
     expect(code == 2 and len(r["load"]) == 1 and r["load"][0]["file"].endswith("agent.dta"),
@@ -73,7 +78,7 @@ def reference(s):
     names = [f["name"] for f in r["reference"]["functions"]]
     expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.5" and "spawn" in names,
            "reference --baker-json: the game's functions")
-    expect(r["shapes"]["schema"] == "baker.shapes/1.4" and r["tweaks"]["schema"] == "baker.tweaks/1.5",
+    expect(r["shapes"]["schema"] == "baker.shapes/1.5" and r["tweaks"]["schema"] == "baker.tweaks/1.5",
            "reference --baker-json: tweaks and shapes")
     code, out, _ = s.run("reference")
     expect(code == 0 and "spawn" in out, "reference: Markdown")
@@ -92,6 +97,12 @@ def eval_json(s):
 def diff_and_promote(s):
     code, out, _ = s.run("diff", agent="(player (speed 4.5))\n")
     expect(code == 0 and "player.speed  3.5 -> 4.5" in out, "diff: what the agent layer changes")
+    code, out, _ = s.run("diff", "--baker-rows", agent="(/player.speed 4.5)\n")
+    expect(code == 0 and out == "; layer 'agent' changes:\n(/player.speed 4.5)  ; was 3.5\n",
+           "diff --baker-rows: each change as a row a layer file holds")
+    code, out, _ = s.run("promote", "--baker-rows", agent="(player (speed 4.5))\n")
+    expect(code == 0 and "(/player.speed 4.5)  ; was 3.5\n" in out,
+           "promote --baker-rows: what it would write, as rows")
     before = (s.dir / "data" / "default.dta").read_text()
     code, out, _ = s.run("promote", "--baker-patch", "change.patch")
     patch = (s.dir / "change.patch").read_text()
@@ -103,6 +114,21 @@ def diff_and_promote(s):
     code, out, _ = s.run("promote", "--baker-write")
     expect(code == 0 and "(speed 4.5)   ; how fast" in (s.dir / "data" / "default.dta").read_text(),
            "promote --baker-write writes the line")
+    # The layer verbs: diff names each, with a stale pin; the patch carries each row's note.
+    code, out, _ = s.run("diff", agent="(loot #append ruby (@note \"a rarer drop\"))\n"
+                                       "(player (lives 5 (@was 2)))\n")
+    expect(code == 0 and "loot  (coin gem) -> #append ruby" in out and
+           "player.lives  3 -> 5" in out and out.rstrip().endswith("stale"),
+           "diff: a verb and a stale pin")
+    code, out, _ = s.run("diff", "--baker-rows")
+    expect(code == 0 and '(/loot #append ruby (@note "a rarer drop"))  ; was (coin gem)\n' in out and
+           "(/player.lives 5 (@was 2))  ; was 3, stale\n" in out,
+           "diff --baker-rows: a verb in its slot, with its metadata")
+    code, out, _ = s.run("promote", "--baker-patch", "verbs.patch")
+    patch = (s.dir / "verbs.patch").read_text()
+    expect(code == 0 and patch.startswith("# loot: a rarer drop\n--- a/data/default.dta") and
+           "+(loot coin gem ruby)\n" in patch,
+           "promote --baker-patch: the note above the patch, the list resolved")
 
 
 def format_files(s):

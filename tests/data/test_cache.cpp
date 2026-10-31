@@ -454,7 +454,7 @@ TEST_CASE("a cache load leaves the session as the text load did") {
     test::TempDir dir;
     const std::string main = dir.write("main.dta", R"(
         #define FLAG
-        #define BODY (x 1)
+        [BODY x 1]
         #undef GONE
         #ifdef PRE (pre yes) #endif
         #autorun {print "hello"}
@@ -515,7 +515,7 @@ TEST_CASE("a Cipher enciphers what it writes and deciphers what it reads") {
 
 TEST_CASE("a cache records the files #require read, and which it found already read") {
     test::TempDir dir;
-    dir.write("pack.dta", "#define SPEED (3)\n(pack_read)");
+    dir.write("pack.dta", "[SPEED 3]\n(pack_read)");
     const std::string main = dir.write("main.dta", "#require pack.dta\n(a SPEED)");
     const std::string cache = dir.path("main.datb");
     LoadSession text;
@@ -537,7 +537,7 @@ TEST_CASE("a cache records the files #require read, and which it found already r
 
 TEST_CASE("a cache replays packs, and is stale for other pack levels") {
     test::TempDir dir;
-    dir.write("task.dta", "(pack boss_task (level task))\n#define PHASES (3)");
+    dir.write("task.dta", "#pack (boss_task (level task))\n[PHASES 3]");
     const std::string main = dir.write("main.dta", "#require task.dta\n(a PHASES)");
     const std::string cache = dir.path("main.datb");
     LoadSession text;
@@ -553,7 +553,7 @@ TEST_CASE("a cache replays packs, and is stale for other pack levels") {
     REQUIRE(p);
     CHECK(p->rank == 1);
     // The replayed macro keeps its pack: a game pack using it is warned about.
-    const std::string game = dir.write("game.dta", "(pack rules (level game))\n(b PHASES)");
+    const std::string game = dir.write("game.dta", "#pack (rules (level game))\n(b PHASES)");
     (void)ok(read_file(game, cached));
     CHECK(cached.warnings().size() == 1);
 
@@ -565,8 +565,8 @@ TEST_CASE("a cache replays packs, and is stale for other pack levels") {
 TEST_CASE("a cache replays packs' harness metadata and files' origins") {
     test::TempDir dir;
     dir.write("task.dta",
-              "(pack boss (level task) (owners \"td-a\") (for designers) (stage genesis))\n"
-              "(origin \"bosses.xlsx\" (tool export))\n(a 1)");
+              "#pack (boss (level task) (owners \"td-a\") (for designers) (stage genesis))\n"
+              "#origin (\"bosses.xlsx\" (tool export))\n(a 1)");
     const std::string main = dir.write("main.dta", "#require task.dta\n(b 2)");
     const std::string cache = dir.path("main.datb");
     LoadSession text;
@@ -589,4 +589,50 @@ TEST_CASE("a cache replays packs' harness metadata and files' origins") {
     REQUIRE(o);
     CHECK(o->source == Symbol("bosses.xlsx"));
     CHECK(o->tool == Symbol("export"));
+}
+
+TEST_CASE("a cache as deep as the parse allows reads back: past the loader's 256 inline frames") {
+    std::string text;
+    for (int i = 0; i < 256; ++i) text += "(a ";
+    text += "1";
+    for (int i = 0; i < 256; ++i) text += ")";
+    const auto deep = read_string(text, "deep.dta");
+    REQUIRE(deep);
+    std::string bytes;
+    REQUIRE(write_cache(**deep, string_out(bytes)));
+    const auto back = read_cache_bytes(bytes, "deep.datb");
+    REQUIRE(back);
+    CHECK(structurally_equal(**deep, **back));
+    CHECK((*back)->height() == (*deep)->height());
+}
+
+TEST_CASE("the written-infix flag rides the cache, so a cached tree prints as it was written") {
+    auto root = ok(read_string("(pass {0.3 <= $value <= 0.7})\n{$i += 1}", "t.dta"));
+    auto cached = ok(read_cache_bytes(bytes_of(*root)));
+    CHECK(structurally_equal(*root, *cached));
+    const Array& band = *(*(*cached)[0].array())[1].array();
+    CHECK(band.written_infix());
+    CHECK((*cached)[1].array()->written_infix());
+    CHECK(to_dta(*cached) == "(pass {0.3 <= $value <= 0.7})\n{$i += 1}\n");
+}
+
+TEST_CASE("without_metadata leaves out every @ child of data, and shares what holds none") {
+    const auto root =
+        ok(read_string("(speed 4.5 (@range 0 10) (@desc \"Run speed\"))\n"
+                       "(menu (title \"x\") (@note \"n\") (size 3))\n"
+                       "(plain (a 1) (b (c 2)))\n"
+                       "{func f ($x) (@doc \"kept\") $x}\n",
+                       "t.dta"));
+    const Ref<Array> lean = without_metadata(*root);
+    CHECK(to_dta(*lean) ==
+          "(speed 4.5)\n(menu (title \"x\") (size 3))\n(plain (a 1) (b (c 2)))\n"
+          "{func f ($x) (@doc \"kept\") $x}\n");
+    CHECK(lean->find<float>("speed").value() == 4.5f);
+    CHECK(lean->try_find("speed")->meta(Symbol("@range")) == nullptr);
+    CHECK((*lean)[2].array() == (*root)[2].array());         // nothing to leave out: shared
+    CHECK((*lean)[3].array() == (*root)[3].array());         // a command, as written
+    CHECK(root->try_find("speed")->meta(Symbol("@range")));  // the original is untouched
+    // Its cache reads back without them.
+    const auto back = ok(read_cache_bytes(bytes_of(*lean)));
+    CHECK(structurally_equal(*back, *lean));
 }

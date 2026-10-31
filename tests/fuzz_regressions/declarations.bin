@@ -1,0 +1,6 @@
+#pack (p (level game) (owners a))
+#origin ("x.csv" (tool t))
+#shape (u (@at us) (@keyed) (hp int (@range 1 9)) (pos (list float 3)))
+#shape (v (n symbol))
+(pack data) (origin "data") (shapes (w (n int)))
+(us (a (hp 3) (pos 1 2 3)))

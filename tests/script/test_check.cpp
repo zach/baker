@@ -111,7 +111,7 @@ TEST_CASE("check: literal types against overloads, and {set} needs a variable") 
     const CheckReport report = check(*tree, ctx);
     REQUIRE(report.errors.size() == 3);
     CHECK(report.errors[0].message() ==
-          "'+' is given (int symbol); it takes (int int) (float float)");
+          "'+' is given (int symbol); it takes (number number number...)");
     CHECK(report.errors[1].message() == "'set' is given (symbol int); it takes ($variable value)");
     CHECK(report.errors[2].message() == "'not' takes 1 argument, given 0");
     CHECK(report.errors[2].line() == 3);
@@ -120,7 +120,7 @@ TEST_CASE("check: literal types against overloads, and {set} needs a variable") 
 TEST_CASE("the demand report lists unresolved heads and stubs with every call site") {
     Context ctx;
     const auto a = parse(
-        "{func boss.taunt ($who) (status stub) 0}\n"
+        "{func boss.taunt ($who) (@status stub) 0}\n"
         "{func helper ($x) $x}\n"
         "(phase1 {boss.find_cover 1} {boss.taunt player})\n"
         "(phase2\n  {boss.find_cover 2}\n  {helper 1}\n  {helper 1 2})\n",
@@ -174,6 +174,7 @@ TEST_CASE("docs/script-reference.md matches the code") {
     s << in.rdbuf();
     std::string on_disk = s.str();
     on_disk.erase(std::remove(on_disk.begin(), on_disk.end(), '\r'), on_disk.end());
+    if constexpr (kShipping) return;  // the reference is generated with its docs
     CHECK_MESSAGE(on_disk == generated,
                   "docs/script-reference.md is out of date: run the script tests with "
                   "BAKER_UPDATE_REFERENCE=1 to regenerate it");
@@ -183,11 +184,11 @@ TEST_CASE("check applies the one-way rule to calls across packs") {
     // An in-memory file system: three packs and a loose file.
     std::map<std::string, std::string> files{
         {"task.dta",
-         "(pack boss_task (level task))\n{func boss.restart_phase () 1}\n"
+         "#pack (boss_task (level task))\n{func boss.restart_phase () 1}\n"
          "{func boss.use_engine () {engine.shake}}"},
-        {"engine.dta", "(pack engine_core (level engine))\n{func engine.shake () 0}"},
+        {"engine.dta", "#pack (engine_core (level engine))\n{func engine.shake () 0}"},
         {"game.dta",
-         "(pack game_rules (level game))\n#require engine.dta\n#require task.dta\n"
+         "#pack (game_rules (level game))\n#require engine.dta\n#require task.dta\n"
          "{func game.tick () {boss.restart_phase}}\n{boss.restart_phase}"},
         {"loose.dta", "#require task.dta\n{boss.restart_phase}"},
     };
@@ -221,7 +222,7 @@ TEST_CASE("check applies the one-way rule to calls across packs") {
     // A script function the Context has registered is attributed by its file too.
     auto task = test::ok(read_file("task.dta", session));
     for (const Node& n : *task) (void)test::ok(ctx.eval(n));
-    files["call.dta"] = "(pack more_rules (level game))\n{boss.restart_phase}";
+    files["call.dta"] = "#pack (more_rules (level game))\n{boss.restart_phase}";
     auto call = test::ok(read_file("call.dta", session));
     const CheckReport registered = check(*call, ctx, {.packs = &session});
     REQUIRE(registered.warnings.size() == 1);
@@ -233,10 +234,10 @@ TEST_CASE("check reports a pack with one owner, and repetition across its trees"
     LoadSession session;
     session.set_pack_levels({"game", "task"});
     const auto solo =
-        ok(read_string("(pack boss (level task) (owners \"td-a\"))\n(x 1)", "boss.dta", session));
+        ok(read_string("#pack (boss (level task) (owners \"td-a\"))\n(x 1)", "boss.dta", session));
     const auto pair = ok(
-        read_string("(pack econ (level game) (owners \"a\" \"b\"))\n(y 1)", "econ.dta", session));
-    const auto none = ok(read_string("(pack ui (level game))\n(z 1)", "ui.dta", session));
+        read_string("#pack (econ (level game) (owners \"a\" \"b\"))\n(y 1)", "econ.dta", session));
+    const auto none = ok(read_string("#pack (ui (level game))\n(z 1)", "ui.dta", session));
     CheckReport report;
     check(*solo, ctx, report, {.packs = &session});
     REQUIRE(report.findings.size() == 1);
@@ -268,11 +269,11 @@ TEST_CASE("check's JSON is versioned, sorted, and the same bytes on every run") 
     // repeat whose form needs escaping, a one-owner finding, and packs with metadata.
     std::map<std::string, std::string> files{
         {"task.dta",
-         "(pack boss_task (level task) (owners \"td-encounter\") (for designers) (stage custom))\n"
+         "#pack (boss_task (level task) (owners \"td-encounter\") (for designers) (stage custom))\n"
          "{func boss.restart () 1}\n"
          "(phase (say \"Get \\qready\\q\") (hp 30) (wait 2))\n"},
         {"game.dta",
-         "(pack game_rules (level game) (requires boss_task) (owners \"a\" \"b\"))\n"
+         "#pack (game_rules (level game) (requires boss_task) (owners \"a\" \"b\"))\n"
          "#require task.dta\n"
          "{boss.restart}\n{spawn grunt}\n{+ 1}\n"
          "(phase (say \"Get \\qready\\q\") (hp 30) (wait 2))\n"},
@@ -313,7 +314,7 @@ TEST_CASE("check's JSON is versioned, sorted, and the same bytes on every run") 
 
     // Without the session, the packs list is empty; an empty report is still a whole one.
     CHECK(to_json(CheckReport{}) ==
-          "{\n  \"schema\": \"baker.check/1.4\",\n  \"passed\": true,\n  \"errors\": [],\n"
+          "{\n  \"schema\": \"baker.check/1.5\",\n  \"passed\": true,\n  \"errors\": [],\n"
           "  \"warnings\": [],\n  \"demand\": [],\n  \"repeats\": [],\n  \"findings\": [],\n"
           "  \"load\": [],\n  \"shape_errors\": [],\n  \"shape_warnings\": [],\n"
           "  \"tweak_errors\": [],\n  \"tweak_warnings\": [],\n"
@@ -323,10 +324,10 @@ TEST_CASE("check's JSON is versioned, sorted, and the same bytes on every run") 
 TEST_CASE("the reference lists the session's packs and origins: the harness register") {
     LoadSession session;
     session.set_pack_levels({"game"});
-    (void)test::ok(
-        read_string("(pack econ (level game) (owners \"td-econ\") (for designers) (stage product))",
-                    "econ.dta", session));
-    (void)test::ok(read_string("(origin \"economy.xlsx\" (tool sheets-export))\n(price 5)",
+    (void)test::ok(read_string(
+        "#pack (econ (level game) (owners \"td-econ\") (for designers) (stage product))",
+        "econ.dta", session));
+    (void)test::ok(read_string("#origin (\"economy.xlsx\" (tool sheets-export))\n(price 5)",
                                "prices.dta", session));
     Context ctx;
     const std::string with = reference(ctx, &session);
@@ -341,11 +342,11 @@ TEST_CASE("the reference lists the session's packs and origins: the harness regi
 TEST_CASE("a Config's read_session has every layer's packs and origins") {
     std::map<std::string, std::string> files{
         {"default.dta",
-         "(pack game_rules (level game) (owners \"a\"))\n#require task.dta\n"
+         "#pack (game_rules (level game) (owners \"a\"))\n#require task.dta\n"
          "{func game.tick () {boss.restart}}\n(x 1)"},
         {"task.dta",
-         "(pack boss_task (level task) (owners \"a\" \"b\"))\n{func boss.restart () 1}"},
-        {"agent.dta", "(origin \"sheet.xlsx\" (tool export))\n(x 2)"},
+         "#pack (boss_task (level task) (owners \"a\" \"b\"))\n{func boss.restart () 1}"},
+        {"agent.dta", "#origin (\"sheet.xlsx\" (tool export))\n(x 2)"},
     };
     Config cfg({.tweaks = nullptr});
     cfg.session().set_reader([&](std::string_view path, TextSink out) {
@@ -904,4 +905,78 @@ TEST_CASE("a tool tells a type already known from a refusal without reading word
     CHECK(has_type(ctx, "Tank"));
     CHECK(declare_object(ctx, "scheduler", "Tank").error().code() == ErrorCode::Refused);
     CHECK(declare_object(ctx, "t", "Plane").error().code() == ErrorCode::Type);
+}
+
+namespace {
+// The variadic operators' report: the same for a prefix tree and its infix spelling.
+void check_operator_report(const char* text) {
+    Context ctx;
+    const auto tree = parse(text, "rules.dta");
+    const CheckReport report = check(*tree, ctx);
+    REQUIRE(report.errors.size() == 4);
+    CHECK(to_string(report.errors[0]) ==
+          "baker: '+' is given (int string); it takes (number number number...)  (rules.dta:2)");
+    CHECK(
+        to_string(report.errors[1]) ==
+        "baker: '+' is given (int int string); it takes (number number number...)  (rules.dta:3)");
+    CHECK(to_string(report.errors[2]) ==
+          "baker: '<' is given (int int symbol); it takes (number number number...)  "
+          "(rules.dta:5)");
+    CHECK(to_string(report.errors[3]) ==
+          "baker: '+=' is given (? symbol); it takes ($variable number)  (rules.dta:8)");
+    REQUIRE(report.demand.size() == 1);
+    CHECK(report.demand[0].name == Symbol("="));
+    CHECK(report.demand[0].sites[0].line == 6);
+}
+}  // namespace
+
+TEST_CASE("check holds variadic operators to their literal types, and `=` is a demand") {
+    check_operator_report(
+        "(rules\n"
+        "  (a {+ 1 \"x\"})\n"
+        "  (b {+ 1 2 \"x\"})\n"
+        "  (c {<= 0.3 $value 0.7})\n"
+        "  (d {< 1 2 three})\n"
+        "  (e {= $x 1})\n"
+        "  (f {+= $i 1})\n"
+        "  (g {+= $i one}))\n");
+    check_operator_report(
+        "(rules\n"
+        "  (a {+ 1 \"x\"})\n"
+        "  (b {1 + 2 + \"x\"})\n"
+        "  (c {0.3 <= $value <= 0.7})\n"
+        "  (d {1 < 2 < three})\n"
+        "  (e {$x = 1})\n"
+        "  (f {$i += 1})\n"
+        "  (g {$i += one}))\n");
+}
+
+TEST_CASE("check reports a head no call can have, as evaluation does, and names infix's fix") {
+    Context ctx;
+    const auto tree = parse(
+        "(rules\n"
+        "  (a {1 2})\n"
+        "  (b {\"f\" x})\n"
+        "  (c {[hp] 3})\n"
+        "  (d {0.3 $value <= 0.7})\n"
+        "  (e {$obj hit 1})\n"
+        "  (f {{find enemy} hit 1}))\n",
+        "rules.dta");
+    const CheckReport report = check(*tree, ctx);
+    REQUIRE(report.errors.size() == 4);
+    CHECK(to_string(report.errors[0]) ==
+          "baker: a command starts with a function or an object, not a int  (rules.dta:2)");
+    CHECK(to_string(report.errors[1]) ==
+          "baker: a command starts with a function or an object, not a string  (rules.dta:3)");
+    CHECK(to_string(report.errors[2]) ==
+          "baker: a command starts with a function or an object, not a property  (rules.dta:4)");
+    CHECK(to_string(report.errors[3]) ==
+          "baker: a command starts with a function or an object, not a float: infix needs an "
+          "operator between every two operands  (rules.dta:5)");
+    // A variable or a command at the head is an object computed at run time: no error.
+    REQUIRE(report.demand.size() == 1);
+    CHECK(report.demand[0].name == Symbol("find"));
+    // Each is what evaluation says of it.
+    CHECK(ctx.eval((*parse("{1 2}", "x.dta"))[0]).error().message() ==
+          "a command starts with a function or an object, not a int");
 }

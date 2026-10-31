@@ -184,7 +184,7 @@ struct Watcher::Impl {
                 kept.push_back(std::move(d));
                 return kept.size() - 1;
             }
-        Own<Dir> d = Own<Dir>::make(default_allocator());
+        Own<Dir> d = Own<Dir>::make(default_allocator(MemoryKind::Tools));
         d->path = dir;
         if (!open(*d)) return SIZE_MAX;
         kept.push_back(std::move(d));
@@ -285,10 +285,10 @@ struct Watcher::Impl {
     }
 };
 
-Watcher::Watcher() : impl_(detail::create<Impl>(default_allocator())) {}
+Watcher::Watcher() : impl_(detail::create<Impl>(default_allocator(MemoryKind::Tools))) {}
 
 Watcher::~Watcher() {
-    detail::destroy(default_allocator(), impl_);
+    detail::destroy(default_allocator(MemoryKind::Tools), impl_);
 }
 
 void Watcher::set_stamp_hook(StampHook hook) {

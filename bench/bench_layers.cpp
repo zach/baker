@@ -21,8 +21,8 @@ std::string base_text() {
              "\"))\n";
     s += ")\n";
 #if defined(BAKER_BENCH_SHAPE)
-    s += "(shapes (item (at shop) (keyed) (price int (range 0 1000)) (damage int) (name "
-         "string)))\n";
+    s += "#shape (item (@at shop) (@keyed) (price int (@range 0 1000)) (damage int) (name "
+         "string))\n";
 #endif
     return s;
 }

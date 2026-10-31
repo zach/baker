@@ -22,26 +22,39 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 ### `*`
 
-- `{* int int}` → int
-- `{* float float}` → float
+- `{* number number number...}` → value
 
-*Native.* Product.
+*Native.* Product of two numbers or more: `{* 2 3 4}` is 24.
+
+### `*=`
+
+- `{*= $variable number}` → value
+
+*Native.* `{*= $x n}`: multiplies, stores and returns the new value.
 
 ### `+`
 
-- `{+ int int}` → int
-- `{+ float float}` → float
+- `{+ number number number...}` → value
 
-*Native.* Sum.
+*Native.* Sum of two numbers or more, left to right: `{+ 1 2 3}` is 6.
+
+### `+=`
+
+- `{+= $variable number}` → value
+
+*Native.* `{+= $x n}`, or in a method `{+= [property] n}`: adds, stores and returns the new value.
 
 ### `-`
 
-- `{- int int}` → int
-- `{- float float}` → float
-- `{- int}` → int
-- `{- float}` → float
+- `{- number number...}` → value
 
-*Native.* Difference, or with one argument, negation.
+*Native.* Difference, left to right: `{- 10 2 3}` is 5; with one argument, negation.
+
+### `-=`
+
+- `{-= $variable number}` → value
+
+*Native.* `{-= $x n}`: subtracts, stores and returns the new value.
 
 ### `/`
 
@@ -49,19 +62,23 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 *Native.* Quotient, always a float.
 
+### `/=`
+
+- `{/= $variable number}` → value
+
+*Native.* `{/= $x n}`: divides (a float), stores and returns it.
+
 ### `<`
 
-- `{< int int}` → bool
-- `{< float float}` → bool
+- `{< number number number...}` → bool
 
-*Native.* Less than.
+*Native.* Less than, over every adjacent pair: `{< 1 $x 10}`.
 
 ### `<=`
 
-- `{<= int int}` → bool
-- `{<= float float}` → bool
+- `{<= number number number...}` → bool
 
-*Native.* Less than or equal.
+*Native.* Less than or equal, over every adjacent pair: `{<= 0.3 $value 0.7}` is a band.
 
 ### `==`
 
@@ -71,17 +88,15 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 ### `>`
 
-- `{> int int}` → bool
-- `{> float float}` → bool
+- `{> number number number...}` → bool
 
-*Native.* Greater than.
+*Native.* Greater than, over every adjacent pair.
 
 ### `>=`
 
-- `{>= int int}` → bool
-- `{>= float float}` → bool
+- `{>= number number number...}` → bool
 
-*Native.* Greater than or equal.
+*Native.* Greater than or equal, over every adjacent pair.
 
 ### `and`
 
@@ -117,7 +132,7 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 - `{func values...}` → value
 
-*Native.* `{func name ($params...) body...}`: defines a script function. `(status stub)`, `(status provisional)`, `(status deprecated replacement)` and `(doc "...")` may follow the parameters.
+*Native.* `{func name ($params...) body...}`: defines a script function. `(@status stub)`, `(@status provisional)`, `(@status deprecated replacement)` and `(@doc "...")` may follow the parameters.
 
 ### `if`
 

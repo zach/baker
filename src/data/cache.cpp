@@ -6,6 +6,7 @@
 
 #include "arena.hpp"
 #include "common/containers.hpp"
+#include "intern_site.hpp"
 #include "session.hpp"
 #include "text.hpp"
 
@@ -40,8 +41,10 @@ static_assert(sizeof(String) == 8 && sizeof(Symbol) == 8);
 constexpr char kMagic[10] = {'M', 'O', 'I', 'R', 'A', '.', 'D', 'A', 'T', 'B'};
 // 2: packs' harness metadata, origins; 3: the header hashed; 4: '' keys no tag
 // in the tag run; 5: packs' versions, and the versions they require; 6: the
-// source-order layout, for delta patches.
-constexpr uint16_t kVersion = 6;
+// source-order layout, for delta patches; 7: the metadata boundary in an array's
+// flags, which an older build's image of the same text lacks; 8: #shape declarations,
+// and (pack ...) and (origin ...) read as data.
+constexpr uint16_t kVersion = 8;
 constexpr uint32_t kEndian = 0x01020304;
 
 // The layout is made for delta patches: an edit to the text changes the bytes of the
@@ -83,6 +86,7 @@ constexpr uint32_t kEndian = 0x01020304;
 //   (macro_packs NAME file ...)        the pack each macro the load defined came from
 //   (origins (file "source" tool-or-0) ...)   origins the load's files declared
 //   (definitions (NAME file line flag) ...)   where the load defined each macro
+//   (shapes (file line root FORM) ...) the #shape declarations the load read
 struct Header {
     char magic[10];
     uint16_t version;
@@ -442,7 +446,8 @@ Expected<Ref<Array>> load(char* file, size_t bytes, std::string_view name, const
         cipher->decrypt(cipher->user,
                         {reinterpret_cast<std::byte*>(file) + sizeof h, bytes - sizeof h});
 
-    // Intern the symbols into their slots.
+    // Intern the symbols into their slots: a name that shares a hash is reported at the cache.
+    const detail::InternSiteScope site(name);
     char* slots = file + h.symbols;
     const char* slots_end = slots + size_t{h.symbol_slots} * 16;
     size_t p = h.symbols + size_t{h.symbol_slots} * 16;
@@ -615,6 +620,21 @@ Node list(Vec<Node>& nodes) {
 }
 
 // The meta array for a load the session recorded, or null.
+// A shape's form without its notes, (@desc ...) and (@note ...), at any depth: what a cache
+// that drops metadata keeps of a #shape.
+Node without_notes(const Node& n) {
+    const Array* a = n.type() == Type::Array ? n.array() : nullptr;
+    if (!a) return n;
+    Vec<Node> kept;
+    kept.reserve(a->size());
+    for (const Node& c : *a) {
+        const Symbol tag = tag_of(c);
+        if (tag == Symbol("@desc") || tag == Symbol("@note")) continue;
+        kept.push_back(without_notes(c));
+    }
+    return Node(Array::make_from({kept.data(), kept.size()}));
+}
+
 Ref<Array> record_of(const LoadSession& s) {
     using A = SessionAccess;
     if (!A::recorded(s)) return nullptr;
@@ -623,7 +643,8 @@ Ref<Array> record_of(const LoadSession& s) {
         autorun{Node(Symbol("autorun"))}, required{Node(Symbol("required"))},
         require{Node(Symbol("require"))}, levels{Node(Symbol("levels"))},
         packs{Node(Symbol("packs"))}, macro_packs{Node(Symbol("macro_packs"))},
-        origins{Node(Symbol("origins"))}, definitions{Node(Symbol("definitions"))};
+        origins{Node(Symbol("origins"))}, definitions{Node(Symbol("definitions"))},
+        shapes{Node(Symbol("shapes"))};
     for (const CacheFile& f : A::files(s)) {
         Vec<Node> entry{Node(String::make(f.path)), Node(f.size), Node(f.hash)};
         files.push_back(list(entry));
@@ -683,9 +704,15 @@ Ref<Array> record_of(const LoadSession& s) {
                         Node(int64_t{d.flag ? 1 : 0})};
         definitions.push_back(list(entry));
     }
+    for (const ShapeDecl& d : A::new_shapes(s)) {
+        Vec<Node> entry{Node(d.file), Node(int64_t{d.line}), Node(d.root),
+                        s.drop_metadata ? without_notes(d.form) : Node(d.form)};
+        shapes.push_back(list(entry));
+    }
     Vec<Node> meta{list(files),   list(before),      list(define),  list(undefine),
                    list(autorun), list(required),    list(require), list(levels),
-                   list(packs),   list(macro_packs), list(origins), list(definitions)};
+                   list(packs),   list(macro_packs), list(origins), list(definitions),
+                   list(shapes)};
     return Array::make_from({meta.data(), meta.size()});
 }
 
@@ -814,6 +841,17 @@ void replay(const Array& meta, LoadSession& s) {
                               static_cast<int32_t>((*d)[2].try_int().value_or(0)),
                               (*d)[3].try_int().value_or(0) != 0});
         }
+    if (const Array* ss = meta.try_find("shapes"))
+        for (const Node& n : ss->values()) {
+            const Array* d = n.array();
+            const Array* form = d && d->size() == 4 ? (*d)[3].try_array() : nullptr;
+            if (!form) continue;
+            SessionAccess::add_shape(s,
+                                     ShapeDecl{Ref<Array>(const_cast<Array*>(form)),
+                                               (*d)[0].try_sym().value_or(Symbol()),
+                                               static_cast<int32_t>((*d)[1].try_int().value_or(0)),
+                                               (*d)[2].try_sym().value_or(Symbol())});
+        }
     if (const Array* m = meta.try_find("macro_packs"))
         for (uint32_t i = 1; i + 1 < m->size(); i += 2)
             SessionAccess::set_macro_pack(s, (*m)[i].try_sym().value_or(Symbol()),
@@ -825,6 +863,10 @@ void replay(const Array& meta, LoadSession& s) {
 
 Expected<void> bytes_of(const Array& root, const LoadSession* session, Str& out) {
     Ref<Array> meta = session ? record_of(*session) : nullptr;
+    if (session && session->drop_metadata) {
+        const Ref<Array> kept = without_metadata(root);
+        return Writer().run(*kept, meta.get(), session->cipher, out);
+    }
     return Writer().run(root, meta.get(), session ? session->cipher : nullptr, out);
 }
 

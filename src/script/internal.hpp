@@ -163,8 +163,95 @@ void record_stack(Error& e);
 // An error located at `at`, with the call stack.
 BAKER_COLD Expected<Node> fail(const Array& at, ErrorCode code, std::string_view message);
 
-// A variable cell never set holds a Func node with no record, which nothing else makes.
-inline const Node kUnset = Node::func(nullptr);
+// A variable cell never set holds a Func node with no record, which nothing else makes. Made
+// where it is needed, not kept in a static: a static Node costs every file that includes this
+// a dynamic initializer and an exit-time destructor.
+[[nodiscard]] inline Node unset_node() noexcept {
+    return Node::func(nullptr);
+}
+
+// Where calls of more arguments than ArgValues holds inline put them: blocks that never
+// move, used last in, first out as calls nest, and kept for the next call, so a call
+// allocates nothing once the Context has made the deepest it needs. From the
+// Context's allocator.
+class SpillStack {
+public:
+    explicit SpillStack(const Allocator& alloc) noexcept : alloc_(&alloc) {}
+    ~SpillStack() {
+        while (first_) {
+            Block* next = first_->next;
+            detail::deallocate(*alloc_, first_, sizeof(Block) + first_->cap * sizeof(Node));
+            first_ = next;
+        }
+    }
+    SpillStack(const SpillStack&) = delete;
+    SpillStack& operator=(const SpillStack&) = delete;
+
+    // `n` unset nodes, after any taken and not yet given back.
+    [[nodiscard]] Node* push(size_t n) {
+        if (!top_ || top_->cap - top_->used < n) next_block(n);
+        Node* p = nodes(top_) + top_->used;
+        for (size_t i = 0; i < n; ++i) ::new (p + i) Node();
+        top_->used += n;
+        return p;
+    }
+    // Gives back the last `n` pushed.
+    void pop(size_t n) noexcept {
+        Node* p = nodes(top_) + top_->used - n;
+        for (size_t i = 0; i < n; ++i) p[i].~Node();
+        top_->used -= n;
+        if (top_->used == 0 && top_->prev) top_ = top_->prev;
+    }
+
+private:
+    struct alignas(Node) Block {
+        Block* prev;
+        Block* next;
+        size_t cap;
+        size_t used;
+    };
+    static Node* nodes(Block* b) noexcept { return reinterpret_cast<Node*>(b + 1); }
+    // The block after the top if it is free and large enough, else a new one there.
+    void next_block(size_t n) {
+        Block* after = top_ ? top_->next : first_;
+        if (!after || after->cap < n) {
+            const size_t cap = n > kBlock ? n : kBlock;
+            auto* b = static_cast<Block*>(
+                detail::allocate(*alloc_, sizeof(Block) + cap * sizeof(Node), alignof(Block)));
+            *b = Block{top_, after, cap, 0};
+            if (after) after->prev = b;
+            (top_ ? top_->next : first_) = b;
+            after = b;
+        }
+        top_ = after;
+    }
+    static constexpr size_t kBlock = 64;
+    const Allocator* alloc_;
+    Block* first_ = nullptr;
+    Block* top_ = nullptr;
+};
+
+// The arguments of a call that evaluates them all first (an overload set, a declared
+// function): eight on the stack, more on the Context's spill stack.
+class ArgValues {
+public:
+    ArgValues(SpillStack& spill, size_t n) : spill_(&spill), n_(n) {
+        if (n > kInline) data_ = spill.push(n);
+    }
+    ~ArgValues() {
+        if (data_ != inline_) spill_->pop(n_);
+    }
+    ArgValues(const ArgValues&) = delete;
+    ArgValues& operator=(const ArgValues&) = delete;
+    [[nodiscard]] Node* data() noexcept { return data_; }
+
+private:
+    static constexpr size_t kInline = 8;
+    SpillStack* spill_;
+    size_t n_;
+    Node inline_[kInline];
+    Node* data_ = inline_;
+};
 [[nodiscard]] inline bool is_unset(const Node& n) noexcept {
     return n.type() == Type::Func && !n.func_record();
 }
@@ -185,7 +272,7 @@ struct Context::Impl {
     static constexpr uint32_t kPageBits = 10;
     static constexpr uint32_t kMaxDepth = 1000;
 
-    Impl(Context& c, const Allocator& a) : alloc(a), self(c) {}
+    Impl(Context& c, const Allocator& a) : alloc(with_kind(a, MemoryKind::Script)), self(c) {}
     ~Impl();
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
@@ -205,6 +292,8 @@ struct Context::Impl {
 
     [[nodiscard]] Expected<Node> eval(const Node& n);
     [[nodiscard]] Expected<Node> call(const Array& command);
+    // The step budget is spent: true if the hook granted more (Context::set_step_hook).
+    bool more_steps();
     // The call itself. `counted`, if given, receives the counters of what was called.
     [[nodiscard]] Expected<Node> call_body(const Array& command, Counters** counted);
     // A call while profiling or tracing: times it, and reports it to the trace sink.
@@ -294,6 +383,7 @@ struct Context::Impl {
     // Types and objects a tool declared from the reference, for check(): the types are the
     // Context's to free; an object is a name and its type.
     Vec<detail::TypeRecord*> declared_types{alloc};
+    SpillStack spill{alloc};  // ArgValues past eight
     Vec<std::pair<Symbol, Symbol>> declared_objects{alloc};
     [[nodiscard]] Symbol declared_object(Symbol name) const noexcept {
         for (const auto& [n, type] : declared_objects)
@@ -311,6 +401,16 @@ struct Context::Impl {
     }
     const CallFrame* top = nullptr;  // the innermost call in progress
     uint32_t depth = 0;
+    uint64_t steps = Context::kUnlimitedSteps;  // Context::set_step_budget
+    Context::StepHook step_hook = nullptr;
+    void* step_user = nullptr;
+    bool in_step_hook = false;
+    // The budget ran out and the hook gave none.
+    bool steps_out = false;
+    // No call can run until the host sets a budget: a Scheduler stops its tick.
+    [[nodiscard]] bool steps_spent() const noexcept {
+        return steps_out || (steps == 0 && !step_hook);
+    }
     uintptr_t stack_base = 0;                        // the outermost call's stack address
     uintptr_t stack_budget = uintptr_t{256} * 1024;  // see Context::set_stack_budget
     NoticeSink sink = nullptr;

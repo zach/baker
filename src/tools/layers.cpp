@@ -8,6 +8,20 @@
 #include <algorithm>
 
 namespace baker::tools {
+namespace {
+// Layer `l`'s declarations.
+Vec<Declaration> declared(const LayerState& l) {
+    Vec<Declaration> out;
+    if (l.after && l.root)
+        declarations_of(*l.after, l.root->file(), {l.deps.data(), l.deps.size()}, out);
+    return out;
+}
+const Declaration* find_declared(const Vec<Declaration>& ds, const Declaration& like) {
+    for (const Declaration& d : ds)
+        if (d.directive == like.directive && d.name == like.name) return &d;
+    return nullptr;
+}
+}  // namespace
 
 Expected<List<LayerEffectEntry>> layer_effect(const Config& cfg, std::string_view layer) {
     const auto& impl = detail::ToolsAccess::impl(cfg);
@@ -35,8 +49,11 @@ Expected<List<LayerEffectEntry>> layer_effect(const Config& cfg, std::string_vie
         const Path path(leaf.path);
         e.path = Symbol(leaf.path);
         e.value = pack(leaf.values);
+        e.op = op_of(*leaf.holder);
         e.source = li ? impl.located(impl.layers[*li], *leaf.holder) : in_scratch;
-        if (value_nodes(*without, path, below)) e.below = pack(below);
+        const bool has = value_nodes(*without, path, below);
+        if (has) e.below = pack(below);
+        e.stale = stale(*leaf.holder, has ? &below : nullptr);
         // The topmost other layer that supplies the path: it shadows this one if above it.
         const auto s = impl.supplier(path, impl.layers.size(), li ? *li : SIZE_MAX);
         const bool scratch_has = !is_scratch && impl.scratch_entry(path);
@@ -47,6 +64,24 @@ Expected<List<LayerEffectEntry>> layer_effect(const Config& cfg, std::string_vie
         e.shadowed = scratch_has || (li && s && *s > *li);
         out.push_back(std::move(e));
     }
+    // Its declarations, each over the same one in the nearest enabled layer below.
+    if (li)
+        for (const Declaration& d : declared(impl.layers[*li])) {
+            LayerEffectEntry e{};
+            e.path = d.name;
+            e.value = d.form;
+            e.declares = d.directive;
+            e.source = Source{Symbol(layer), d.file, d.line};
+            for (size_t i = *li; i-- > 0 && !e.below;) {
+                if (!impl.layers[i].options.enabled) continue;
+                const Vec<Declaration> under = declared(impl.layers[i]);
+                if (const Declaration* b = find_declared(under, d)) {
+                    e.below = b->form;
+                    e.below_source = Source{Symbol(impl.layers[i].name), b->file, b->line};
+                }
+            }
+            out.push_back(std::move(e));
+        }
     return List<LayerEffectEntry>(out);
 }
 
@@ -76,18 +111,44 @@ Expected<List<DiffEntry>> diff(const Config& cfg, std::string_view a, std::strin
         const auto it = in_b.find(x.path);
         const Leaf* y = it != in_b.end() ? &lb[it->second] : nullptr;
         if (y) matched[it->second] = true;
-        if (y && same_nodes(x.values, y->values)) continue;
-        DiffEntry d{Symbol(x.path), pack(x.values), std::nullopt, source(a, x), std::nullopt};
+        if (y && same_nodes(x.values, y->values) && op_of(*x.holder) == op_of(*y->holder)) continue;
+        DiffEntry d{Symbol(x.path), pack(x.values),   std::nullopt, source(a, x),
+                    std::nullopt,   op_of(*x.holder), Symbol(),     Symbol()};
         if (y) {
             d.b = pack(y->values);
             d.source_b = source(b, *y);
+            d.op_b = op_of(*y->holder);
         }
         out.push_back(std::move(d));
     }
     for (size_t i = 0; i < lb.size(); ++i)
         if (!matched[i])
             out.push_back({Symbol(lb[i].path), std::nullopt, pack(lb[i].values), std::nullopt,
-                           source(b, lb[i])});
+                           source(b, lb[i]), Symbol(), op_of(*lb[i].holder), Symbol()});
+    // The two layers' declarations, by directive and name.
+    auto decls_of = [&](std::string_view name) {
+        const auto i = name == "scratch" ? std::nullopt : impl.find_layer(name);
+        return i ? declared(impl.layers[*i]) : Vec<Declaration>();
+    };
+    const Vec<Declaration> da = decls_of(a), db = decls_of(b);
+    for (const Declaration& x : da) {
+        const Declaration* y = find_declared(db, x);
+        if (y && structurally_equal(x.form, y->form)) continue;
+        DiffEntry d{x.name,       x.form,   std::nullopt, Source{Symbol(a), x.file, x.line},
+                    std::nullopt, Symbol(), Symbol(),     x.directive};
+        if (y) {
+            d.b = y->form;
+            d.source_b = Source{Symbol(b), y->file, y->line};
+        }
+        out.push_back(std::move(d));
+    }
+    for (const Declaration& y : db)
+        if (!find_declared(da, y)) {
+            DiffEntry d{
+                y.name,   std::nullopt, y.form,     std::nullopt, Source{Symbol(b), y.file, y.line},
+                Symbol(), Symbol(),     y.directive};
+            out.push_back(std::move(d));
+        }
     return List<DiffEntry>(out);
 }
 
@@ -97,17 +158,52 @@ Expected<List<ExplainEntry>> explain(const Config& cfg, const Path& path) {
     if (!path.valid()) return Unexpected(detail::get_error(root, path, nullptr));
     if (path.empty())
         return Unexpected(refused("the whole config has no single value: explain a leaf"));
+    // #shape.NAME[.FIELD]: each layer that declares it, bottom to top.
+    if (path[0].name == Symbol("#shape")) {
+        Vec<ExplainEntry> out;
+        if (path.size() < 2 || path.size() > 3 || path[1].is_index)
+            return Unexpected(refused("explain a shape as #shape.NAME or #shape.NAME.FIELD"));
+        for (const LayerState& l : impl.layers)
+            for (const Declaration& d : declared(l)) {
+                if (d.directive != Symbol("#shape") || d.name != path[1].name) continue;
+                const Array* form = d.form.try_array();
+                const Array* field =
+                    path.size() == 3 && form ? form->try_find(path[2].name) : nullptr;
+                if (path.size() == 3 && !field) continue;
+                ExplainEntry e{Symbol(l.name),
+                               field ? Node(Ref<Array>(const_cast<Array*>(field))) : d.form,
+                               Source{Symbol(l.name), field ? field->file() : d.file,
+                                      field ? field->line() : d.line}};
+                e.standing = l.options.enabled ? Standing::Wins : Standing::Disabled;
+                e.when = cfg.layer_condition(l.name.view());
+                out.push_back(std::move(e));
+            }
+        if (out.empty())
+            return Unexpected(make_error(
+                ErrorCode::NotFound, "no layer declares " + detail::text_of(path, SIZE_MAX, '.')));
+        return List<ExplainEntry>(out);
+    }
 
     // What one tree holds at `path`: a value, a removal of it or of an ancestor, an array
     // of arrays, or nothing.
     struct Held {
         Vec<Node> nodes;
-        const Array* marker = nullptr;
+        const Array* marker = nullptr;    // a removal of it or of an ancestor
+        const Array* composes = nullptr;  // (key #append v...) or (key #drop v...)
         bool value = false, subtree = false;
     };
     auto held = [&](const Array& tree) {
         Held h;
         detail::Resolved r;
+        // A row that composes the value, or the list an element is in: its operands, as
+        // layer_effect gives them.
+        if (const Array* row = tree.has_marker() ? row_at(tree, path) : nullptr;
+            row && detail::composes(*row)) {
+            h.composes = row;
+            h.nodes = leaf_values(*row);
+            h.value = true;
+            return h;
+        }
         for (size_t k = 1; k <= path.size(); ++k) {
             if (path[k - 1].is_index) continue;
             const Path prefix = k == path.size() ? path : Path(detail::text_of(path, k));
@@ -132,11 +228,17 @@ Expected<List<ExplainEntry>> explain(const Config& cfg, const Path& path) {
     auto add = [&](Symbol layer, const Held& h, const Source& source, bool enabled) {
         subtree = subtree || h.subtree;
         if (!h.value && !h.marker) return;
-        ExplainEntry e{layer, h.marker ? Node(detail::remove_marker()) : pack(h.nodes), source};
+        const Array* row = h.marker ? h.marker : h.composes;
+        ExplainEntry e{
+            layer, h.marker ? Node(detail::marker_symbol(detail::Marker::Remove)) : pack(h.nodes),
+            source, Standing::Wins, row ? op_of(*row) : Symbol()};
+        e.when = cfg.layer_condition(layer.str());
         if (!enabled) {
             e.standing = Standing::Disabled;
         } else if (decided) {
             e.standing = Standing::Shadowed;
+        } else if (h.composes) {
+            e.standing = Standing::Composes;  // the value below it still decides
         } else {
             e.standing = h.marker ? Standing::Removes : Standing::Wins;
             decided = true;
@@ -149,9 +251,10 @@ Expected<List<ExplainEntry>> explain(const Config& cfg, const Path& path) {
     for (size_t i = impl.layers.size(); i-- > 0;) {
         const LayerState& l = impl.layers[i];
         const Held h = held(*l.root);
-        const Source source = h.marker  ? impl.located(l, *h.marker)
-                              : h.value ? impl.source_in(l, path)
-                                        : Source{};
+        const Source source = h.marker     ? impl.located(l, *h.marker)
+                              : h.composes ? impl.located(l, *h.composes)
+                              : h.value    ? impl.source_in(l, path)
+                                           : Source{};
         add(Symbol(l.name), h, source, l.options.enabled);
         // The branch of an #ifdef its value was read in: the innermost around its line.
         if (!out.empty() && out.back().layer == Symbol(l.name) && l.after && !source.file.empty())

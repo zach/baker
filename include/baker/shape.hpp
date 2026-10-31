@@ -1,26 +1,26 @@
 #pragma once
 
-// baker::shape: the expected structure of a data domain,
-// declared in data, by whichever layer owns the vocabulary.
+// baker::shape: the expected structure of a data
+// domain, declared in data, by whichever layer owns the vocabulary, with #shape:
 //
-//   (shapes
-//     (boss_phase (at bosses * phases)
-//       (enter_at float (range 0 1) (kind percent) (desc "HP fraction that starts it"))
-//       (attacks  (list symbol))
-//       (cadence  float (range 0.2 5) (optional))))
+//   #shape (boss_phase (@at bosses * phases)
+//     (enter_at float (@range 0 1) (@kind percent) (@desc "HP fraction that starts it"))
+//     (attacks  (list symbol))
+//     (cadence  float (@range 0.2 5) (@optional)))
 //
-// A shape governs every array tagged with its name, or, given (at ...), those whose
+// A shape governs every array tagged with its name, or, given (@at ...), those whose
 // ancestors' tags from the root are the ones listed (`*` matches any). A shape declared
-// (keyed) governs every child of the arrays at its (at ...) path, whatever the child's tag:
+// (@keyed) governs every child of the arrays at its (@at ...) path, whatever the child's tag:
 // keyed data, as (fighters (kestrel (moves (jab ...) (kick ...)))), which layers merge by
 // name.
 //
-//   (shapes (move (at fighters * moves) (keyed) (startup int (range 1 60))))
+//   #shape (move (@at fighters * moves) (@keyed) (startup int (@range 1 60)))
 //
 // A field has a type (int, float, bool, symbol, string, any, curve, (list T), another shape's
-// name, or (key_of TABLE)) and the tweak metadata; a symbol field may list the
-// symbols it allows, (button symbol (one_of light heavy kick special)). A curve field's values
-// are a curve (<baker/curve.hpp>), and its (range lo hi) holds every point's y.
+// name, or (key_of TABLE)) and the tweak metadata, each with its sigil. A list
+// may give its count: (list float 4) holds four values, (list float 1 3) one to three. A symbol
+// field may list the symbols it allows, (button symbol (@one_of light heavy kick special)). A curve
+// field's values are a curve (<baker/curve.hpp>), and its (@range lo hi) holds every point's y.
 //
 // (key_of TABLE) holds a symbol to the keys of a keyed table: (weapon (key_of weapons)) in
 // a unit names a child of (weapons (laser ...) (rifle ...)). TABLE is a dotted path, looked
@@ -59,20 +59,23 @@ struct Field {
     Type element = Type::Any;   // a List's elements
     baker::Symbol shape;        // a Shape's, or a List of shapes', name
     List<baker::Symbol> table;  // a Key's, or a List of keys', table: a path, as written
+    // How many values a List holds: (list T N) exactly N, (list T N M) N to M; any number
+    // when not declared.
+    uint32_t min_count = 0, max_count = UINT32_MAX;
     bool optional = false;
     bool ranged = false;
     double min = 0, max = 0;
     double step = 0;  // 0: none
     baker::Symbol kind;
     std::string_view desc, note;  // in the declaration, which the Set keeps
-    // (one_of light heavy kick): the symbols a symbol field's value may be, in the order
+    // (@one_of light heavy kick): the symbols a symbol field's value may be, in the order
     // written; a field declared again adds to it. Empty: any symbol.
     List<baker::Symbol> one_of;
     baker::Symbol file;
     int32_t line = 0;
 };
 
-// (rule "message" {expression} (warn)): what must hold between a record's values. The
+// (@rule "message" {expression} (@warn)): what must hold between a record's values. The
 // shape library reads rules; baker::tools evaluates them (tools::check_rules), since this
 // library cannot run script.
 struct Rule {
@@ -112,15 +115,17 @@ public:
     Set(Set&& other) noexcept;
     Set& operator=(Set&& other) noexcept;
 
-    // Reads every (shapes ...) at the top of `tree`. A field declared again takes the new
+    // Reads every #shape the session's reads declared, or, given `root`, those of the read
+    // that began with that file: one layer's (Config::layer_root(name)->file()). A field
+    // declared again takes the new
     // type and whatever metadata the new declaration gives, as Config's merge of two layers
     // would. A malformed declaration is an error in `report`.
     //
-    // With `packs`, harder packs' declarations hold: a field a softer pack declares
+    // Harder packs' declarations hold: a field a softer pack declares
     // again may narrow a range or add metadata, but one that widens or drops a range, changes
     // the type, or makes a required field optional is a warning in `report`, and the harder
     // declaration stays. Files that declare no pack are unconstrained, as in the one-way rule.
-    void add(const Array& tree, Report& report, const LoadSession* packs = nullptr);
+    void add(const LoadSession& session, Report& report, baker::Symbol root = {});
     [[nodiscard]] std::span<const Shape> shapes() const noexcept;
     [[nodiscard]] const Shape* find(baker::Symbol name) const noexcept;
 
@@ -135,6 +140,11 @@ private:
 // one-way rule warns of a call.
 void check(const Array& tree, const Set& shapes, Report& report,
            const LoadSession* packs = nullptr);
+// A warning in `report` for each shape of `shapes` that governs no array of `tree`: one whose
+// (@at ...) names a place the data does not have (a keyed shape one level off checks
+// nothing), or whose tag nothing carries. A tool's check, not a validator's: data a stack
+// lacks for now is not an error at every merge.
+void unused(const Array& tree, const Set& shapes, Report& report);
 // Calls `visit` with each array of `tree` that a shape with rules governs (as check() finds
 // them, by tag or at a keyed shape's path), the shape, and the array's path from the root:
 // what tools::check_rules evaluates each rule over.
@@ -150,7 +160,7 @@ void each_ruled(
 // baker::script warns once that the shapes hold rules it cannot check.
 [[nodiscard]] Config::Validator validator();
 
-// The shapes of `shapes` as JSON (schema baker.shapes/1.4, docs/reference-json.md), sorted by
+// The shapes of `shapes` as JSON (schema baker.shapes/1.5, docs/reference-json.md), sorted by
 // name: each shape's place, keyed or not, and its fields with their types, ranges, steps,
 // kinds, documentation, and where they are declared, and its rules. For editors and agents.
 void write_json(const Set& shapes, TextSink out);

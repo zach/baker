@@ -6,6 +6,8 @@
 #include <baker/std_interop.hpp>
 #include <baker/tweak.hpp>
 
+#include <bit>
+#include <cstdint>
 #include <string>
 #include "ok.hpp"
 
@@ -174,5 +176,35 @@ TEST_CASE("Tweak<Curve> reads a key's curve; a layer replaces it whole") {
         REQUIRE(falloff.set(Curve(edited, CurveMode::Linear)));
         CHECK(falloff.get().sample(1) == doctest::Approx(3));
         CHECK(cfg.get<Curve>("falloff")->mode() == CurveMode::Linear);
+    }
+}
+
+TEST_CASE("a curve samples to the same bits on every compiler and platform") {
+    // Each sample's exact bits. A build that fuses a multiply and an add (GCC and Clang do
+    // where the target has FMA, unless Baker's build says -ffp-contract=off) changes the last
+    // bits of several, and a replay or a digest of computed values would differ with it.
+    struct Golden {
+        const char* curve;
+        double x;
+        uint64_t bits;
+    };
+    static constexpr Golden kGolden[] = {
+        {"(c (0 0.1) (1.3 2.7) (2.9 0.3) (4.1 3.3))", 0.37, 0x3fefb393ae704ed6},
+        {"(c (0 0.1) (1.3 2.7) (2.9 0.3) (4.1 3.3))", 1.91, 0x3ffeb61de69ad42d},
+        {"(c (0 0.1) (1.3 2.7) (2.9 0.3) (4.1 3.3))", 3.33, 0x3fedd6164ce9ed5e},
+        {"(c (0 0.1) (1.3 2.7) (2.9 0.3) (4.1 3.3))", 5.17, 0x400a666666666666},
+        {"(c catmull-rom (0 0.1) (1.3 2.7) (2.9 0.3) (4.1 3.3))", 0.37, 0x3fef8903d1bc96fa},
+        {"(c catmull-rom (0 0.1) (1.3 2.7) (2.9 0.3) (4.1 3.3))", 1.91, 0x3ffe79c94acb9e1c},
+        {"(c catmull-rom (0 0.1) (1.3 2.7) (2.9 0.3) (4.1 3.3))", 3.33, 0x3fef0ce13060d906},
+        {"(c extrapolate (0 0.1) (1.3 2.7 0.7 -1.9) (2.9 0.3))", 0.37, 0x3fee0392ae502b0d},
+        {"(c extrapolate (0 0.1) (1.3 2.7 0.7 -1.9) (2.9 0.3))", 1.91, 0x3ffb10ba9d1f6018},
+        {"(c extrapolate (0 0.1) (1.3 2.7 0.7 -1.9) (2.9 0.3))", 3.33, 0xbfd6147ae147ae1d},
+        {"(c extrapolate (0 0.1) (1.3 2.7 0.7 -1.9) (2.9 0.3))", 5.17, 0xc008d70a3d70a3da},
+    };
+    for (const Golden& g : kGolden) {
+        CAPTURE(g.curve);
+        CAPTURE(g.x);
+        const Read r(g.curve);
+        CHECK(std::bit_cast<uint64_t>(r.curve.sample(g.x)) == g.bits);
     }
 }

@@ -82,6 +82,9 @@ TEST_CASE("fuzzer regressions stay fixed") {
         if (e.path().extension() != ".bin") continue;
         CAPTURE(e.path().string());
         CHECK(fuzz::check_parse(slurp(e.path())));
+        // The lookup fuzzer's, named for it: a path line, then the text.
+        if (e.path().filename().string().starts_with("lookup_"))
+            CHECK(fuzz::check_lookup(slurp(e.path())));
         ++count;
     }
     CHECK(count > 0);

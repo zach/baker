@@ -37,13 +37,22 @@ static baker::Tweak<float> kJumpHeight{"player.jump.height", 1.2f,
 - **Declare tweaks at namespace scope.** A function-local static adds a guard check to
   every read. At namespace scope, reading a `Tweak<float>` is one relaxed atomic load,
   checked in the generated assembly by a test.
+- **Read a tweak once into a local before a hot loop.** A read is an atomic load, which no
+  compiler hoists out of a loop, so `for (...) v[i] *= speed;` multiplies one float at a
+  time where `const float s = speed;` first lets the loop use SIMD (GCC and Clang, -O3).
+  Reading once also gives the loop one value even if a reload lands meanwhile.
+
+  ```cpp
+  const float s = speed;                 // one read a frame
+  for (float& v : velocities) v *= s;    // vectorized
+  ```
 - **The default is the old constant.** A path the data does not set keeps it, and that
   is never an error: a tweak can go in before anyone writes its data.
 - **Metadata belongs in the data once someone tunes it.** The code's `TweakMeta` is a
-  starting point; `(height 1.4 (range 0.5 4) (note "4 breaks the level 3 ceiling"))` in
-  the data wins, and `note` exists only there: a remark from whoever tuned the value for
+  starting point; `(height 1.4 (@range 0.5 4) (@note "4 breaks the level 3 ceiling"))` in
+  the data wins, and `@note` exists only there: a remark from whoever tuned the value for
   whoever tunes it next. A value of several numbers takes metadata the same way:
-  `(tint 0.9 0.5 0.2 (range 0 1))` is three numbers, which a tool shows as a color.
+  `(tint 0.9 0.5 0.2 (@range 0 1))` is three numbers, which a tool shows as a color.
 - **Types.** Any `T` with a `Convert<T>` works. One whose `std::atomic` is lock-free reads
   with a load; another (`std::string`, `std::vector<float>`) reads through `get()`, whose
   reference stays valid until the next reload.
@@ -121,12 +130,13 @@ and the game and every tool read it.
    (reference "build/reference.json") ; for tools: where the build writes the reference
    (tool "build/bin/my_game")         ; for tools: the binary that answers the commands
    (console 4555)                     ; for tools: the port the game's console listens on
-   (format (indent 3) (width 100))    ; for tools: how its files are laid out (format)
+   (format (indent 3) (width 100))    ; how its files are laid out, by format and write-back
    (scenarios "sim")                  ; for sim: scenarios and objectives (docs/sim-json.md)
    (objectives "metrics")
    (layers                            ; bottom to top
       (default "data/default.dta")
       (mods (dir "mods") optional)    ; a layer for each mod in mods/
+      (handheld "data/handheld.dta" (when (and HANDHELD (not PC))))
       (local "data/local.dta" optional dev_only)
       (agent "data/agent.dta" optional dev_only)))
 ```
@@ -149,6 +159,15 @@ if (auto r = baker::open_project(cfg, *project); !r) return report(r.error());
   shipping build never pushes even when its file is present. A `(dir "path")` entry is a
   directory of layers, one for each file or folder in it (see Content packages below); its
   flags apply to every layer it finds.
+- **A condition:** `(when COND)` keeps a layer in the merge only while the session's
+  defines say so: a platform's differences, a demo build's store, an experiment for one
+  build. COND is a define's name, `(not C)`, `(and C C...)` or `(or C C...)`, read as
+  `#ifdef` reads names, unexpanded. The layer is pushed and read either way; while its
+  condition does not hold it is skipped as a disabled one is. `set_defines` applies every
+  condition again in its one merge, `explain` lists a layer's condition with its values,
+  and `Config::layer_condition` gives it to a panel. With `disabled` too, it is off until
+  enabled, and then still under its condition. In C++, `push_layer(name, path, {.when =
+  "(not PC)"})`.
 - **Packaging:** a build step that copies the data directory whole would ship those files
   too. It reads the project instead and leaves out each layer whose `dev_only` is set, by
   the path the project names; a file such a layer only `#include`s is the step's to know.
@@ -233,6 +252,8 @@ it stands:
 - `Wins`: it supplies the value `get` returns.
 - `Shadowed`: a layer above overrides it.
 - `Removes`: it holds `(key #remove)` for the key or an ancestor.
+- `Composes`: it holds `(key #append ...)` or `(key #drop ...)`, which changes the value
+  below it; its `op` names the verb.
 - `Disabled`: a toggled-off layer that would bring the value back.
 
 A tweak at the path adds a first entry, `code`, holding its default.
@@ -306,7 +327,7 @@ setting only its own values) so that removing one never needs another removed fi
 ### Tests before an overlay ships
 
 - **Shapes.** Declare, in the shipped data, the shapes of everything an overlay may set,
-  with ranges: `(event (drop_rate float (range 0 1)))`. With
+  with ranges: `(event (drop_rate float (@range 0 1)))`. With
   `cfg.add_validator(baker::shape::validator(), {.any_thread = true})`, the shapes judge
   every push and every check of an overlay before it is pushed: `examples/live-ops` refuses
   an overlay that sets a 15% drop rate as `15`.
@@ -326,11 +347,15 @@ declares.
 
 | Rule | Refuses |
 |---|---|
-| `data_only` | commands, properties, variables, `#autorun` |
-| `scalars_only` | a value that is not a number, symbol or string, and a removal |
+| `data_only` | commands, properties, variables, `#autorun`, and `#shape` |
+| `scalars_only` | a value that is not a number, symbol or string, a removal, and `#shape` |
 | `existing_only` | a new key, and a removal |
 | `allow` | anything outside the listed paths |
 | `warnings_refuse` | anything a validator, or the read, warns about |
+
+Shapes are refused by both data rules because they change how the stack is checked: an
+overlay that sent `#shape (item (price int (@range 0 99999)))` beside `(shop (sword (price
+5000)))` would widen the range its own value is checked against.
 
 **The check.** `cfg.check_layer_text(name, text, policy)` checks text received from
 outside, changing nothing:
@@ -366,11 +391,11 @@ which base it needs:
 
 ```dta
 ; data/default.dta
-(pack game_data (level game) (version "1.0"))
+#pack (game_data (level game) (version "1.0"))
 
 ; overlays/2026-10-17-double-xp.dta
-(pack double_xp_1017 (level live) (version 1) (requires (game_data "1.0")))
-(origin "liveops console, ticket 4412" (tool baker-publish))
+#pack (double_xp_1017 (level live) (version 1) (requires (game_data "1.0")))
+#origin ("liveops console, ticket 4412" (tool baker-publish))
 (event (xp_multiplier 2) (banner "Double XP all weekend!"))
 ```
 
@@ -379,7 +404,7 @@ which base it needs:
   refused.
 - This guards rollbacks too. An overlay checked against the base it lands on cannot meet
   data whose shape has moved since it was made.
-- `(origin ...)` carries into provenance. `source("event.xp_multiplier")` names the
+- `#origin` carries into provenance. `source("event.xp_multiplier")` names the
   overlay's layer, the ticket, and the publishing tool, so an operator can see what is live
   and why.
 
@@ -470,6 +495,12 @@ and one allocation each: a 6.2 MB tree in 2.3–2.5 ms.
   and `baker::read_cached(text_path, cache_path, session)` in the game, which uses the
   cache when it is fresh and the text otherwise. Give `baker_bake` the same defines as the
   game, or the cache is stale for it.
+- **Leave the metadata at home:** `baker_bake --drop-metadata` writes a cache without any
+  `(@...)` child of data (ranges, descriptions, notes, `(@was ...)` pins), which only
+  development tools read; `ConfigOptions::cache_drop_metadata` does the same for a Config's
+  `cache_dir`, and `baker::without_metadata(root)` gives the tree. Values read the same.
+  Commands keep their own forms. A development build reading such a cache has no metadata
+  either, so bake the shipped caches apart from the ones developers use.
 - **A cache is a memory image**, for one byte order and pointer size: bake it with the
   target's layout. Today's consoles and PCs are all little-endian and 64-bit, so a bake
   on a development PC serves them. A cache from another layout is refused with an error
@@ -518,10 +549,10 @@ How a game delivers content after it ships:
   parse is an empty layer, its error located and passed to the warning handler, until it is
   fixed; the rest stand. A host with an archive or a virtual root lists the directory with
   `LoadSession::set_lister`, as it reads with `set_reader`.
-- **Anything packages extend is a keyed table.** Two layers that set one value list leave
-  the top one's list, because Overwrite replaces values. Keyed children merge, so every
-  package's entries survive. This is how Rock Band's `songs.dta` scaled to thousands of
-  downloadable songs:
+- **Key what packages retune by name; mark what they extend in order.** Two layers that set
+  one value list leave the top one's list, because Overwrite replaces values. Keyed
+  children merge, so every package's entries survive, and each can retune one by its name.
+  This is how Rock Band's `songs.dta` scaled to thousands of downloadable songs:
 
   ```dta
   ; base: (songs (song_a (bpm 120)) (song_b (bpm 90)))
@@ -530,8 +561,18 @@ How a game delivers content after it ships:
   ; merged: (songs (song_a ...) (song_b ...) (song_c ...))
   ```
 
-  A value list such as `(setlist song_a song_b)` is right for something one package owns.
-  `layer_effect` shows a layer that replaces another's list.
+  A list whose entries have no names of their own, items, a move's cancels, a room's
+  furniture with two beds, takes `#append` and `#drop`: `(items #append rope)` adds
+  to the list below without restating it, so packages compose in their stack order, and a
+  title update drops one entry without reverting the rest. A list that one package owns
+  stays a plain value list. `layer_effect` shows a layer that replaces another's list, and
+  names each verb.
+- **A mod directory is a stack of packages**: each mod that extends a list appends to
+  it, and `order.dta` decides the order their entries take.
+- **An overlay pins what it was written against.** A live-ops overlay or an agent's layer
+  written with `write_back_to(path, layer, true)` carries `(@was v...)`, the value below it
+  then. When a title update moves that value, checking the overlay warns at the row
+  instead of silently reverting the update, and `warnings_refuse` refuses it.
 - **A title update removes with `(key #remove)`**, a debug menu or an exploit's entry, and
   the key stays gone until the layer is removed.
 - **A title update changes values, not the macros below it.** A layer reads with the macros
@@ -539,9 +580,10 @@ How a game delivers content after it ships:
   it, never the base that already expanded it.
 - **Run autorun with `Context::run_autorun(cfg.autorun().items())`** after every stack
   change. Script an uninstalled DLC defined goes with it, and what it replaced comes back.
-- **Declare what a package requires**, and at which version: `(pack expansion (level dlc)
-  (version "1.0") (requires (base_game "1.2") season_pass))`. A requirement that is not loaded once the pack's file is read is a
-  located warning, forwarded to the Config's warning handler.
+- **Declare what a package requires**, and at which version: `#pack (expansion (level dlc)
+  (version "1.0") (requires (base_game "1.2") season_pass))`. A requirement that is not
+  loaded once the pack's file is read is a located warning, forwarded to the Config's
+  warning handler.
 - **A cache patches about as small as its text**. It is laid out in source order,
   with no absolute offsets, so an edit changes the cache's bytes near the edit and a binary
   diff or a chunked store sends little more than the edit: inserting a section into a
@@ -554,6 +596,14 @@ How a game delivers content after it ships:
   Content that arrives as text, such as a live overlay, also sets
   `LoadSession::refuse_includes`, so it cannot `#include` the game's files;
   `Config::push_layer_text` sets both.
+- **Bound the names outside text adds.** Symbols live until the program ends, so overlays
+  read all session, mods, or a console that use unique IDs as symbols add to them with every
+  read. `ParseLimits::max_new_symbols` (on the session's `limits`) caps the names a read
+  may add that the program had not seen: past it the read fails with `ErrorCode::Limit`.
+  The default, 1,048,576, suits the game's own data; set it far lower for text you do not
+  trust: at the default, one read can keep about 74 MB of names for the rest of the
+  session (about 74 bytes a name). A name already interned costs nothing, so reading the
+  same overlay again counts none.
 
 ## Linking a shipped game
 
@@ -578,8 +628,36 @@ pays only for what it links:
   ```
 
 A minimal game (load, read, a tweak, a function, an object, `eval`) built with
-`BAKER_SHIPPING` links 580 KB of Baker code, 41.5 KB of it tooling; with sections, 407
-KB, 4.8 KB of it tooling (the source maps that loading reaches).
+`BAKER_SHIPPING` links about 910 KB of Baker code with GCC 13 at -O2, and about 595 KB
+with sections.
+
+A tweak's tool text stays out too. Under `BAKER_SHIPPING` a `Tweak` keeps only the
+metadata that decides its value (`range`, `one_of`, `choices`, `dev_only`): its `desc`,
+`kind`, `group` and `step` are not copied, so an optimized build drops their literals with
+the copy, and a `Tweak<float>` is 128 bytes, not 184. Metadata in the data still applies.
+So does doc text: under `BAKER_SHIPPING`, `.doc(...)` on a function or a method,
+a property's and a global's doc, and the built-ins' docs are dropped where they are
+written, and a cache baked with `--drop-metadata` keeps no shape's notes.
+
+Baker's memory comes from the allocators you give it: one to each `Config` and `Context`,
+and the default (`set_default_allocator`, before Baker first allocates) for what has no
+owner. Each call says what the memory is for, so a game can hold Baker to a budget per
+kind:
+
+```cpp
+void* game_alloc(void* user, size_t size, size_t align, baker::MemoryKind kind) {
+    budgets[size_t(kind)] += size;  // symbols, trees, config, script, tasks, tweaks, errors...
+    return engine_heap_alloc(size, align);
+}
+void game_free(void* user, void* p, size_t size, baker::MemoryKind kind) {
+    budgets[size_t(kind)] -= size;  // the same kind its allocation named
+    engine_heap_free(p);
+}
+```
+
+Every owner tags the copy it keeps (a Context allocates as `Script`, its Schedulers as
+`Tasks`, what a load builds as `Trees`), and a free names the kind its allocation did.
+`memory_kind_name` gives each a name for a report.
 
 ## Harness packs
 
@@ -588,14 +666,14 @@ fast: a boss-tuning harness, an economy harness. Packs give harnesses a structur
 
 ```dta
 ; harness/combat_core.dta
-(pack combat_core (level game))
+#pack (combat_core (level game))
 [combat.hit_pause 0.08]
 {func combat.knockback ($force) {* $force 1.5}}
 ```
 
 ```dta
 ; harness/boss_tools.dta
-(pack boss_tools (level task) (requires combat_core))
+#pack (boss_tools (level task) (requires combat_core))
 #require "combat_core.dta"
 [boss.restart_phase {boss_phase_restart}]
 ```
@@ -654,7 +732,7 @@ people. Two calls give it what it needs:
 
 ```
 > (1 {config.explain player.speed})
-{"schema":"baker.reply/1.1","id":1,"ok":true,"text":"...","value":[
+{"schema":"baker.reply/1.2","id":1,"ok":true,"text":"...","value":[
   {"layer":"default","value":4.5,"standing":"shadowed","file":"default.dta","line":3},
   {"layer":"local","value":6,"standing":"wins","file":"local/me.dta","line":1}]}
 ```
@@ -690,10 +768,29 @@ frames. Other threads may read, on these terms:
 - **Checks off the game's thread** take `cfg.checker()` (see
   [Live ops](#tests-before-an-overlay-ships)).
 - **Symbols** may be made from any thread; the symbol table's reads take no lock.
+- **No fiber switch inside a Baker call.** A Context's current call, the symbol table's
+  intern site and a few tools keep thread-local state, which a compiler may read once and
+  keep across a call. A native function bound into script that waits on a job counter
+  must not switch fibers, or resume on another thread, before it returns to Baker. A
+  fiber-based job system waits outside the call: the native starts the job and returns,
+  and the script picks up the result later (a task, or the next frame).
 - **Script on a small stack.** `Context::set_stack_budget(bytes)` bounds how deep a script
   may nest before it gets a Limit error instead of a stack overflow. The default, 256 KB,
   suits a desktop or console thread; on a thread with a smaller stack (a handheld's worker,
   a fiber of a job system) set it to well under that thread's stack size.
+- **A budget for script you did not write.** Depth bounds recursion, not work: a doubly
+  recursive `{func}` in a mod or a live overlay can stay shallow and still hang a frame.
+  `Context::set_step_budget(n)` gives the Context n steps; every call spends one, so a
+  script spends the same on every run, as a replay or a headless simulation needs. When
+  they run out the call fails with a Limit error, and so does every call after it until
+  the budget is set again: set it once a frame, or before each console command. A
+  Scheduler's tick stops at that point, so a runaway task ends with the error and the tasks
+  after it wait for the next tick rather than fail with it. A hook,
+  `set_step_hook(fn, user)`, is asked first and may grant more, for a time limit (grant
+  10,000 steps and check the clock each time it is asked) or a sampling profiler (read
+  `top_frame()` in it). The default budget is unlimited; the check costs five
+  instructions a call. A game that runs only its own script can build with
+  `-DBAKER_STEP_BUDGET=OFF`, which compiles the check out.
 
 ## Agreeing on the data: lockstep, replays, saves
 
@@ -714,6 +811,45 @@ stacks apart that merge to the same values. `baker::digest(tree)` digests any tr
 and value, not by file, layout or comments; the encoding is fixed and documented in
 `array.hpp`. It finds a difference and is no defence against tampering: it is not a
 cryptographic hash.
+
+## Stable IDs for names
+
+A `Symbol` is a name's text and its identity in this process: comparing two is comparing
+pointers, and its `index()` follows the order names were interned. Neither means anything to
+another process, so a save file, a network message, a replay or a crash dump that names a
+move, an item or an event writes its hash instead, and a `switch` dispatches on it:
+
+```cpp
+using namespace baker::literals;
+switch (event.hash()) {            // the Symbol's hash, or symbol_hash(text) of a string
+    case "jump"_hash: start_jump(); break;
+    case "land"_hash: land(); break;
+    default: break;
+}
+save.write_u64(player.weapon.hash());
+```
+
+- **What it is.** `baker::symbol_hash(text)`, `"name"_hash` and `Symbol::hash()` give one
+  value: FNV-1a 64 over the name's bytes as written (UTF-8 for a non-ASCII name), with no
+  normalisation. It is the same on every platform, compiler and build mode, and it is
+  computed at compile time for a literal. Baker promises it: changing the algorithm would be
+  a breaking change, announced in the changelog, and the library's build checks golden
+  values.
+- **What it is for.** Keys that must survive the process. Inside it, hold a `Symbol`, which
+  is cheaper to compare and cannot collide.
+- **What it is not.** A hash is an extra key for the game, never the name's replacement:
+  data files and the binary cache keep the text, and reading them never depends on a hash.
+- **Two names that share a hash.** It is very unlikely, about 3 in a million among ten
+  million names, but a `switch` or a save keyed by hash would take one name for the other
+  without an error. A build that is not shipping checks every name the first time it is
+  interned, whether from code, a data file or a binary cache, and reports a pair that
+  shares a hash: an `Error` with `ErrorCode::Collision`, naming both names and the hash, at
+  the data file and line being read. The default writes it to stderr and aborts;
+  `baker::set_symbol_collision_handler(fn)` takes it instead, to log it or fail a build
+  step. Both names stay interned, distinct Symbols: only code keyed on the hash is at risk.
+  A shipping build does not check, and pays nothing for it. A game that ships hash-keyed
+  data runs that data through a build that is not shipping, in CI for example, so a
+  collision is found before it ships.
 
 ## Repro scripts
 

@@ -1,4 +1,4 @@
-# Replies for tools: schema `baker.reply/1.1`
+# Replies for tools: schema `baker.reply/1.2`
 
 `baker::eval_request(ctx, line, sink)` evaluates one line from a tool (a console client, an
 editor, an agent's bridge) and writes one line of JSON. A tool sends a request, reads one
@@ -7,7 +7,7 @@ line back, and never parses Baker text unless it wants to.
 ```cpp
 std::string reply;
 baker::eval_request(ctx, "(7 {config.source player.speed})", baker::string_out(reply));
-// {"schema":"baker.reply/1.1","id":7,"ok":true,
+// {"schema":"baker.reply/1.2","id":7,"ok":true,
 //  "text":"(source (layer default) (file \"default.dta\") (line 3))",
 //  "value":{"layer":"default","file":"default.dta","line":3}}
 ```
@@ -30,12 +30,15 @@ no JSON.
 
 | Field | Type | Contents |
 |---|---|---|
-| `schema` | string | `"baker.reply/1.1"` |
+| `schema` | string | `"baker.reply/1.2"` |
 | `id` | number, string, or `null` | the request's ID |
 | `ok` | bool | whether the command succeeded |
 | `text` | string | on success: the result, printed as Baker text. **The authority**: it reads back as the same value. |
 | `value` | any | on success: the result projected to JSON (below). Lossy by design. |
 | `error` | object | on failure: `code`, `file`, `line`, `column` (1-based, in characters; 0 if unknown; 1.1), `path`, `message`, and `stack` |
+
+1.2 adds no field: a path to metadata is spelled with its sigil, `player.speed.@desc`, as
+the data spells it.
 
 `error.stack` lists the script calls the error unwound through, innermost first. Each one
 has `function`, `on` (the object it was sent to, or `""`), `file` and `line`.

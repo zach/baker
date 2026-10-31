@@ -1,8 +1,8 @@
 {
-  "schema": "baker.check/1.4",
+  "schema": "baker.check/1.5",
   "passed": false,
   "errors": [
-    {"code": "type", "file": "game.dta", "line": 5, "column": 0, "path": "", "message": "no overload of '+' takes 1 argument"}
+    {"code": "type", "file": "game.dta", "line": 5, "column": 0, "path": "", "message": "'+' takes at least 2 arguments, given 1"}
   ],
   "warnings": [
     {"code": "refused", "file": "game.dta", "line": 3, "column": 0, "path": "", "message": "pack 'game_rules' (level game) calls 'boss.restart' from the softer pack 'boss_task' (level task)"}

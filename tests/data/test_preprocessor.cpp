@@ -81,12 +81,12 @@ TEST_CASE("[ ] defines a macro only at a file's top level") {
 }
 
 TEST_CASE("#define and #undef") {
-    CHECK(text("#define kMax (4)\n(players kMax)") == "((players 4))");
-    CHECK(text("#define PAIR (1 2)\n(p PAIR)") == "((p 1 2))");
+    CHECK(text("[kMax 4]\n(players kMax)") == "((players 4))");
+    CHECK(text("[PAIR 1 2]\n(p PAIR)") == "((p 1 2))");
     CHECK(text("#define FLAG\n(a FLAG)") == "((a FLAG))");  // a flag is not a macro
     // The body must start on the same line; otherwise the define is a flag.
     CHECK(text("#define FLAG\n(next 1)") == "((next 1))");
-    CHECK(text("#define X (1)\n#undef X\n(a X)") == "((a X))");
+    CHECK(text("[X 1]\n#undef X\n(a X)") == "((a X))");
     CHECK(error("#define").code() == ErrorCode::Directive);
     CHECK(error("#define (a)").message() == "#define needs a name");
     CHECK(error("#undef 5").message() == "#undef needs a name");
@@ -126,13 +126,20 @@ TEST_CASE("unknown directives are errors") {
     CHECK(e.line() == 2);
 }
 
-TEST_CASE("a lone # is a symbol") {
-    // Real data binds it as a key: (# {fake_win 3}) in a cheats table.
-    auto root = read_string("(# 3) #", "t.dta");
+TEST_CASE("# opens a directive only before a letter: #, #1 and #00aa00 are symbols") {
+    // Real data binds a lone # as a key: (# {fake_win 3}) in a cheats table. The
+    // reader and the printer agree on each, so it reads back as written.
+    auto root = read_string("(# 3) # (tint #00aa00) (#1 one) (#- x)", "t.dta");
     REQUIRE(root);
     CHECK((*(**root)[0].array())[0].try_sym() == Symbol("#"));
     CHECK((**root)[1].try_sym() == Symbol("#"));
-    CHECK(to_dta(**root) == "('#' 3)\n'#'\n");
+    CHECK((*(**root)[2].array())[1].try_sym() == Symbol("#00aa00"));
+    CHECK(to_dta(**root) == "(# 3)\n#\n(tint #00aa00)\n(#1 one)\n(#- x)\n");
+    // Before a letter it is a directive, and a symbol so spelled prints quoted.
+    CHECK_FALSE(read_string("(a #x1)", "t.dta"));
+    auto quoted = read_string("('#x1')", "t.dta");
+    REQUIRE(quoted);
+    CHECK(to_dta(**quoted) == "('#x1')\n");
     auto again = read_string(to_dta(**root), "t.dta");
     REQUIRE(again);
     CHECK(structurally_equal(**root, **again));
@@ -298,7 +305,7 @@ TEST_CASE("size limits stop macro blow-ups") {
 TEST_CASE("#require reads a file once per session") {
     Files fs;
     // A pack: a macro, and a node that shows each time the pack is read.
-    fs.files["pack.dta"] = "#define SPEED (speed 3)\n(pack_read)";
+    fs.files["pack.dta"] = "[SPEED speed 3]\n(pack_read)";
     for (const char* f : {"a.dta", "b.dta", "c.dta"})
         fs.files[f] = std::string("#require pack.dta\n(") + f[0] + " SPEED)";
     fs.files["main.dta"] = "#include a.dta\n#include b.dta\n#include c.dta";
@@ -332,13 +339,13 @@ TEST_CASE("a pack whose required pack is not loaded is warned about") {
     };
     Files fs;
     fs.session.set_pack_levels({"game", "dlc"});
-    fs.files["combat_core.dta"] = "(pack combat_core (level game))\n#define HIT (2)";
+    fs.files["combat_core.dta"] = "#pack (combat_core (level game))\n[HIT 2]";
     // The cookbook's pattern: declare what it requires, then #require it.
     fs.files["boss_tools.dta"] =
-        "(pack boss_tools (level dlc) (requires combat_core))\n#require combat_core.dta\n"
+        "#pack (boss_tools (level dlc) (requires combat_core))\n#require combat_core.dta\n"
         "(boss (hit HIT))";
     fs.files["expansion.dta"] =
-        "; an expansion\n(pack expansion (level dlc) (requires season_pass))\n"
+        "; an expansion\n#pack (expansion (level dlc) (requires season_pass))\n"
         "(zone (desert 4))";
     CHECK(fs.load("boss_tools.dta") == "((boss (hit 2)))");
     CHECK(requires_warnings(fs.session).empty());
@@ -376,10 +383,10 @@ TEST_CASE("packs declare versions, and a required version is checked") {
     {
         Files fs;
         session(fs);
-        fs.files["base.dta"] = "(pack base (level game) (version \"1.2\"))\n(a 1)";
+        fs.files["base.dta"] = "#pack (base (level game) (version \"1.2\"))\n(a 1)";
         fs.files["ok.dta"] =
-            "(pack ok_dlc (level dlc) (requires (base \"1.2\")))\n#require base.dta";
-        fs.files["new.dta"] = "(pack new_dlc (level dlc) (requires (base \"1.10\")))\n";
+            "#pack (ok_dlc (level dlc) (requires (base \"1.2\")))\n#require base.dta";
+        fs.files["new.dta"] = "#pack (new_dlc (level dlc) (requires (base \"1.10\")))\n";
         fs.load("ok.dta");
         CHECK(warnings_of(fs.session).empty());
         REQUIRE(fs.session.packs().size() == 2);
@@ -393,10 +400,10 @@ TEST_CASE("packs declare versions, and a required version is checked") {
     {
         Files fs;
         session(fs);
-        fs.files["base.dta"] = "(pack base (level game) (version 2))";  // an int is a version
-        fs.files["plain.dta"] = "(pack plain (level game))";
+        fs.files["base.dta"] = "#pack (base (level game) (version 2))";  // an int is a version
+        fs.files["plain.dta"] = "#pack (plain (level game))";
         fs.files["dlc.dta"] =
-            "(pack dlc (level dlc) (requires (base \"1.9.3\") (plain \"1\")))\n"
+            "#pack (dlc (level dlc) (requires (base \"1.9.3\") (plain \"1\")))\n"
             "#require base.dta\n#require plain.dta";
         fs.load("dlc.dta");
         const auto w = warnings_of(fs.session);
@@ -404,9 +411,9 @@ TEST_CASE("packs declare versions, and a required version is checked") {
         CHECK(w[0] == "pack 'dlc' requires 'plain' \"1\" or later, which declares no version");
     }
     for (const char* bad :
-         {"(pack p (level game) (version 1.10))", "(pack p (level game) (version \"1.x\"))",
-          "(pack p (level game) (requires (base 1.5)))",
-          "(pack p (level game) (requires (\"1.2\")))"}) {
+         {"#pack (p (level game) (version 1.10))", "#pack (p (level game) (version \"1.x\"))",
+          "#pack (p (level game) (requires (base 1.5)))",
+          "#pack (p (level game) (requires (\"1.2\")))"}) {
         Files fs;
         session(fs);
         fs.files["bad.dta"] = bad;
@@ -415,7 +422,7 @@ TEST_CASE("packs declare versions, and a required version is checked") {
     // A cache keeps the versions and checks them on replay.
     Files fs;
     session(fs);
-    fs.files["new.dta"] = "(pack new_dlc (level dlc) (version \"3\") (requires (base \"1.10\")))";
+    fs.files["new.dta"] = "#pack (new_dlc (level dlc) (version \"3\") (requires (base \"1.10\")))";
     LoadSession bake;
     bake.set_pack_levels({"game", "dlc"});
     bake.set_reader(fs.session.reader());
@@ -436,12 +443,12 @@ TEST_CASE("packs declare versions, and a required version is checked") {
 TEST_CASE("packs declare a level, and the one-way rule warns on softer macros") {
     Files fs;
     fs.session.set_pack_levels({"engine", "game", "task"});
-    fs.files["engine.dta"] = "(pack engine_core (level engine))\n#define GRAVITY (9.8)";
+    fs.files["engine.dta"] = "#pack (engine_core (level engine))\n[GRAVITY 9.8]";
     fs.files["task.dta"] =
-        "(pack boss_task (level task) (requires game_rules))\n#define PHASES (3)\n"
+        "#pack (boss_task (level task) (requires game_rules))\n[PHASES 3]\n"
         "(uses GRAVITY)";
     fs.files["game.dta"] =
-        "(pack game_rules (level game))\n#require engine.dta\n#require task.dta\n"
+        "#pack (game_rules (level game))\n#require engine.dta\n#require task.dta\n"
         "(a GRAVITY PHASES)\n(b PHASES)";
     fs.files["loose.dta"] = "#require task.dta\n(free PHASES)";
 
@@ -476,7 +483,7 @@ TEST_CASE("packs carry harness metadata: owners, audience, stage") {
     Files fs;
     fs.session.set_pack_levels({"game", "task"});
     fs.files["boss.dta"] =
-        "(pack boss (level task) (requires combat)\n"
+        "#pack (boss (level task) (requires combat)\n"
         "      (owners \"td-encounter\" td-combat) (for designers testers) (stage custom))\n"
         "(x 1)";
     CHECK(fs.load("boss.dta") == "((x 1))");
@@ -489,7 +496,7 @@ TEST_CASE("packs carry harness metadata: owners, audience, stage") {
     CHECK(p->audience[1] == Symbol("testers"));
     CHECK(p->stage == Symbol("custom"));
     // None declared: empty.
-    fs.files["plain.dta"] = "(pack plain (level game))";
+    fs.files["plain.dta"] = "#pack (plain (level game))";
     (void)fs.load("plain.dta");
     const Pack* q = fs.session.pack_of(Symbol("plain.dta"));
     REQUIRE(q);
@@ -497,10 +504,10 @@ TEST_CASE("packs carry harness metadata: owners, audience, stage") {
     CHECK(q->audience.empty());
     CHECK(q->stage.empty());
 
-    fs.files["bad.dta"] = "(pack bad (level game) (stage finished))";
+    fs.files["bad.dta"] = "#pack (bad (level game) (stage finished))";
     CHECK(to_string(fs.fail("bad.dta")) ==
           "baker: pack 'bad': (stage S) is genesis, custom, product, or commodity  (bad.dta:1)");
-    fs.files["bad2.dta"] = "(pack bad2 (level game)\n(owners \"a\" 3))";
+    fs.files["bad2.dta"] = "#pack (bad2 (level game)\n(owners \"a\" 3))";
     CHECK(to_string(fs.fail("bad2.dta")) ==
           "baker: pack 'bad2': (owners ...) lists names  (bad2.dta:2)");
 }
@@ -510,7 +517,7 @@ TEST_CASE("a file's origin is recorded and left out of the tree") {
     fs.session.set_pack_levels({"game"});
     fs.files["econ.dta"] =
         "; generated: do not edit\n"
-        "(origin \"economy.xlsx\" (tool sheets-export))\n"
+        "#origin (\"economy.xlsx\" (tool sheets-export))\n"
         "(econ (price 5))";
     CHECK(fs.load("econ.dta") == "((econ (price 5)))");
     const Origin* o = fs.session.origin_of(Symbol("econ.dta"));
@@ -520,7 +527,7 @@ TEST_CASE("a file's origin is recorded and left out of the tree") {
     CHECK(fs.session.origins().size() == 1);
 
     // After a pack declaration too; the tool is optional.
-    fs.files["p.dta"] = "(pack p (level game))\n(origin \"levels.csv\")\n(a 1)";
+    fs.files["p.dta"] = "#pack (p (level game))\n#origin (\"levels.csv\")\n(a 1)";
     CHECK(fs.load("p.dta") == "((a 1))");
     REQUIRE(fs.session.origin_of(Symbol("p.dta")));
     CHECK(fs.session.origin_of(Symbol("p.dta"))->tool.empty());
@@ -530,31 +537,31 @@ TEST_CASE("a file's origin is recorded and left out of the tree") {
     CHECK(fs.load("main.dta") == "((b 2) (econ (price 5)))");
     CHECK_FALSE(fs.session.origin_of(Symbol("main.dta")));
 
-    // Ordinary data is not taken for one: a value that is not a string, a later form, a
-    // second origin.
+    // An (origin ...) form is data, whatever it holds.
     fs.files["d.dta"] = "(origin 0 0 0)";
     CHECK(fs.load("d.dta") == "((origin 0 0 0))");
     fs.files["e.dta"] = "(x 1)\n(origin \"a.xlsx\")";
     CHECK(fs.load("e.dta") == "((x 1) (origin \"a.xlsx\"))");
-    fs.files["f.dta"] = "(origin \"a.xlsx\")\n(origin \"b.xlsx\")";
+    fs.files["f.dta"] = "#origin (\"a.xlsx\")\n(origin \"b.xlsx\")";
     CHECK(fs.load("f.dta") == "((origin \"b.xlsx\"))");
     CHECK(fs.session.origin_of(Symbol("f.dta"))->source == Symbol("a.xlsx"));
     CHECK_FALSE(fs.session.origin_of(Symbol("d.dta")));
 
-    fs.files["g.dta"] = "(origin \"a.xlsx\" (tool))";
-    CHECK(to_string(fs.fail("g.dta")) == "baker: write (origin \"source\" (tool name))  (g.dta:1)");
+    fs.files["g.dta"] = "#origin (\"a.xlsx\" (tool))";
+    CHECK(to_string(fs.fail("g.dta")) ==
+          "baker: write #origin (\"source\" (tool name))  (g.dta:1)");
 }
 
 TEST_CASE("a pack's level must be one of the session's") {
     Files fs;
-    fs.files["p.dta"] = "(pack p (level nowhere))";
+    fs.files["p.dta"] = "#pack (p (level nowhere))";
     CHECK(to_string(fs.fail("p.dta")).find("not one of the session's pack levels ()") !=
           std::string::npos);
     fs.session.set_pack_levels({"engine"});
     CHECK(to_string(fs.fail("p.dta")).find("(engine)") != std::string::npos);
-    fs.files["q.dta"] = "(pack q)";
+    fs.files["q.dta"] = "#pack (q)";
     CHECK(to_string(fs.fail("q.dta")).find("needs a (level L)") != std::string::npos);
-    // Only the first form declares: a later (pack ...) is data.
+    // A (pack ...) form is data, first or not.
     fs.files["r.dta"] = "(x 1)\n(pack r (level nowhere))";
     CHECK(fs.load("r.dta") == "((x 1) (pack r (level nowhere)))");
 }
@@ -565,7 +572,7 @@ TEST_CASE("a session lists the macro definitions its reads made, where each is w
         "#define PC\n"
         "[SPEED 3]\n"
         "#include colors.dta\n"
-        "#define BIG (scale 2)\n"
+        "[BIG scale 2]\n"
         "[SPEED 4]\n"
         "#undef PC\n"
         "(speed SPEED)\n";
@@ -596,4 +603,66 @@ TEST_CASE("a session lists the macro definitions its reads made, where each is w
     CHECK(game.macro_definitions()[2].file == Symbol("colors.dta"));
     CHECK(game.macro_definitions()[2].line == 2);
     CHECK(game.macro_definitions()[0].flag);
+}
+
+TEST_CASE("max_new_symbols bounds the names a read adds to the program") {
+    // Names no other test interns: a run counter keeps them new if the case runs twice.
+    static int run = 0;
+    ++run;
+    const auto names = [&](const char* prefix, int n) {
+        std::string s = "(ids";
+        for (int i = 0; i < n; ++i)
+            s += " " + std::string(prefix) + std::to_string(run) + "_" + std::to_string(i);
+        return s + ")";
+    };
+    LoadSession s;
+    s.limits.max_new_symbols = 8;
+    // The file's own name is new too; "ids" may be.
+    const std::string fine = names("cap_fine_", 5);
+    REQUIRE(read_string(fine, "cap_fine.dta", s));
+    // Read again, the same names are no longer new.
+    s.limits.max_new_symbols = 0;
+    CHECK(read_string(fine, "cap_fine.dta", s));
+
+    s.limits.max_new_symbols = 8;
+    const auto r = read_string(names("cap_many_", 20), "cap_many.dta", s);
+    REQUIRE_FALSE(r);
+    CHECK(r.error().code() == ErrorCode::Limit);
+    CHECK(r.error().message() == "more than 8 new names (ParseLimits::max_new_symbols)");
+    CHECK(r.error().line() == 1);
+
+    // An include counts into its reader's total; variables and macro names count.
+    Files fs;
+    fs.session.limits.max_new_symbols = 6;
+    fs.files["cap_inc.dta"] = names("cap_inc_", 4);
+    fs.files["cap_main.dta"] = "#include cap_inc.dta\n[CAP_M" + std::to_string(run) +
+                               " 1]\n(v $cap_var" + std::to_string(run) + ")\n";
+    CHECK(fs.fail("cap_main.dta").code() == ErrorCode::Limit);
+    fs.session.limits.max_new_symbols = 1 << 20;
+    CHECK(fs.load("cap_main.dta").find("cap_inc_") != std::string::npos);
+}
+
+TEST_CASE("names a host's Reader interns are not the read's") {
+    // A host may switch fibers in its Reader and run another read, or intern its own names:
+    // neither counts against the read that called it.
+    static int run = 0;
+    ++run;
+    Files fs;
+    fs.files["host_main.dta"] = "#include host_inc.dta\n";
+    fs.files["host_inc.dta"] = "(x 1)\n";
+    LoadSession other;  // the work of another fiber, on this thread
+    fs.session.set_reader([&](std::string_view path, TextSink out) {
+        for (int i = 0; i < 20; ++i)
+            (void)Symbol("host_name_" + std::to_string(run) + "_" + std::string(path) + "_" +
+                         std::to_string(i));
+        other.limits.max_new_symbols = 1000;
+        CHECK(read_string("(y " + std::string(path) + "_" + std::to_string(run) + ")", "o.dta",
+                          other));
+        const auto it = fs.files.find(std::string(path));
+        if (it == fs.files.end()) return false;
+        out(it->second);
+        return true;
+    });
+    fs.session.limits.max_new_symbols = 8;
+    CHECK(fs.load("host_main.dta") == "((x 1))");
 }

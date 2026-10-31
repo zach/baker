@@ -43,15 +43,20 @@ public:
     static constexpr uint32_t kBlockHeader = 24;
 
     // An array of `nodes`, moved from; the Ref counts this arena.
-    [[nodiscard]] Ref<Array> make_array(std::span<Node> nodes, Symbol file, int32_t line);
+    // `verb`: as Array::finish takes it, whether slot 1 holds a layer verb (-1: test it).
+    [[nodiscard]] Ref<Array> make_array(std::span<Node> nodes, Symbol file, int32_t line,
+                                        int verb = -1);
     [[nodiscard]] Ref<String> make_string(std::string_view text);
     // Stores `n`, which is moved from, at `slot` (raw storage, or a node it overwrites
     // without destroying). `building`: the load is not yet returned, so no other thread
     // can count this arena (Array::set passes false).
     void adopt(Node* slot, Node&& n, bool building = true);
 
-    // The arena an owner of kind kArena is.
+    // The arena an owner of kind kArena is, and the other way.
     [[nodiscard]] static Arena& of(Owner& owner) noexcept;
+    [[nodiscard]] Owner& owner() noexcept { return head_.owner; }
+    // The allocator its blocks come from.
+    [[nodiscard]] const Allocator& allocator() const noexcept { return alloc_; }
 
     // The creator's count, as a scoped handle.
     class Handle {
@@ -76,7 +81,9 @@ private:
         Block* next;
         size_t bytes;
     };
-    explicit Arena(const Allocator& a) : head_{{}, this}, alloc_(a) { head_.owner.kind = kArena; }
+    explicit Arena(const Allocator& a) : head_{{}, this}, alloc_(with_kind(a, MemoryKind::Trees)) {
+        head_.owner.kind = kArena;
+    }
     // The arena's own count, changed without atomics: until the load is returned, only the
     // thread building it can see it.
     void own_retain() noexcept;
@@ -92,7 +99,7 @@ private:
     };
     static_assert(std::is_standard_layout_v<Head>, "an Owner& must convert to its Head");
     Head head_;
-    const Allocator alloc_;     // a copy: the tree may outlive whoever read it
+    const Allocator alloc_;     // a copy, tagged Trees: the tree may outlive whoever read it
     Block* blocks_ = nullptr;   // newest first
     Block* current_ = nullptr;  // the block being filled
     char* cur_ = nullptr;

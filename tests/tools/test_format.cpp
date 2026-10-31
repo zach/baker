@@ -88,7 +88,7 @@ TEST_CASE("comments stay: trailing, on their own line, and block; a ; comment br
     CHECK(formatted("(a /* x */ 1)\n") == "(a /* x */ 1)\n");
 }
 
-TEST_CASE("directives keep their arguments on their line; #remove is a value") {
+TEST_CASE("directives keep their arguments on their line; a layer verb is a value") {
     CHECK(
         formatted("#include   \"common.dta\"\n#define   FAST\n(speed\n#ifdef FAST\n 9\n#else\n 3\n"
                   "#endif\n)\n") ==
@@ -97,6 +97,8 @@ TEST_CASE("directives keep their arguments on their line; #remove is a value") {
     CHECK(formatted("#define RED (1\n 0   0)\n(a (b #remove))\n") ==
           "#define RED (1 0 0)\n(a (b #remove))\n");
     CHECK(formatted("#autorun   {print\n hi}\n") == "#autorun {print hi}\n");
+    CHECK(formatted("(items  #append rope\n torch)\n(t #drop (phone 1))\n") ==
+          "(items #append rope torch)\n(t #drop (phone 1))\n");
 }
 
 TEST_CASE("what was written aligned stays aligned; nothing else is aligned") {
@@ -198,20 +200,20 @@ TEST_CASE("formatting is linear in the text") {
                     ") ; its price\n (name \"Item\")  (tags fast   loud))\n";
         return text;
     };
-    auto best_ms = [](const std::string& text) {
-        double best = 1e30;
-        for (int run = 0; run < 3; ++run) {
-            const auto t0 = std::chrono::steady_clock::now();
-            std::string out;
-            (void)format_text(text, string_out(out));
-            best = std::min(best, std::chrono::duration<double, std::milli>(
-                                      std::chrono::steady_clock::now() - t0)
-                                      .count());
-        }
-        return best;
+    auto ms = [](const std::string& text) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::string out;
+        (void)format_text(text, string_out(out));
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+            .count();
     };
-    const double one = best_ms(text_of_size(500'000));
-    const double four = best_ms(text_of_size(2'000'000));
+    // The best of five of each, interleaved, so that a busy machine slows both alike.
+    const std::string small = text_of_size(500'000), large = text_of_size(2'000'000);
+    double one = 1e30, four = 1e30;
+    for (int run = 0; run < 5; ++run) {
+        one = std::min(one, ms(small));
+        four = std::min(four, ms(large));
+    }
     MESSAGE("0.5 MB in " << one << " ms, 2 MB in " << four << " ms");
     CHECK(four < 8 * one);
 }

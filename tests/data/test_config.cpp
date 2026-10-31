@@ -54,7 +54,7 @@ const char* const kDefault =
     "(audio\n"
     "   (master_volume kDefaultVolume)   ; from the macro\n"
     "   (channels 64))\n"
-    "(box (width 2 (range 0 10) (note \"good values are 2-3\")) (height 1))\n";
+    "(box (width 2 (@range 0 10) (@note \"good values are 2-3\")) (height 1))\n";
 
 const char* const kApp =
     "; app overrides\n"
@@ -68,8 +68,8 @@ TEST_CASE("overwrite merge: leaves win, tagged arrays recurse") {
     auto r = merge(*parse("(a (b 1))"), *parse("(a (b 2) (c 2))"));
     CHECK(str_of(*r) == "((a (b 2) (c 2)))");
     // Values replace values; children are kept and merged.
-    r = merge(*parse("(width 2 (range 0 10))"), *parse("(width 3)"));
-    CHECK(str_of(*r) == "((width 3 (range 0 10)))");
+    r = merge(*parse("(width 2 (@range 0 10))"), *parse("(width 3)"));
+    CHECK(str_of(*r) == "((width 3 (@range 0 10)))");
     r = merge(*parse("(clear_color 0.1 0.1 0.12)"), *parse("(clear_color 1 0)"));
     CHECK(str_of(*r) == "((clear_color 1 0))");
     r = merge(*parse("(points (1 2) (3 4))"), *parse("(points (5 6))"));
@@ -343,7 +343,7 @@ TEST_CASE("source names the layer, file, and line") {
 TEST_CASE("source names a generated file's origin and tool") {
     TempDir dir;
     Config cfg({.tweaks = nullptr});
-    dir.write("econ.dta", "(origin \"economy.xlsx\" (tool sheets-export))\n(econ (price 5))\n");
+    dir.write("econ.dta", "#origin (\"economy.xlsx\" (tool sheets-export))\n(econ (price 5))\n");
     REQUIRE(
         cfg.push_layer("default", dir.write("default.dta", "(shop (tax 2))\n#include econ.dta\n")));
     REQUIRE(cfg.push_layer("patch", dir.write("patch.dta", "(shop (tax 3))\n")));
@@ -535,8 +535,9 @@ TEST_CASE("tweaks bind, rebind, and fall back to their defaults") {
 
     // Metadata: the data file's wins over the code's, and note exists only in data.
     CHECK(width.range().max == 10);
-    CHECK(width.step() == 1);
-    CHECK(width.desc() == "Box width");
+    // A shipping build keeps none of the code's tool text.
+    CHECK(width.step() == (kShipping ? 0 : 1));
+    CHECK(width.desc() == (kShipping ? "" : "Box width"));
     CHECK(width.note() == "good values are 2-3");
     CHECK(width.group() == "box");
 
@@ -569,10 +570,11 @@ TEST_CASE("a tweak's value stops before the metadata written after it") {
     std::vector<Error> warnings;
     cfg.set_warning_handler([&](const Error& e) { warnings.push_back(e); });
     REQUIRE(cfg.push_layer(
-        "default", dir.write("default.dta",
-                             "(look\n"
-                             "   (tint 0.9 0.5 0.2 (range 0 1) (desc \"Tint\") (note \"warm\"))\n"
-                             "   (sizes 1 2 3 (step 1)))\n")));
+        "default",
+        dir.write("default.dta",
+                  "(look\n"
+                  "   (tint 0.9 0.5 0.2 (@range 0 1) (@desc \"Tint\") (@note \"warm\"))\n"
+                  "   (sizes 1 2 3 (@step 1)))\n")));
     CHECK(warnings.empty());
     REQUIRE(tint.bound());
     CHECK(tint.value()[0] == 0.9f);
@@ -585,7 +587,7 @@ TEST_CASE("a tweak's value stops before the metadata written after it") {
         // A live edit and its write-back change the numbers and keep the metadata.
         REQUIRE(tint.set({0.8f, 0.5f, 0.25f}));
         REQUIRE(tint.write_back());
-        CHECK(dir.read("default.dta").find("(tint 0.8 0.5 0.25 (range 0 1) (desc \"Tint\")") !=
+        CHECK(dir.read("default.dta").find("(tint 0.8 0.5 0.25 (@range 0 1) (@desc \"Tint\")") !=
               std::string::npos);
         CHECK(tint.value()[2] == 0.25f);
     }
@@ -593,7 +595,7 @@ TEST_CASE("a tweak's value stops before the metadata written after it") {
     // Only trailing arrays with a metadata tag are left out: other tagged elements are
     // the value's own.
     Tweak<std::vector<Node>> parts{"look.parts", {}, {}, reg};
-    REQUIRE(cfg.push_layer("parts", parse("(look (parts 1 (x 2) (range 0 1)))")));
+    REQUIRE(cfg.push_layer("parts", parse("(look (parts 1 (x 2) (@range 0 1)))")));
     CHECK(parts.get().size() == 2);
 }
 
@@ -629,8 +631,8 @@ TEST_CASE("live edits through tweaks, and write-back to the source line") {
     const std::string after = dir.read("default.dta");
     CHECK(diff_lines(before, after) ==
           std::vector<std::string>{
-              "-(box (width 2 (range 0 10) (note \"good values are 2-3\")) (height 1))",
-              "+(box (width 2.7 (range 0 10) (note \"good values are 2-3\")) (height 1))"});
+              "-(box (width 2 (@range 0 10) (@note \"good values are 2-3\")) (height 1))",
+              "+(box (width 2.7 (@range 0 10) (@note \"good values are 2-3\")) (height 1))"});
     CHECK(width.source()->layer == "default");  // saved: no longer live
     CHECK(width.source()->line == 10);
     CHECK(cfg.unsaved().empty());
@@ -696,7 +698,7 @@ TEST_CASE("write-back refuses what it cannot edit exactly") {
 
 TEST_CASE("write-back into an array assembled by #merge is refused") {
     TempDir dir;
-    dir.write("base.dta", "(s (w 1 (range 0 2)))\n");
+    dir.write("base.dta", "(s (w 1 (@range 0 2)))\n");
     Config cfg({.tweaks = nullptr});
     REQUIRE(cfg.push_layer("main", dir.write("main.dta", "(s (w 5))\n#merge base.dta\n")));
     // (w 5) gained (range 0 2) from base.dta, so it was rebuilt; its values are main.dta's
@@ -979,9 +981,9 @@ BAKER_DEV_TEST_CASE("cache_dir reads a cache through a custom reader, and from d
 
 TEST_CASE("Config forwards the one-way rule's warnings") {
     TempDir dir;
-    dir.write("task.dta", "(pack boss_task (level task))\n#define PHASES (3)");
+    dir.write("task.dta", "#pack (boss_task (level task))\n[PHASES 3]");
     const std::string game =
-        dir.write("game.dta", "(pack rules (level game))\n#require task.dta\n(b PHASES)");
+        dir.write("game.dta", "#pack (rules (level game))\n#require task.dta\n(b PHASES)");
     Config cfg({.tweaks = nullptr});
     cfg.session().set_pack_levels({"game", "task"});
     std::vector<std::string> warnings;
@@ -1032,7 +1034,7 @@ TEST_CASE("a tweak's path made at runtime is kept by the symbol") {
     }
     CHECK(tunables[0]->path() == "enemy.speed");
     CHECK(tunables[1]->path() == "enemy");
-    CHECK(tunables[1]->desc() == "Enemy speed");
+    CHECK(tunables[1]->desc() == (kShipping ? "" : "Enemy speed"));
     TempDir dir;
     Config cfg({.tweaks = &reg});
     REQUIRE(cfg.push_layer("default", dir.write("default.dta", "(enemy (speed 4.5))\n")));
@@ -1241,4 +1243,35 @@ BAKER_DEV_TEST_CASE("a read of a record or table above a live edit sees it") {
     // A clear goes back to the files' value everywhere.
     REQUIRE(cfg.clear_scratch("units.tank.price"));
     CHECK(ok(cfg.get<UnitRecord>("units.tank")).price == 40);
+}
+
+TEST_CASE("cache_drop_metadata: the caches a bake writes hold no metadata") {
+    if constexpr (kShipping) return;  // shipping writes no caches
+    TempDir dir;
+    fs::create_directories(dir.path("cache"));
+    const std::string base =
+        dir.write("base.dta",
+                  "(speed 3 (@range 0 10) (@desc \"Run\"))\n"
+                  "#shape (enemy (hp int (@range 1 100) (@desc \"SHAPE_NOTE\")) (@note \"N\"))\n");
+    const std::string cache_dir = dir.path("cache");
+    Config bake({.edit_mode = false,
+                 .tweaks = nullptr,
+                 .cache_dir = cache_dir,
+                 .cache_drop_metadata = true});
+    REQUIRE(bake.push_layer("base", base));
+    CHECK(bake.get<int>("speed") == 3);
+    // The game's Config reads the cache: the value, and no metadata.
+    Config game({.edit_mode = false, .tweaks = nullptr, .cache_dir = cache_dir});
+    REQUIRE(game.push_layer("base", base));
+    CHECK(game.get<int>("speed") == 3);
+    CHECK(game.root()->try_find("speed")->metadata().empty());
+    // The shapes it declares keep their ranges, and lose their notes.
+    std::string cache_bytes;
+    for (const auto& e : fs::directory_iterator(cache_dir)) {
+        std::ifstream in(e.path(), std::ios::binary);
+        cache_bytes.assign(std::istreambuf_iterator<char>(in), {});
+    }
+    REQUIRE_FALSE(cache_bytes.empty());
+    CHECK(cache_bytes.find("SHAPE_NOTE") == std::string::npos);
+    CHECK(cache_bytes.find("@range") != std::string::npos);
 }

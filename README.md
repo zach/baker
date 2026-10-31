@@ -38,7 +38,7 @@ like `player.speed` walks tags from the top.
 ```dta
 ; The values the game reads, by path: player.speed is 4.5 here.
 (player
-   (speed 4.5 (range 0 10) (desc "Run speed, in m/s")))
+   (speed 4.5 (@range 0 10) (@desc "Run speed, in m/s")))
 ```
 
 **3. Replace the constant.** `examples/quickstart/main.cpp` is the whole program. A
@@ -94,7 +94,7 @@ restarted.
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.6.0)
+FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.7.0)
 FetchContent_MakeAvailable(baker)
 target_link_libraries(game PRIVATE baker::baker)
 ```
@@ -132,7 +132,7 @@ save, see it.
 - **Packs and levels.** `#require` reads a shared file once per session; a pack declares
   its level (`engine`, `game`, `task`), and a harder pack using a softer one's macro or
   function is warned about. [Language guide](docs/language.md#packs-and-levels).
-- **Shapes.** `(shapes (boss_phase (enter_at float (range 0 1)) ...))` declares what data
+- **Shapes.** `#shape (boss_phase (enter_at float (@range 0 1)) ...)` declares what data
   should look like; a Config validator reports violations at load, located.
   [Language guide](docs/language.md#shapes).
 - **The host kit.** `baker::host` gives a game the loop every host writes the same way:
@@ -151,7 +151,9 @@ save, see it.
 Public headers include no standard containers or strings (an engine that bans the STL can
 use them); text comes out through a `TextSink`. `<baker/std_interop.hpp>`,
 `<baker/std_script.hpp>` and `<baker/tools/std_tools.hpp>` add `std::string` forms for
-hosts that want them.
+hosts that want them. `<baker/fwd.hpp>` declares Baker's types and includes only
+`<cstdint>`, for a header of yours that only names them: it compiles in a few
+milliseconds, where any other Baker header takes about half a second.
 
 ## Measured
 
@@ -200,6 +202,8 @@ and the tool commands a game runs from its `main`
 | `BAKER_ATOMIC_REFCOUNT` | `ON` | `OFF` for single-threaded programs |
 | `BAKER_SHIPPING` | `OFF` | Reload and live edits inert; `dev_only` tweaks keep defaults |
 | `BAKER_USE_EASTL` | `OFF` | Internal containers from EASTL (fetched) |
+| `BAKER_RTTI` | `ON` | `OFF` builds Baker without RTTI (`-fno-rtti`, `/GR-`), for a game built without it, or one that never derives from `baker::ObjectBase` with RTTI on: such a class needs the typeinfo Baker otherwise emits |
+| `BAKER_STEP_BUDGET` | `ON` | `OFF` compiles out the step count behind `Context::set_step_budget`, five instructions a call, for a game that runs no script it did not write |
 | `BAKER_SANITIZE` | empty | e.g. `address,undefined` |
 
 Android: CMake builds get C++20 from the targets; with `ndk-build`, add

@@ -209,7 +209,7 @@ Config::Validator rules_validator(Context& ctx) {
     return [&ctx](const ValidatorStack& stack, const Callback<void(const Error&)>& warn) {
         shape::Set set;
         shape::Report read;  // the shapes' own errors are shape::validator()'s to report
-        for (const Ref<Array>& tree : stack.layers) set.add(*tree, read, &stack.session);
+        for (const Ref<Array>& tree : stack.layers) set.add(stack.session, read, tree->file());
         shape::Report report;
         check_rules(stack.root, set, ctx, report);
         if (!warn) return;

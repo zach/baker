@@ -117,9 +117,16 @@ private:
     // char data[size_ + 1] follows.
 };
 
+namespace detail {
+struct ConstantZero {};
+}  // namespace detail
+
 class Node {
 public:
     Node() noexcept : value_{.i = 0}, type_(Type::Int) {}
+    // Int 0 as a constant, for a static that must need no initializer. Not the default
+    // constructor: made constexpr, that one costs Config::set 12 instructions.
+    explicit constexpr Node(detail::ConstantZero) noexcept : value_{.i = 0}, type_(Type::Int) {}
     // Any integer type. Unsigned values above INT64_MAX keep their bit pattern.
     template <class T>
         requires std::is_integral_v<T>

@@ -59,10 +59,11 @@ An editor works on text that rarely parses, and checks it on every pause:
   tag) and every comment, even when the text does not parse. An unclosed bracket runs to the
   end of the text, an unterminated string or comment ends there, and the problems are listed
   beside the rest. It reads 2 MB in about 25 ms. The outline, folding, completion, hover, a
-  rename and a highlighter can all work from it, with no lexer of the tool's own.
+  rename and a highlighter can all work from it, with no lexer of the tool's own. A row's
+  key, the `/a.b.c` of a top-level `(/a.b.c 1)`, is a token of the kind `PathKey`.
 - **Laid out as Baker writes it.** `tools::format_text(text, sink, {.layout = ...})` lays
-  out text as `write_dta` lays out a tree, with the project's `(format (indent 3) (width
-  100))`, keeping every comment, directive, macro and spelling. Only whitespace changes:
+  out text as `write_dta` lays out a tree, with the project's `(format ...)`, keeping every
+  comment, directive, macro and spelling. Only whitespace changes:
   - a form goes on one line if it fits, else one item a line;
   - a `;` comment stays on its line, and a blank line between forms stays (once);
   - a table or a column of trailing comments written aligned stays aligned, re-padded when
@@ -73,10 +74,14 @@ An editor works on text that rarely parses, and checks it on every pause:
   editor applies them without moving the cursor through unchanged text; `.begin` and
   `.end` lay out only the forms a selection touches. Formatting twice changes nothing. 2 MB
   takes about 60 ms.
-- **Values as Baker presents them.** `split_metadata(values)` separates a value from the
-  metadata after it, `(width 2 (range 0 10))`, and `presented_kind(values)` gives the kind a
-  value is shown as (its `(kind ...)`, or "color" for 3 or 4 numbers ranged 0 to 1). These
-  are the rules tweaks follow.
+- **The house layout.** Three spaces a level and a hundred columns is `WriteOptions`'
+  default, and the layout of a project without `(format ...)`. A Config opened from a
+  project (`open_project`) writes in the project's layout: the forms promote and write-back
+  add to a layer's file, and `layer_text` (`Config::set_layout`).
+- **Values as Baker presents them.** An array's `values()` end before its metadata,
+  `(width 2 (@range 0 10))`, and `metadata()` lists it; `presented_kind(values)` gives the
+  kind a value is shown as (its `(@kind ...)`, or "color" for 3 or 4 numbers ranged 0 to 1).
+  These are the rules tweaks follow.
 - **Checking again after an edit.** Keep one Config, reading through a reader that serves
   the open editors' text, and call `reload()` after each edit. It compares each layer's text
   by hash and reads again only from the first layer whose text changed, upward, so an edit
@@ -170,11 +175,11 @@ error, so a misspelling is caught.
 
 | Command | What it writes |
 |---|---|
-| `check` | [check's report](check-json.md); exit 1 on an error, a load problem, a shape error, or a call to an undefined function |
+| `check` | [check's report](check-json.md); exit 1 on an error, a load problem, a shape error, or a call to an undefined function; a shape that governs no array is a shape warning |
 | `reference [--baker-json]` | the script vocabulary as Markdown, or `{"reference", "tweaks", "shapes"}` |
 | `eval [--baker-seed N] [--baker-json] "{command}"...` | each command's result on the game reset with the seed; `--baker-json`: one reply line each |
-| `diff [--baker-layer L]` | what layer L (default `agent`) changes, value by value |
-| `promote [--baker-from L] [--baker-to T] [--baker-write \| --baker-patch FILE]` | what promoting L into T would write; `--baker-write` writes; `--baker-patch` writes a unified diff and nothing else |
+| `diff [--baker-layer L]` | what layer L (default `agent`) changes, value by value: a verb as `-> #append v`, and `stale` where a row's `(@was ...)` pin no longer names the value below |
+| `promote [--baker-from L] [--baker-to T] [--baker-write \| --baker-patch FILE]` | what promoting L into T would write; `--baker-write` writes; `--baker-patch` writes a unified diff and nothing else, after a line `# path: note` for each row's `(@note ...)`, which `git apply` skips |
 | `sim [--baker-scenario NAME]... [--baker-seed N \| --baker-seeds A-B] [--baker-step-hz N] [--baker-json] [--baker-results DIR]` | the project's scenarios run and judged by its objectives ([`baker.sim/1.3`](sim-json.md)); exit 1 when one fails |
 | `compare --baker-before DIR --baker-after DIR` | which objectives broke or were fixed between two `sim --baker-results` ([`baker.compare/1`](sim-json.md)) |
 | `format [--baker-check] [--baker-json] [FILE...]` | lays out each file (the stack's own files under the project's directory if none is named) with the project's `(format ...)`; `--baker-check` changes nothing and exits 1, listing each file that would change, for CI and a pre-commit hook; `--baker-json`: `{"schema": "baker.format/1", "files": [{"file", "changed", "line_end", "edits": [[begin, end, newlines, spaces], ...], "errors"}]}` |

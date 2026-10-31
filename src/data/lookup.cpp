@@ -242,11 +242,13 @@ Expected<const Array*> Array::find_array(Symbol tag) const {
 }
 
 void Array::sort_for_lookup() {
-    // A stable merge sort. std::stable_sort would take its buffer from operator new.
+    // A stable merge sort. std::stable_sort would take its buffer from operator new. The
+    // metadata follow the other tagged children, so the values and the boundary survive.
     const auto less = [](const Node& a, const Node& b) {
         const Symbol tb = detail::tag_of(b);
         if (tb.empty()) return false;
         const Symbol ta = detail::tag_of(a);
+        if (!ta.empty() && ta.is_meta() != tb.is_meta()) return tb.is_meta();
         return ta.empty() || tag_less(ta, tb);
     };
     Node* d = data();
@@ -267,9 +269,13 @@ void Array::sort_for_lookup() {
 
 const Array* Array::find_sorted(Symbol tag) const noexcept {
     if (tag.empty()) return nullptr;  // '' is no tag
-    const Node* it = std::partition_point(begin(), end(), [tag](const Node& n) {
+    // The sort's order: untagged, then the other tags, then metadata's. Not from the
+    // boundary: in an untagged array, slot 0 may be metadata's tag, which the boundary never
+    // names.
+    const bool meta = tag.is_meta();
+    const Node* it = std::partition_point(begin(), end(), [tag, meta](const Node& n) {
         const Symbol t = detail::tag_of(n);
-        return t.empty() || tag_less(t, tag);
+        return t.empty() || (t.is_meta() == meta ? tag_less(t, tag) : !t.is_meta());
     });
     return it != end() && detail::tag_of(*it) == tag ? it->try_array() : nullptr;
 }

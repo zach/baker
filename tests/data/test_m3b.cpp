@@ -4,6 +4,7 @@
 #include <baker/cache.hpp>
 #include <baker/config.hpp>
 #include <baker/parse.hpp>
+#include <baker/project.hpp>
 #include <baker/std_interop.hpp>
 #include <baker/write.hpp>
 
@@ -47,7 +48,7 @@ struct FakeClock {
 const char* const kBase =
     "; shared defaults\n"
     "(box\n"
-    "   (width 2 (note \"2-3 reads well\"))   ; tuned in playtest 4\n"
+    "   (width 2 (@note \"2-3 reads well\"))   ; tuned in playtest 4\n"
     "   (height 1))\n"
     "(audio (volume 0.8) (channels 64))\n";
 
@@ -173,11 +174,11 @@ TEST_CASE("a layer removes a key from the layers below with (key #remove)") {
 
     // A layer read from a cache keeps its removals: the flag is in the array header.
     auto layer = ok(read_string("(menu (debug_menu #remove))", "tu.dta"));
-    CHECK(layer->has_removal());
+    CHECK(layer->has_marker());
     std::string bytes;
     REQUIRE(write_cache(*layer, string_out(bytes)));
     auto cached = ok(read_cache_bytes(bytes, "tu.datb"));
-    CHECK(cached->has_removal());
+    CHECK(cached->has_marker());
     CHECK(to_string(*merge(*ok(read_string("(menu (debug_menu 1) (x 2))", "b.dta")), *cached)) ==
           "((menu (x 2)))");
 
@@ -525,8 +526,8 @@ TEST_CASE("set then write_back: one line, comments and note kept, scratch emptie
     REQUIRE(report);
     CHECK(diff_lines(before, dir.read("default.dta")) ==
           std::vector<std::string>{
-              "-   (width 2 (note \"2-3 reads well\"))   ; tuned in playtest 4",
-              "+   (width 2.4 (note \"2-3 reads well\"))   ; tuned in playtest 4"});
+              "-   (width 2 (@note \"2-3 reads well\"))   ; tuned in playtest 4",
+              "+   (width 2.4 (@note \"2-3 reads well\"))   ; tuned in playtest 4"});
     REQUIRE(report->written.size() == 1);
     CHECK(report->written[0].file.str().ends_with("default.dta"));
     CHECK(report->written[0].line == 3);
@@ -546,7 +547,7 @@ TEST_CASE("write_back_to creates an absent personal file, or inserts beside sibl
     REQUIRE(cfg.set("box.width", Node(4)));
     auto r = cfg.write_back_to("box.width", "local");
     REQUIRE(r);
-    CHECK(dir.read("local/sam.dta") == "(box (width 4))\n");
+    CHECK(dir.read("local/sam.dta") == "(/box.width 4)\n");  // a created layer is rows
     CHECK(cfg.source("box.width")->layer == "local");
     CHECK(cfg.unsaved().empty());
 
@@ -727,3 +728,35 @@ TEST_CASE("taking a snapshot copies no array") {
     }
 }
 #endif
+
+BAKER_DEV_TEST_CASE("a Config writes in its layout: the house layout, or the project's") {
+    TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    CHECK(cfg.layout().indent == 3);
+    CHECK(cfg.layout().width == 100);
+    REQUIRE(cfg.push_layer("d", dir.write("d.dta", "(audio (rate 44100))\n")));
+    const std::vector<Node> words{Node(Symbol("alpha")), Node(Symbol("beta")),
+                                  Node(Symbol("gamma")), Node(Symbol("delta"))};
+    REQUIRE(cfg.set(Path("menu.title.words"), std::span<const Node>(words)));
+    // A new entry wider than the layout's width wraps at its indent.
+    cfg.set_layout({.indent = 2, .width = 44});
+    REQUIRE(cfg.write_back_to("menu.title.words", "d"));
+    CHECK(dir.read("d.dta") ==
+          "(audio (rate 44100))\n"
+          "(menu\n"
+          "  (title (words alpha beta gamma delta)))\n");
+    std::string text;
+    REQUIRE(cfg.layer_text("d", string_out(text)));
+    CHECK(text ==
+          "(audio (rate 44100))\n"
+          "(menu\n"
+          "  (title (words alpha beta gamma delta)))\n");
+    // A project's (format ...) is what a Config opened from it writes.
+    const std::string file = dir.write(
+        "baker-project.dta", "(project (format (indent 2) (width 40)) (layers (d \"d.dta\")))\n");
+    const Project p = ok(read_project(file));
+    Config opened({.tweaks = nullptr});
+    REQUIRE(open_project(opened, p));
+    CHECK(opened.layout().indent == 2);
+    CHECK(opened.layout().width == 40);
+}

@@ -3,7 +3,7 @@
 // Console: a game's tools on a loopback socket. Each line a client sends is evaluated in the
 // game's Context, between frames, and answered:
 //
-//   (ID {command})   a request, from a tool: one line of JSON (baker.reply/1.1,
+//   (ID {command})   a request, from a tool: one line of JSON (baker.reply/1.2,
 //                    eval_request, docs/reply-json.md)
 //   {command}        anything else, from a person: "=> value", or the error and its script
 //                    stack

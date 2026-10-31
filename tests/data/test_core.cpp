@@ -26,7 +26,7 @@ TEST_CASE("symbols are interned and compare by identity") {
     CHECK(a == b);
     CHECK(a.id() == b.id());
     CHECK(a.str() == "price");
-    CHECK(a.hash() == detail::hash_symbol_text("price"));
+    CHECK(a.hash() == symbol_hash("price"));
     CHECK("price"_sym == a);
     CHECK_FALSE(Symbol("Price") == a);
     CHECK(Symbol() == Symbol(""));
@@ -304,4 +304,14 @@ TEST_CASE("symbols intern the same text to one entry from several threads") {
                   per_thread[static_cast<size_t>(t)][static_cast<size_t>(i)]);
     const Symbol again("shared_1");
     CHECK(again == per_thread[2][1]);
+}
+
+TEST_CASE("a ValueList of more values than it holds inline keeps them all") {
+    ValueList list;  // eight inline, then the heap
+    for (int64_t i = 0; i < 9; ++i) list.add(i);
+    REQUIRE(list.nodes().size() == 9);
+    for (int64_t i = 0; i < 9; ++i) CHECK(list.nodes()[static_cast<size_t>(i)].try_int() == i);
+    const ValueList copy = list;
+    CHECK(copy.nodes().size() == 9);
+    CHECK(copy.nodes()[8].try_int() == 8);
 }

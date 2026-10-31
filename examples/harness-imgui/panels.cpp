@@ -104,7 +104,7 @@ std::string provenance(const baker::Config& cfg, std::string_view path) {
         text = file_name(s->file) + ":" + std::to_string(s->line) + " (layer " +
                std::string(s->layer.str()) + ")";
     // The data's note, if it has one: (speed 4 (note "..."))
-    const std::string note_path = std::string(path) + ".note";
+    const std::string note_path = std::string(path) + ".@note";
     if (auto note = cfg.root()->get<std::string_view>(path_of(note_path), std::string_view());
         note && !note->empty())
         text += "\nnote: " + std::string(*note);
@@ -302,8 +302,11 @@ void shapes_panel(baker::Config& cfg, ShapesState& state) {
     if (ImGui::Begin("Shapes")) {
         baker::shape::Set set;
         baker::shape::Report report;
-        set.add(*root, report);
-        if (set.shapes().empty()) ImGui::TextDisabled("No (shapes ...) in the data.");
+        for (const baker::Symbol layer : cfg.layers())
+            if (cfg.layer_enabled(layer.str()))
+                if (const baker::Ref<baker::Array> own = cfg.layer_root(layer.str()))
+                    set.add(cfg.read_session(), report, own->file());
+        if (set.shapes().empty()) ImGui::TextDisabled("No #shape in the data.");
         ShapeWalk{cfg, set, state, {}, {}}.walk(*root);
         if (!state.status.empty()) ImGui::TextWrapped("%s", state.status.c_str());
     }
@@ -542,6 +545,11 @@ void layers_panel(baker::Config& cfg, LayersState& state) {
             bool on = cfg.layer_enabled(name);
             if (ImGui::Checkbox("##on", &on)) state.toggle = name;
             ImGui::SameLine();
+            // A layer's (when COND): the defines that keep it in, or out.
+            if (const auto when = cfg.layer_condition(name)) {
+                ImGui::TextDisabled("(when %s)", baker::to_string(*when).c_str());
+                ImGui::SameLine();
+            }
             if (ImGui::TreeNode(name.c_str())) {
                 if (auto effect = baker::tools::layer_effect(cfg, name)) {
                     if (effect->empty()) ImGui::TextDisabled("changes nothing");

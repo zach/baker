@@ -61,10 +61,13 @@ TEST_CASE("the tweaks as JSON: type, default, value, metadata, and source") {
         "\n"
         R"j(    {"path": "player.speed", "type": "float32", "values": ["float32"], "count": "exact", )j"
         R"j("element": null, "length": null, "default": "4.0", "value": "6.0", )j"
-        R"j("bound": true, "range": [0.0, 10.0], "step": 0.5, "desc": "Run speed", )j"
-        R"j("kind": "", "group": "player", "dev_only": false, "one_of": [], "choices": [], )j"
-        R"j("source": {"layer": "default", "file": "d.dta", "line": 1}})j"
-        "\n  ]\n}\n");
+        R"j("bound": true, "range": [0.0, 10.0], )j" +
+            std::string(kShipping ? R"j("step": 0.0, "desc": "", )j"
+                                  : R"j("step": 0.5, "desc": "Run speed", )j") +
+            R"j()j"
+            R"j("kind": "", "group": "player", "dev_only": false, "one_of": [], "choices": [], )j"
+            R"j("source": {"layer": "default", "file": "d.dta", "line": 1}})j"
+            "\n  ]\n}\n");
 }
 
 TEST_CASE("a symbol tweak's allowed symbols, from the code or the data") {
@@ -74,7 +77,7 @@ TEST_CASE("a symbol tweak's allowed symbols, from the code or the data") {
     Tweak<Symbol> kick{"moves.kick.button", Symbol("light"), {.one_of = kButtons}, reg};
     Config cfg({.tweaks = &reg});
     REQUIRE(cfg.push_layer(
-        "default", ok(read_string("(moves (jab (button heavy)) (kick (button kick (one_of light "
+        "default", ok(read_string("(moves (jab (button heavy)) (kick (button kick (@one_of light "
                                   "heavy kick))))\n",
                                   "d.dta"))));
     CHECK(Symbol(jab) == Symbol("heavy"));
@@ -136,8 +139,8 @@ TEST_CASE("the data is held to the tweaks the game declares") {
 
     // The data's own range and list win over the code's.
     const auto own =
-        run("(jump (height 400 (range 16 500)) (buffer 3) (air (time 0.4)))\n"
-            "(world (floor sand (one_of stone sand)) (gravity 9.8))");
+        run("(jump (height 400 (@range 16 500)) (buffer 3) (air (time 0.4)))\n"
+            "(world (floor sand (@one_of stone sand)) (gravity 9.8))");
     CHECK(own.errors.empty());
     const auto list =
         run("(jump (height 120) (buffer 3) (air (time 0.4)))\n(world (floor lava) (gravity 9.8))");
@@ -162,19 +165,20 @@ TEST_CASE("a tweak's value types, in the JSON, from Convert's values") {
           std::string::npos);
 }
 
-TEST_CASE("the metadata split and the color rule, for any value") {
-    const Ref<Array> root = ok(read_string(
-        "(width 2 (range 0 10) (desc \"w\"))\n(ball (kind ball) (pos 1 2))\n"
-        "(tint 1 0.5 0 (range 0 1))\n(sky 0.2 0.4 0.9)\n(spot 1 0.5 0 (kind angle) (range 0 1))\n",
-        "d.dta"));
+TEST_CASE("values and metadata, and the color rule, for any value") {
+    const Ref<Array> root =
+        ok(read_string("(width 2 (@range 0 10) (@desc \"w\"))\n(ball (kind ball) (pos 1 2))\n"
+                       "(tint 1 0.5 0 (@range 0 1))\n(sky 0.2 0.4 0.9)\n(spot 1 0.5 0 (@kind "
+                       "angle) (@range 0 1))\n",
+                       "d.dta"));
     auto values = [&](const char* key) { return root->try_find(Symbol(key))->values(); };
-    const ValueMetadata width = split_metadata(values("width"));
-    REQUIRE(width.values.size() == 1);
-    CHECK(width.values[0].try_int() == 2);
-    CHECK(width.metadata.size() == 2);
-    const ValueMetadata ball = split_metadata(values("ball"));  // (pos 1 2) is no metadata
-    CHECK(ball.values.size() == 2);
-    CHECK(ball.metadata.empty());
+    const Array& width = *root->try_find("width");
+    REQUIRE(width.values().size() == 1);
+    CHECK(width.values()[0].try_int() == 2);
+    CHECK(std::distance(width.metadata().begin(), width.metadata().end()) == 2);
+    const Array& ball = *root->try_find("ball");  // (kind ball) is a field, not metadata
+    CHECK(ball.values().size() == 2);
+    CHECK(ball.metadata().empty());
 
     CHECK(presented_kind(values("tint")) == "color");
     CHECK(presented_kind(values("sky")).empty());                 // no range 0..1

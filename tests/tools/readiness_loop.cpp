@@ -42,7 +42,7 @@ TEST_CASE("readiness loop: edit, see, tune, save, experiment, and return") {
     const std::string shared =
         "; boss tuning, shared by the encounter team\n"
         "(warden\n"
-        "   (cadence 1.8 (note \"feels unfair below 1.0 on handheld\"))   ; seconds\n"
+        "   (cadence 1.8 (@note \"feels unfair below 1.0 on handheld\"))   ; seconds\n"
         "   (hp 1200))\n";
     dir.write("default.dta", shared);
     TweakRegistry reg;
@@ -94,8 +94,8 @@ TEST_CASE("readiness loop: edit, see, tune, save, experiment, and return") {
     const std::string saved = dir.read("default.dta");
     CHECK(test::diff_lines(edited, saved) ==
           std::vector<std::string>{
-              "-   (cadence 1.5 (note \"feels unfair below 1.0 on handheld\"))   ; seconds",
-              "+   (cadence 1.25 (note \"feels unfair below 1.0 on handheld\"))   ; seconds"});
+              "-   (cadence 1.5 (@note \"feels unfair below 1.0 on handheld\"))   ; seconds",
+              "+   (cadence 1.25 (@note \"feels unfair below 1.0 on handheld\"))   ; seconds"});
     CHECK(cfg.unsaved().empty());
     const Source source = *cfg.source("warden.cadence");
     CHECK(source.layer == "default");

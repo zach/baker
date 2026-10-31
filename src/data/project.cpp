@@ -209,8 +209,9 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
                 if (!l || l->size() < 2 || l->tag().empty() || (!is_dir && !text_of((*l)[1], file)))
                     return Unexpected(
                         places.at(l ? *l : *part,
-                                  "a layer is (name \"path\" [optional] [disabled] [dev_only]), "
-                                  "or (name (dir \"path\") ...) for a directory of layers"));
+                                  "a layer is (name \"path\" [optional] [disabled] [dev_only] "
+                                  "[(when COND)]), or (name (dir \"path\") ...) for a directory "
+                                  "of layers"));
                 ProjectLayer layer{.name = l->tag(),
                                    .path = joined(dir, file),
                                    .dir = is_dir,
@@ -223,10 +224,15 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
                         layer.enabled = false;
                     else if ((*l)[k].is(Symbol("dev_only")))
                         layer.dev_only = true;
+                    else if (const Array* w = (*l)[k].try_array();
+                             w && w->tag() == Symbol("when") && w->size() == 2 &&
+                             layer.when.empty())
+                        layer.when = Symbol(detail::text_of((*w)[1]));  // checked at the push
                     else
                         return Unexpected(places.at(
                             *l, "layer '" + Str(l->tag().str()) +
-                                    "': after the path, only optional, disabled and dev_only"));
+                                    "': after the path, only optional, disabled, dev_only and one "
+                                    "(when COND)"));
                 }
                 for (const ProjectLayer& seen : layers)
                     if (seen.name == layer.name)
@@ -267,6 +273,7 @@ Expected<List<ProjectProblem>> open_project(Config& cfg, const Project& project,
             ErrorCode::Refused, "more than " +
                                     detail::decimal(static_cast<int64_t>(LayerNames::kCapacity)) +
                                     " layers to leave out (ProjectOptions::skip)"));
+    cfg.set_layout(project.format);  // what it writes, laid out as the project's files
     LoadSession& session = cfg.session();
     if (!project.pack_levels.empty()) {
         Vec<Symbol> levels;
@@ -281,7 +288,7 @@ Expected<List<ProjectProblem>> open_project(Config& cfg, const Project& project,
         if (options.skip.contains(l.name.str())) continue;
         // A development layer never reaches a shipping build, whatever its file says.
         if (l.dev_only && (kShipping || options.skip_dev_only)) continue;
-        const LayerOptions o{.optional = l.optional, .enabled = l.enabled};
+        const LayerOptions o{.optional = l.optional, .enabled = l.enabled, .when = l.when.str()};
         if (auto r = l.dir ? cfg.push_layer_dir(l.name.str(), l.path.str(), o)
                            : cfg.push_layer(l.name.str(), l.path.str(), o);
             !r) {

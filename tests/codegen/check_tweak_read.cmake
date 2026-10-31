@@ -2,7 +2,10 @@
 # tweak_read.cpp at -O2 to assembly and inspects read_box_width():
 #   - no call or branch (no function call, no lock, no loop);
 #   - with -fno-pic on x86-64, exactly one instruction besides endbr64 and ret;
-#   - otherwise at most three (position-independent code may load the address first).
+#   - otherwise at most three (position-independent code may load the address first);
+#   - on AArch64 at most five: adrp and ldr for the address from the GOT, an add for the
+#     value's offset (GCC's atomic load takes no immediate offset), the ldr of the value
+#     into an integer register, and an fmov to s0. Still one load of the value.
 # Invoked by CTest with CXX, STD, SRC, INC, DEFS (;-list), FLAGS (;-list), OUT, ARCH.
 
 function(read_body pic_flag out_var)
@@ -48,7 +51,11 @@ function(check body max what)
 endfunction()
 
 read_body("" body)
-check("${body}" 3 "default code model")
+if(ARCH MATCHES "aarch64|arm64|ARM64")
+  check("${body}" 5 "default code model")
+else()
+  check("${body}" 3 "default code model")
+endif()
 if(ARCH MATCHES "x86_64|AMD64|amd64")
   read_body("-fno-pic" body)
   check("${body}" 1 "-fno-pic")

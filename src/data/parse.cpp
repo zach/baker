@@ -2,15 +2,26 @@
 
 #include "arena.hpp"
 #include "common/containers.hpp"
+#include "intern_site.hpp"
 #include "lexer.hpp"
+#include "markers.hpp"
 #include "merge.hpp"
 #include "session.hpp"
 #include "text.hpp"
 
+#include <baker/path.hpp>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <utility>
+
+#if defined(_MSC_VER)
+#define BAKER_COLD __declspec(noinline)
+#else
+#define BAKER_COLD [[gnu::noinline, gnu::cold]]
+#endif
 
 namespace baker {
 namespace detail {
@@ -31,13 +42,17 @@ bool read_disk_file(std::string_view path, TextSink out) {
 
 bool read_with(const LoadSession::Reader& reader, std::string_view path, Str& text) {
     text.clear();
+    const HostCallScope host;
     return reader(path, detail::str_out(text));
 }
 
 uint64_t list_with(const LoadSession::Lister& lister, std::string_view dir, Vec<Str>& entries,
                    const Allocator& alloc) {
     entries.clear();
-    if (!lister(dir, [&](std::string_view p) { entries.emplace_back(p, alloc); })) return 0;
+    {
+        const HostCallScope host;
+        if (!lister(dir, [&](std::string_view p) { entries.emplace_back(p, alloc); })) return 0;
+    }
     std::sort(entries.begin(), entries.end());
     Str all(alloc);
     for (const Str& e : entries) all.append(e).append("\n");
@@ -98,6 +113,7 @@ struct LoadSession::State {
           pack_levels(a),
           packs(a),
           origins(a),
+          shapes(a),
           definitions(a),
           flags(a),
           sections(a),
@@ -119,6 +135,7 @@ struct LoadSession::State {
         pack_levels = o.pack_levels;
         packs = o.packs;
         origins = o.origins;
+        shapes = o.shapes;
         definitions = o.definitions;
         flags = o.flags;
         sections = o.sections;
@@ -133,6 +150,7 @@ struct LoadSession::State {
         required_from = o.required_from;
         packs_from = o.packs_from;
         origins_from = o.origins_from;
+        shapes_from = o.shapes_from;
         definitions_from = o.definitions_from;
         include_stack = o.include_stack;
         nodes = o.nodes;
@@ -152,6 +170,7 @@ struct LoadSession::State {
     Vec<Symbol> pack_levels;           // hardest first
     Vec<Pack> packs;                   // in the order they were read
     Vec<Origin> origins;               // files that declared one, in the order read
+    Vec<ShapeDecl> shapes;             // #shape declarations, in the order read
     Vec<Definition> definitions;       // macro definitions, in the order read
     Vec<ActiveDefine> flags;           // the flags that stand, in the order made
     Vec<ConditionalSection> sections;  // the #ifdef branches the reads took
@@ -167,10 +186,13 @@ struct LoadSession::State {
     size_t required_from = 0;
     size_t packs_from = 0;
     size_t origins_from = 0;
+    size_t shapes_from = 0;
     size_t definitions_from = 0;
     // Per top-level read.
     Vec<Str> include_stack;
     uint64_t nodes = 0;
+    bool had_rows = false;           // a file of this read held rows: compact its tree
+    detail::NewSymbols new_symbols;  // counted by the symbol table
     uint32_t includes = 0;
 };
 
@@ -189,7 +211,15 @@ public:
           size_(static_cast<uint32_t>(text.size())) {
         if (map_) map_->record_text(file, text);
         ++s_.st_->parses;
+        defs_from_ = s_.st_->definitions.size();
+        // A name this file brings that shares a hash with another is reported at its line.
+        if constexpr (!kShipping) outer_site_ = set_intern_site({file, &line_});
     }
+    ~Parser() {
+        if constexpr (!kShipping) (void)set_intern_site(outer_site_);
+    }
+    Parser(const Parser&) = delete;
+    Parser& operator=(const Parser&) = delete;
 
     bool run(Ref<Array>& out, Error& err) {
         err_ = &err;
@@ -227,6 +257,12 @@ public:
             return fail(ErrorCode::Syntax, Str(bracket_name(f.open)) + " is never closed", f.line,
                         f.begin);
         }
+        if (s_.st_->new_symbols.count > s_.limits.max_new_symbols)  // a directive's last name
+            return too_many_names(line_, kNoColumn);
+        if (!rows_.empty()) {
+            Str path;
+            if (!fold(scratch_, map_ ? &spans_ : nullptr, 0, path, 0)) return false;
+        }
         Ref<Array> root = arena_.make_array(scratch_, file_, 1);
         if (root->height() > s_.limits.max_depth + 1) return too_deep(1);
         if (map_) map_->record(root, {file_, 0, size_, {}}, spans_);
@@ -239,15 +275,30 @@ public:
     }
 
 private:
-    enum class Frame : uint8_t { Root, Array, Command, Property, MacroDef, DefineBody, Autorun };
+    // Declare: the one form of #pack, #origin or #shape. The braces last, so the
+    // infix rule tests for one with one comparison.
+    enum class Frame : uint8_t {
+        Root,
+        Array,
+        Property,
+        MacroDef,
+        DefineBody,
+        Declare,
+        Command,
+        Autorun
+    };
     struct FrameInfo {
         Frame kind;
         size_t start;
         int32_t line;
-        Symbol name;  // DefineBody
+        Symbol name;  // DefineBody; Declare: the directive's name
         char open = '(';
-        uint32_t begin = 0;    // offset of the opening bracket
-        bool removes = false;  // holds #remove, which must be its one value
+        uint32_t begin = 0;  // offset of the opening bracket
+        bool verb = false;   // holds a layer verb: its form is checked at close
+        bool row = false;    // headed by a row's key: close() wraps it in the key's segments
+        // An odd slot was written as something other than a bare symbol token: a quoted symbol
+        // (`{+ '-' 1}`) or a macro use, so the brace is never read infix.
+        bool no_infix = false;
     };
     struct Cond {
         bool active;         // tokens in the current branch are read
@@ -276,6 +327,15 @@ private:
     bool fail(ErrorCode code, std::string_view msg, int32_t line) {
         return fail(code, msg, line, kNoColumn);
     }
+    // Past ParseLimits::max_new_symbols, the symbol table spends the node budget
+    // (count_new_symbols), so push() finds it at no cost of its own.
+    bool too_many_names(int32_t line, uint32_t at) {
+        return fail(ErrorCode::Limit,
+                    "more than " +
+                        detail::decimal(static_cast<int64_t>(s_.limits.max_new_symbols)) +
+                        " new names (ParseLimits::max_new_symbols)",
+                    line, at);
+    }
     bool too_deep(int32_t line, uint32_t at = kNoColumn) {
         return fail(ErrorCode::Limit,
                     "nesting deeper than " + detail::decimal(s_.limits.max_depth) + " levels", line,
@@ -290,11 +350,14 @@ private:
     // Edit mode keeps spans_ parallel to scratch_. An included file's nodes were counted by
     // its own parser, so splicing them in does not count them again.
     bool push(Node n, const SourceSpan& span = {}, bool counted = false) {
-        if (!counted && ++s_.st_->nodes > s_.limits.max_nodes)
+        if (!counted && ++s_.st_->nodes > s_.limits.max_nodes) {
+            if (s_.st_->new_symbols.count > s_.limits.max_new_symbols)
+                return too_many_names(line_, span.file.empty() ? kNoColumn : span.begin);
             return fail(ErrorCode::Limit,
                         "more than " + detail::decimal(static_cast<int64_t>(s_.limits.max_nodes)) +
                             " nodes",
                         line_, span.file.empty() ? kNoColumn : span.begin);
+        }
         if (frames_.back().kind == Frame::Root && n.type() == Type::Property)
             return fail(ErrorCode::Syntax,
                         "a [property] cannot appear at top level, where '[' defines a macro", line_,
@@ -304,8 +367,10 @@ private:
         return true;
     }
 
+    // Shrinks only. pop_back, not resize: once allocation took a kind, GCC 13 called resize's
+    // erase out of line here, and parse took about 5% longer.
     void truncate(size_t size) {
-        scratch_.resize(size);
+        while (scratch_.size() > size) scratch_.pop_back();
         if (map_) spans_.resize(size);
     }
     // Records `arr` (made from the nodes from `start`) and its span, for edit mode.
@@ -316,19 +381,32 @@ private:
     }
 
     bool symbol(const Token& t) {
+        // A row's key, (/a.b.c ...), heads a parenthesized array: a byte compare for every
+        // other symbol.
+        if (t.text.size() > 1 && t.text[0] == '/' && !t.quoted &&
+            frames_.back().kind == Frame::Array && scratch_.size() == frames_.back().start)
+            return row_key(t);
         const Symbol sym(t.text);
         const FrameInfo& f = frames_.back();
         const bool naming_macro = f.kind == Frame::MacroDef && scratch_.size() == f.start;
         if (!t.quoted && !naming_macro && !s_.st_->defines.empty()) {
             if (const Array* body = s_.macro(sym)) {
-                if (pack_ >= 0) one_way(sym, t.line);
+                if (pack_ >= 0)
+                    one_way(sym, t.line);
+                else if (!s_.st_->macro_pack.empty())  // checked if a #pack follows
+                    unpacked_.emplace_back(sym, t.line);
+                if (body->size() != 1 || odd_slot()) frames_.back().no_infix = true;
                 const SourceSpan from{file_, t.begin, t.end, sym};
                 for (const Node& n : *body)
                     if (!push(n, from)) return false;
                 return true;
             }
         }
+        if (t.quoted && odd_slot()) frames_.back().no_infix = true;
         return push(Node(sym), here(t));
+    }
+    [[nodiscard]] bool odd_slot() const noexcept {
+        return ((scratch_.size() - frames_.back().start) & 1) != 0;
     }
 
     bool open(char bracket, int32_t line, uint32_t begin) {
@@ -363,7 +441,6 @@ private:
                         t.line, t.begin);
         frames_.pop_back();
         std::span<Node> kids(scratch_.data() + f.start, scratch_.size() - f.start);
-        if (f.removes && kids.size() != 2) return bad_remove(f.line, f.begin);
 
         if (f.kind == Frame::MacroDef) {
             const auto name = kids.empty() ? std::nullopt : kids[0].try_sym();
@@ -379,10 +456,27 @@ private:
             return true;
         }
 
-        Ref<Array> arr = arena_.make_array(kids, file_, f.line);
+        // The infix rule, after a test of slot 1 that a call (`{game add_score 10}`) fails; an
+        // even brace only when its head is an operand, which only malformed infix gives.
+        bool infix = false;
+        if (f.kind >= Frame::Command && kids.size() >= 2 &&
+            ((kids.size() & 1) || is_infix_operand(kids[0])) && !f.no_infix &&
+            infix_head(kids[1])) {
+            const int r = infix_rule(kids.data(), kids.size(), f.start, f.line, f.begin);
+            if (r < 0) return false;
+            infix = r > 0;
+            if (infix) kids = kids.first(static_cast<size_t>(r));
+        }
+        Ref<Array> arr = arena_.make_array(kids, file_, f.line, f.verb);
+        if (infix) arr->set_written_infix(true);
         record(arr, f.start, f.begin, t.end);
         truncate(f.start);
         if (arr->height() > s_.limits.max_depth) return too_deep(f.line, f.begin);
+        // Metadata comes after the value. Inline, so an array without metadata pays one test;
+        // a command's and a property's forms are positional and keep their order.
+        if (arr->meta_first() && f.kind == Frame::Array && !metadata_placed(*arr, f)) return false;
+        if (f.verb && !verb_placed(*arr, f)) return false;
+        if (f.row) return wrap_row(std::move(arr), f, t.end);
         const SourceSpan span{file_, f.begin, t.end, {}};
         switch (f.kind) {
             case Frame::DefineBody:
@@ -395,26 +489,278 @@ private:
                 return true;
             case Frame::Command: return push(Node(std::move(arr), Type::Command), span);
             case Frame::Property: return push(Node(std::move(arr), Type::Property), span);
-            default:
-                // A file's first form may declare it a pack, which the tree leaves out.
-                if (frames_.size() == 1 && f.start == 0 && pack_ < 0 && !arr->empty() &&
-                    (*arr)[0].is(sym_pack()))
-                    return declare_pack(*arr);
-                // So may (origin "source" ...), first or after the pack declaration.
-                if (frames_.size() == 1 && f.start == 0 && !origin_ && arr->size() >= 2 &&
-                    (*arr)[0].is(sym_origin()) && (*arr)[1].type() == Type::String)
-                    return declare_origin(*arr);
-                return push(Node(std::move(arr)), span);
+            case Frame::Declare: return declared(f, std::move(arr));
+            default: return push(Node(std::move(arr)), span);
         }
     }
 
-    static const Symbol& sym_pack() {
-        static const Symbol s("pack");
-        return s;
+    // The infix rule. A brace of 2k+1 nodes whose odd slots are one bare operator,
+    // `{0.3 <= $value <= 0.7}`, is the command `{<= 0.3 $value 0.7}`: the nodes, and their
+    // spans, are permuted in place and `kids` shrinks to the command. Only when an operand (an
+    // even slot) is a number, variable, property or command, the guard, so a brace of bare
+    // symbols means what it did. An operator at slot 1 that is not one is an error at the
+    // brace, and so is one after an operand head in an even brace (`{$v <= 0.7 0.3}`,
+    // `{$v <=}`), which no head-first call writes: quoted, `{$obj '<=' 1 2}`, it is a call.
+    static bool infix_head(const Node& n) noexcept {
+        const auto s = n.try_sym();
+        return s && !s->str().empty() && kOperatorByte[static_cast<unsigned char>(s->str()[0])];
     }
-    static const Symbol& sym_origin() {
-        static const Symbol s("origin");
-        return s;
+    // Returns the command's new size, 0 for a command as written, -1 after an error. Out of
+    // line, its arguments by value: the hot loop's close keeps its registers.
+    BAKER_COLD int infix_rule(Node* kids, size_t n, size_t start, int32_t line, uint32_t begin) {
+        const std::string_view op = kids[1].try_sym()->str();
+        if (!is_operator_symbol(op)) return 0;
+        bool operand = false;
+        for (size_t i = 0; i < n; i += 2) operand = operand || is_infix_operand(kids[i]);
+        if (!operand) return 0;
+        const Symbol head = *kids[1].try_sym();
+        for (size_t i = 3; i < n; i += 2) {
+            if (kids[i].is(head)) continue;
+            if (quoted_in_command(kids[i]))
+                return malformed(line, begin,
+                                 "mixed operators in {...}: nest braces to say which applies "
+                                 "first");
+            return malformed(line, begin,
+                             "infix {...} needs '" + Str(op) + "' between every two operands");
+        }
+        if (!(n & 1))
+            return malformed(line, begin,
+                             "infix {...} ends with '" + Str(op) + "': write an operand after it");
+        // [k0 op k2 op k4 ...] -> [op k0 k2 k4 ...]: each operand moves left over the operators
+        // before it, which end up past the command and are dropped.
+        auto swap = [&](size_t a, size_t b) {
+            kids[a].swap(kids[b]);
+            if (map_) std::swap(spans_[start + a], spans_[start + b]);
+        };
+        swap(0, 1);
+        for (size_t i = 3, j = 4; j < n; ++i, j += 2) swap(i, j);
+        const size_t size = (n + 3) / 2;
+        if (map_) spans_.resize(start + size);  // the operators' spans go with them
+        return static_cast<int>(size);
+    }
+    int malformed(int32_t line, uint32_t begin, std::string_view message) {
+        fail(ErrorCode::Syntax, message, line, begin);
+        return -1;
+    }
+
+    // The key after '/': segments separated by '.' or '/', a 'quoted' one for a name holding
+    // either, as a Path is written; each a key, never an element. The last is the
+    // array's tag; close() wraps the array in the others.
+    BAKER_COLD bool row_key(const Token& t) {
+        auto bad = [&](const Str& why) { return fail(ErrorCode::Syntax, why, t.line, t.begin); };
+        if (frames_.size() != 2)
+            return bad("a row is a top-level form; write the key nested, or quote '" + Str(t.text) +
+                       "' for a symbol");
+        const std::string_view key = t.text.substr(1);
+        row_size_ = 0;
+        for (size_t i = 0, from = 0; i < key.size(); from = i) {
+            if (row_size_ == Path::kMaxSegments) return bad("the key has more than 16 segments");
+            std::string_view name;
+            if (key[i] == '\'') {
+                i = key.find('\'', i + 1);
+                if (i == std::string_view::npos)
+                    return bad(
+                        "the key has an unclosed quote; a key holds no space or bracket: write "
+                        "that key nested");
+                name = key.substr(from + 1, i++ - from - 1);
+            } else {
+                i = std::min(key.find_first_of("./", i), key.size());
+                name = key.substr(from, i - from);
+                if (!name.empty() && name.find_first_not_of("0123456789") == Str::npos)
+                    return bad("a row names keys, and '" + Str(name) +
+                               "' is an element; an element is set with config.set or by "
+                               "writing the whole list");
+                if (!name.empty() && !is_bare_symbol(name))
+                    return bad("the key's segment " + Str(name) + " must be quoted: '" + Str(name) +
+                               "'");
+            }
+            if (name.empty()) return bad("the key has an empty segment");
+            const auto at = static_cast<uint32_t>(t.begin + 1);
+            row_[row_size_++] = {Symbol(name), at + static_cast<uint32_t>(from),
+                                 at + static_cast<uint32_t>(i)};
+            if (i == key.size()) break;
+            if (key[i] != '.' && key[i] != '/')
+                return bad("a quoted segment is followed by '.' or '/'");
+            if (++i == key.size()) return bad("the key ends with a separator");
+        }
+        frames_.back().row = true;
+        rows_.push_back({t.line, t.begin});
+        s_.st_->had_rows = true;
+        return push(Node(row_[row_size_ - 1].name),
+                    {file_, row_[row_size_ - 1].begin, row_[row_size_ - 1].end, {}});
+    }
+
+    // `arr` in one array for each segment before its tag, each made in the load's arena with
+    // the row's line. In edit mode each wrapper's extent is the row's, and the map
+    // records it as row-made: written as a segment of the key, not literally.
+    BAKER_COLD bool wrap_row(Ref<Array> arr, const FrameInfo& f, uint32_t end) {
+        const SourceSpan extent{file_, f.begin, end, {}};
+        for (size_t i = row_size_ - 1; i-- > 0;) {
+            Node pair[2] = {Node(row_[i].name), Node(std::move(arr))};
+            arr = arena_.make_array(pair, file_, f.line);
+            const SourceSpan spans[2] = {{file_, row_[i].begin, row_[i].end, {}}, extent};
+            if (map_) map_->record(arr, extent, spans, true);
+        }
+        s_.st_->nodes += 2 * (row_size_ - 1);  // push() counts them against the limit
+        if (arr->height() > s_.limits.max_depth) return too_deep(f.line, f.begin);
+        return push(Node(std::move(arr)), extent);
+    }
+
+    // In a file with rows, each tag heads one array at each level: the arrays sharing a tag
+    // in nodes[from..] are joined, in the order written, at the first one's place, and the
+    // joined children folded in turn. A key written twice, by two rows or by a row and a
+    // literal, is an error at the second: first-wins holds only in files without rows.
+    // Grouped by sorting, in buffers kept a depth (as MergeScratch's): no allocation
+    // once they are warm.
+    BAKER_COLD bool fold(Vec<Node>& nodes, Vec<SourceSpan>* spans, size_t from, Str& path,
+                         size_t depth) {
+        if (fold_.empty()) fold_.reserve(s_.limits.max_depth + 2);  // a level never moves
+        while (fold_.size() <= depth) fold_.emplace_back(alloc_);
+        FoldLevel& l = fold_[depth];
+        l.order.clear();
+        // A key's #append and #drop rows stay apart, in the order written: the merge applies
+        // each in turn, as it does a nested file's.
+        for (size_t i = from; i < nodes.size(); ++i)
+            if (!tag_of(nodes[i]).empty() && !detail::composes(*nodes[i].try_array()))
+                l.order.push_back(static_cast<uint32_t>(i));
+        std::sort(l.order.begin(), l.order.end(), [&](uint32_t x, uint32_t y) {
+            const void *a = tag_of(nodes[x]).id(), *b = tag_of(nodes[y]).id();
+            return a != b ? std::less<>()(a, b) : x < y;
+        });
+        l.next.assign(nodes.size(), kNoNext);  // each array's next with its tag; kLater: not first
+        bool joins = false;
+        for (size_t k = 1; k < l.order.size(); ++k) {
+            const uint32_t x = l.order[k - 1], y = l.order[k];
+            if (tag_of(nodes[x]) != tag_of(nodes[y])) continue;
+            l.next[x] = (l.next[x] & kLater) | y;
+            l.next[y] |= kLater;
+            joins = true;
+        }
+        size_t out = from;
+        for (size_t i = from; i < nodes.size() && joins; ++i) {
+            if (l.next[i] & kLater) continue;  // joined into the first with its tag
+            if (l.next[i] != kNoNext && !join(nodes, spans, i, path, depth)) return false;
+            nodes[out] = std::move(nodes[i]);
+            if (spans) (*spans)[out] = (*spans)[i];
+            ++out;
+        }
+        // pop_back, not resize: a second caller of vector<Node>'s erase made GCC stop inlining
+        // it into truncate(), every close() (+1.4% parse instructions, measured).
+        while (joins && nodes.size() > out) nodes.pop_back();
+        if (spans) spans->resize(nodes.size());
+        return true;
+    }
+
+    // nodes[h] and the arrays after it with its tag, as one array: the one value run first,
+    // whichever member wrote it, then every tagged child in the order written, so a value
+    // never follows metadata.
+    bool join(Vec<Node>& nodes, Vec<SourceSpan>* spans, size_t h, Str& path, size_t depth) {
+        FoldLevel& l = fold_[depth];
+        const Array& a = *nodes[h].try_array();
+        const size_t mark = path.size();
+        if (mark) path += '/';
+        append_path_name(path, a.tag().str());
+        // The member with values, if any; a second one, or a removal joined with anything,
+        // is written twice.
+        uint32_t valued = has_values(a) ? static_cast<uint32_t>(h) : kNoNext;
+        bool removed = detail::is_removal(a);
+        for (uint32_t m = l.next[h]; m != kNoNext; m = l.next[m] & ~kLater) {
+            const Array& b = *nodes[m].try_array();
+            if ((valued != kNoNext && has_values(b)) || removed || detail::is_removal(b))
+                return written_twice(b, path, valued != kNoNext && has_values(b));
+            if (has_values(b)) valued = m;
+        }
+        l.kids.assign(1, a[0]);
+        l.spans.clear();
+        auto take = [&](const Array& x, bool values) {
+            const auto known = spans ? map_->spans(x) : std::nullopt;
+            for (size_t k = 1; k < x.size(); ++k) {
+                if (tag_of(x[k]).empty() != values) continue;
+                l.kids.push_back(x[k]);
+                if (spans) l.spans.push_back(known ? (*known)[k] : SourceSpan{});
+            }
+        };
+        if (spans) {
+            const auto known = map_->spans(a);
+            l.spans.push_back(known ? (*known)[0] : SourceSpan{});
+        }
+        if (valued != kNoNext) take(*nodes[valued].try_array(), true);
+        take(a, false);
+        for (uint32_t m = l.next[h]; m != kNoNext; m = l.next[m] & ~kLater)
+            take(*nodes[m].try_array(), false);
+        if (!fold(l.kids, spans ? &l.spans : nullptr, 1, path, depth + 1)) return false;
+        path.resize(mark);
+        Ref<Array> joined = arena_.make_array(l.kids, a.file(), a.line());
+        while (!l.kids.empty()) l.kids.pop_back();  // moved from; see fold()
+        const SourceSpan* ext = map_ ? map_->extent(a) : nullptr;
+        if (map_) map_->record(joined, ext ? *ext : SourceSpan{}, l.spans, true);
+        nodes[h] = Node(std::move(joined));
+        return true;
+    }
+
+    static bool has_values(const Array& a) noexcept {
+        for (size_t i = 1; i < a.size(); ++i)
+            if (tag_of(a[i]).empty()) return true;
+        return false;
+    }
+
+    // At the later writing, `b`, and at its row's key when a row wrote it. A key written
+    // twice by literals only is the list a file of rows cannot hold: the error says so.
+    bool written_twice(const Array& b, const Str& path, bool twice) {
+        const auto r = std::find_if(rows_.begin(), rows_.end(),
+                                    [&](const RowAt& x) { return x.line == b.line(); });
+        Str why = "'" + path + (twice ? "' is written twice" : "' is removed and also written");
+        if (r == rows_.end() && b.file() == file_)
+            why += "; this file holds rows (the first at line " + detail::decimal(rows_[0].line) +
+                   "), so each key is written once: a list of records is written without rows";
+        *err_ = make_error(ErrorCode::Syntax, why, b.file(), b.line());
+        if (b.file() == file_ && r != rows_.end()) err_->set_column(lex_.column_at(r->key));
+        return false;
+    }
+
+    // A declaration's form, which the tree leaves out: #pack (NAME ...), #origin ("SRC" ...),
+    // #shape (NAME ...), the name or source first.
+    bool declared(const FrameInfo& f, Ref<Array> form) {
+        if (f.name == "pack") return declare_pack(*form);
+        if (f.name == "shape") {
+            if (form->tag().empty() || form->tag().is_meta())
+                return fail(ErrorCode::Directive,
+                            "#shape takes a named form: #shape (NAME (FIELD TYPE ...) ...)", f.line,
+                            f.begin);
+            SessionAccess::add_shape(
+                s_, {std::move(form), file_, f.line, Symbol(s_.st_->include_stack.front())});
+            return true;
+        }
+        if (form->empty() || (*form)[0].type() != Type::String)
+            return fail(ErrorCode::Directive,
+                        "#origin takes a string first: #origin (\"source\" (tool NAME))", f.line,
+                        f.begin);
+        return declare_origin(*form);
+    }
+
+    // #pack, #origin, #shape: one form at the file's top level; a pack and an origin once.
+    bool declaration(const Token& t) {
+        const Str d(t.text);
+        if (frames_.size() != 1)
+            return fail(ErrorCode::Directive, "#" + d + " is written at a file's top level", t.line,
+                        t.begin);
+        if ((d == "pack" && pack_ >= 0) || (d == "origin" && origin_))
+            return fail(ErrorCode::Directive,
+                        "second #" + d + " in this file: a file declares one " + d, t.line,
+                        t.begin);
+        Token next;
+        if (!lex_.next(next, *err_)) return false;
+        if (next.kind != Tok::Open || next.bracket != '(')
+            return fail(ErrorCode::Directive,
+                        "#" + d + " takes one form: #" + d +
+                            (d == "pack"     ? " (NAME (level L) ...)"
+                             : d == "origin" ? " (\"source\" (tool NAME))"
+                                             : " (NAME (FIELD TYPE ...) ...)"),
+                        next.line, next.begin);
+        if (!open('(', next.line, next.begin)) return false;
+        frames_.back().kind = Frame::Declare;
+        frames_.back().name = Symbol(d);
+        return true;
     }
 
     // A name written as a symbol or a string: (owners "td-combat" td-encounter).
@@ -473,26 +819,25 @@ private:
         return true;
     }
 
-    // (origin "economy.xlsx" (tool sheets-export)): recorded for this file, left out of the
-    // tree.
+    // #origin ("economy.xlsx" (tool sheets-export)): recorded for this file.
     bool declare_origin(const Array& decl) {
         origin_ = true;
         Symbol tool;
         if (const Array* t = decl.try_find("tool")) {
             const auto x = t->size() == 2 ? name_of((*t)[1]) : std::nullopt;
             if (!x)
-                return fail(ErrorCode::Syntax, "write (origin \"source\" (tool name))", t->line());
+                return fail(ErrorCode::Syntax, "write #origin (\"source\" (tool name))", t->line());
             tool = *x;
         }
-        SessionAccess::add_origin(s_, {file_, Symbol(*decl[1].try_str()), tool});
+        SessionAccess::add_origin(s_, {file_, Symbol(*decl[0].try_str()), tool});
         return true;
     }
 
-    // (pack name (level L) (requires other ...)): other children are metadata for later.
+    // #pack (name (level L) (requires other ...)): other children are metadata for later.
     bool declare_pack(const Array& decl) {
         LoadSession::State& st = *s_.st_;
-        const auto name = decl.size() > 1 ? decl[1].try_sym() : std::nullopt;
-        if (!name) return fail(ErrorCode::Syntax, "(pack ...) needs a name", decl.line());
+        const auto name = decl.tag().empty() ? std::nullopt : std::optional<Symbol>(decl.tag());
+        if (!name) return fail(ErrorCode::Syntax, "#pack (...) needs a name", decl.line());
         const Array* level = decl.try_find("level");
         const auto l = level && level->size() == 2 ? (*level)[1].try_sym() : std::nullopt;
         if (!l)
@@ -549,6 +894,12 @@ private:
                      List<Symbol>({owners.data(), owners.size()}),
                      List<Symbol>({audience.data(), audience.size()}), stage}));
         pack_line_ = decl.line();
+        // A pack is its whole file's: what the file defined above #pack is the pack's, and the
+        // macros it used above #pack are checked now.
+        for (size_t i = defs_from_; i < st.definitions.size(); ++i)
+            if (st.definitions[i].file == file_)
+                st.macro_pack[st.definitions[i].name] = static_cast<uint32_t>(pack_);
+        for (const auto& [macro, line] : unpacked_) one_way(macro, line);
         return true;
     }
 
@@ -641,23 +992,45 @@ private:
         return true;
     }
 
-    // `(key #remove)`: the marker is the tagged array's one value.
-    bool bad_remove(int32_t line, uint32_t at) {
-        return fail(ErrorCode::Directive, "#remove is written as a key's only value: (key #remove)",
-                    line, at);
+    // In the parenthesized array `a` just closed, every child after the first metadata
+    // child, (@tag ...), is a tagged array: a field or more metadata, never a value. Located
+    // at the array: a child's own place is not known once macros have spliced theirs in.
+    BAKER_COLD bool metadata_placed(const Array& a, const FrameInfo& f) {
+        const uint32_t m = a.meta_first();
+        for (uint32_t i = m + 1; i < a.size(); ++i) {
+            if (!detail::tag_of(a[i]).empty()) continue;
+            return fail(
+                ErrorCode::Syntax,
+                "metadata comes after the value: move " + preview(a[m]) + " after " + preview(a[i]),
+                f.line, f.begin);
+        }
+        return true;
     }
-    bool removal(const Token& t) {
+
+    // Whether the verb in `a`'s slot has the form it is written in; else the located error.
+    BAKER_COLD bool verb_placed(const Array& a, const FrameInfo& f) {
+        if (detail::verb_of(a) != detail::Marker::None) return true;
+        return fail(ErrorCode::Directive, detail::marker_hint(detail::marker_of(a[1])), f.line,
+                    f.begin);
+    }
+
+    // A layer verb, `#remove`, `#append` or `#drop`: the first value of a parenthesized
+    // array tagged with a key, metadata's included. The rest of its form (how many
+    // values follow) is checked when the array closes.
+    bool verb(const Token& t, detail::Marker m) {
         FrameInfo& f = frames_.back();
-        if (f.kind != Frame::Array || scratch_.size() != f.start + 1 ||
-            !scratch_[f.start].try_sym())
-            return bad_remove(t.line, t.begin);
-        f.removes = true;
-        return push(Node(remove_marker()), here(t));
+        const auto tag =
+            scratch_.size() == f.start + 1 ? scratch_[f.start].try_sym() : std::nullopt;
+        if (f.kind != Frame::Array || !tag || tag->empty())
+            return fail(ErrorCode::Directive, detail::marker_hint(m), t.line, t.begin);
+        f.verb = true;
+        return push(Node(detail::marker_symbol(m)), here(t));
     }
 
     bool directive(const Token& t) {
         const std::string_view d = t.text;
-        if (d == "remove") return removal(t);
+        if (const detail::Marker m = detail::marker_named(d); m != detail::Marker::None)
+            return verb(t, m);
         if (d == "ifdef" || d == "ifndef") return conditional(t, true);
         if (d == "else" || d == "endif") return else_or_endif(t);
         if (d == "include" || d == "include_opt" || d == "merge" || d == "require") {
@@ -687,6 +1060,12 @@ private:
             Token next;
             if (!lex_.peek(next, *err_)) return false;
             if (next.kind == Tok::Open && next.bracket == '(' && next.line == name.line) {
+                // The older macro form, still read; [NAME ...] is the one a check suggests.
+                s_.st_->warnings.push_back(make_error(
+                    ErrorCode::Syntax,
+                    "#define " + Str(name.text) + " (...) is the older macro form; write [" +
+                        Str(name.text) + " ...]",
+                    file_, name.line));
                 (void)lex_.next(next, *err_);
                 if (!open('(', next.line, next.begin)) return false;
                 frames_.back().kind = Frame::DefineBody;
@@ -707,6 +1086,7 @@ private:
             s_.st_->tested.emplace_back(name.text);
             return true;
         }
+        if (d == "pack" || d == "origin" || d == "shape") return declaration(t);
         if (d == "autorun") {
             Token next;
             if (!lex_.next(next, *err_)) return false;
@@ -739,6 +1119,8 @@ private:
 
     // Where an included path may be: beside this file, then in each include directory.
     [[nodiscard]] Vec<Str> candidates_of(const Str& path) const {
+        // A path the session records is copied there, with its allocator: the default's,
+        // which outlives the session, not this parser's.
         Vec<Str> candidates;
         if (is_absolute_path(path)) {
             candidates.push_back(normalize_path(path));
@@ -787,7 +1169,7 @@ private:
     bool load(const Str& path, bool optional, int32_t line, uint32_t at, Ref<Array>& out,
               bool require = false) {
         if (!may_include(path, line, at)) return false;
-        Str text;
+        Str text(alloc_);
         const Str* found = nullptr;
         Vec<Str>& required = s_.st_->required;
         const Vec<Str> candidates = candidates_of(path);
@@ -860,7 +1242,7 @@ private:
                             line, at);
         Vec<uint32_t> order;
         for (uint32_t i = 0; i < children.size(); ++i) order.push_back(i);
-        Str text;
+        Str text(alloc_);
         const Str order_file = normalize_path(join_path(dir, "order.dta"));
         if (read_recorded(order_file, text)) {
             Vec<std::string_view> names;
@@ -925,21 +1307,48 @@ private:
     int32_t line_ = 1;
     SourceMap* map_;
     uint32_t size_;
-    Vec<Node> scratch_;
-    Vec<SourceSpan> spans_;  // parallel to scratch_ in edit mode
-    Vec<FrameInfo> frames_;
-    Vec<Cond> conds_;
-    int32_t pack_ = -1;      // the pack this file declared, as an index; -1 for none
-    int32_t pack_line_ = 0;  // where it declared it
-    bool origin_ = false;    // this file declared its origin
-    Vec<Symbol> warned_;     // macros this file has been warned about
+    // The session's allocator, tagged Config, for the parser's own buffers: before the
+    // containers that take it.
+    const Allocator alloc_{with_kind(*s_.st_->alloc, MemoryKind::Config)};
+    Vec<Node> scratch_{alloc_};
+    Vec<SourceSpan> spans_{alloc_};  // parallel to scratch_ in edit mode
+    Vec<FrameInfo> frames_{alloc_};
+    Vec<Cond> conds_{alloc_};
+    int32_t pack_ = -1;           // the pack this file declared, as an index; -1 for none
+    int32_t pack_line_ = 0;       // where it declared it
+    bool origin_ = false;         // this file declared its origin
+    Vec<Symbol> warned_{alloc_};  // macros this file has been warned about
+    size_t defs_from_ = 0;        // the session's definitions before this file
+    Vec<std::pair<Symbol, int32_t>> unpacked_{alloc_};  // macros used before a #pack, and where
+    InternSite outer_site_;  // the intern site of the read that included this file
+    struct RowSegment {
+        Symbol name;
+        uint32_t begin = 0, end = 0;  // its bytes in the text, quotes included
+    };
+    struct RowAt {
+        int32_t line;
+        uint32_t key;  // the offset of the key
+    };
+    // A depth's buffers for the fold: the nodes by tag, each array's next with its tag, and
+    // a joined array's children with their spans.
+    struct FoldLevel {
+        explicit FoldLevel(const Allocator& a) : order(a), next(a), kids(a), spans(a) {}
+        Vec<uint32_t> order, next;
+        Vec<Node> kids;
+        Vec<SourceSpan> spans;
+    };
+    static constexpr uint32_t kLater = 0x80000000u, kNoNext = 0x7FFFFFFFu;
+    RowSegment row_[Path::kMaxSegments];  // the open row's key: rows do not nest
+    size_t row_size_ = 0;
+    Vec<RowAt> rows_{alloc_};  // the rows read, for the fold and its errors
+    Vec<FoldLevel> fold_{alloc_};
 };
 
 }  // namespace detail
 
 // Sessions belong to whoever made them: from the default allocator unless an owner passes
 // its own.
-LoadSession::LoadSession() : LoadSession(default_allocator()) {}
+LoadSession::LoadSession() : LoadSession(default_allocator(MemoryKind::Config)) {}
 LoadSession::LoadSession(const Allocator& alloc) : st_(detail::create<State>(alloc, alloc)) {}
 void LoadSession::copy_options(const LoadSession& o) noexcept {
     limits = o.limits;
@@ -948,6 +1357,7 @@ void LoadSession::copy_options(const LoadSession& o) noexcept {
     cipher = o.cipher;
     text_only = o.text_only;
     refuse_includes = o.refuse_includes;
+    drop_metadata = o.drop_metadata;
     allocator = o.allocator;
 }
 LoadSession::LoadSession(const LoadSession& o)
@@ -1068,6 +1478,9 @@ std::span<const Definition> LoadSession::macro_definitions() const noexcept {
 }
 std::span<const Origin> LoadSession::origins() const noexcept {
     return {st_->origins.data(), st_->origins.size()};
+}
+std::span<const ShapeDecl> LoadSession::shapes() const noexcept {
+    return {st_->shapes.data(), st_->shapes.size()};
 }
 const Origin* LoadSession::origin_of(Symbol file) const noexcept {
     for (const Origin& o : st_->origins)
@@ -1199,6 +1612,18 @@ void SessionAccess::add_origin(LoadSession& s, const Origin& origin) {
         }
     s.st_->origins.push_back(origin);
 }
+std::span<const ShapeDecl> SessionAccess::new_shapes(const LoadSession& s) noexcept {
+    const auto& d = s.st_->shapes;
+    return {d.data() + std::min(s.st_->shapes_from, d.size()), d.data() + d.size()};
+}
+void SessionAccess::add_shape(LoadSession& s, ShapeDecl shape) {
+    for (ShapeDecl& d : s.st_->shapes)
+        if (d.file == shape.file && d.line == shape.line && d.form->tag() == shape.form->tag()) {
+            d = std::move(shape);
+            return;
+        }
+    s.st_->shapes.push_back(std::move(shape));
+}
 void SessionAccess::set_macro_pack(LoadSession& s, Symbol macro, Symbol file) {
     const auto& packs = s.st_->packs;
     for (size_t i = 0; i < packs.size(); ++i)
@@ -1264,12 +1689,63 @@ size_t first_block(std::string_view text) noexcept {
 
 }  // namespace
 
+namespace {
+// The tree a read built in `from`, copied into an arena of its own: an array or a string of
+// `from` is copied once (an array that macro expansion shared stays shared), and one of
+// another owner, a define from an earlier file, is kept as it is.
+class Compactor {
+public:
+    Compactor(detail::Arena& from, const Allocator& alloc)
+        : from_(&from.owner()), to_(detail::Arena::create(alloc)) {}
+
+    Ref<Array> array(const Array& a) {
+        if (const auto it = done_.find(&a); it != done_.end()) return it->second;
+        Vec<Node> kids;
+        kids.reserve(a.size());
+        for (const Node& n : a) kids.push_back(node(n));
+        Ref<Array> copy = to_->make_array(kids, a.file(), a.line());
+        if (a.written_infix()) copy->set_written_infix(true);
+        if (a.sorted_for_lookup()) copy->sort_for_lookup();
+        done_.emplace(&a, copy);
+        return copy;
+    }
+
+private:
+    Node node(const Node& n) {
+        switch (n.type()) {
+            case Type::String:
+                if (&detail::owner_of(n.string()) != from_) return n;
+                return Node(to_->make_string(n.string()->view()));
+            case Type::Array:
+            case Type::Command:
+            case Type::Property: {
+                const Array* a = n.array();
+                if (&detail::owner_of(a) != from_) return n;
+                return Node(array(*a), n.type());
+            }
+            default: return n;
+        }
+    }
+
+    detail::Owner* from_;
+    detail::Arena::Handle to_;
+    HashMap<const Array*, Ref<Array>> done_;
+};
+
+Ref<Array> compact(const Array& root, detail::Arena& from) {
+    Compactor c(from, from.allocator());
+    return c.array(root);
+}
+}  // namespace
+
 Expected<Ref<Array>> read_string(std::string_view text, std::string_view name,
                                  LoadSession& session) {
     const bool top = session.st_->include_stack.empty();
     if (top) {
         LoadSession::State& st = *session.st_;
         st.nodes = 0;
+        st.had_rows = false;
+        st.new_symbols = {0, session.limits.max_new_symbols, &st.nodes, session.limits.max_nodes};
         st.includes = 0;
         st.recorded = session.record_for_cache;
         st.files.clear();
@@ -1280,6 +1756,7 @@ Expected<Ref<Array>> read_string(std::string_view text, std::string_view name,
             st.required_from = st.required.size();
             st.packs_from = st.packs.size();
             st.origins_from = st.origins.size();
+            st.shapes_from = st.shapes.size();
             st.definitions_from = st.definitions.size();
         }
     }
@@ -1294,10 +1771,28 @@ Expected<Ref<Array>> read_string(std::string_view text, std::string_view name,
     // Its first block is sized from the text.
     const detail::Arena::Handle arena(detail::Arena::create(
         session.allocator ? *session.allocator : default_allocator(), first_block(text)));
+    // A top-level read counts the names it interns; an include counts into the same total.
+    struct CountNames {
+        bool top;
+        detail::NewSymbols* outer = nullptr;
+        CountNames(bool is_top, detail::NewSymbols* counter) : top(is_top) {
+            if (top) outer = detail::count_new_symbols(counter);
+        }
+        ~CountNames() {
+            if (top) (void)detail::count_new_symbols(outer);
+        }
+        CountNames(const CountNames&) = delete;
+        CountNames& operator=(const CountNames&) = delete;
+    } count(top, &session.st_->new_symbols);
     detail::Parser parser(session, *arena, text, Symbol(file), 0);
     Ref<Array> root;
     Error err;
     if (!parser.run(root, err)) return Unexpected(std::move(err));
+    // Rows build each key's arrays twice, a wrapper per segment and then the joined level,
+    // and the first copies stay in the arena: a file of rows held 2.3 times what the same
+    // file written nested holds. Its tree goes into an arena of its own, and the first goes
+    // with the read. Not under a source map, which knows each array by its address.
+    if (top && session.st_->had_rows && !session.source_map) root = compact(*root, *arena);
     return root;
 }
 
@@ -1307,8 +1802,11 @@ Expected<Ref<Array>> read_string(std::string_view text, std::string_view name) {
 }
 
 Expected<Ref<Array>> read_file(std::string_view path, LoadSession& session) {
+    // The file's text is the session's, tagged. Not its path: the session keeps a copy
+    // of that, and a copy keeps its allocator, which must outlive it.
+    const Allocator alloc = with_kind(*session.st_->alloc, MemoryKind::Config);
     const Str file = detail::normalize_path(path);
-    Str text;
+    Str text(alloc);
     if (!detail::read_with(session.st_->reader, file, text))
         return Unexpected(make_error(ErrorCode::Io, "cannot read '" + file + "'"));
     auto root = read_string(text, file, session);

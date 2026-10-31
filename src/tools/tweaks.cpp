@@ -131,11 +131,12 @@ struct DescribedTweaks::Impl {
 };
 
 DescribedTweaks::DescribedTweaks(TweakRegistry& registry)
-    : impl_(detail::create<Impl>(default_allocator(), Impl{&registry, {}})) {}
+    : impl_(detail::create<Impl>(default_allocator(MemoryKind::Tools), Impl{&registry, {}})) {}
 
 DescribedTweaks::~DescribedTweaks() {
-    for (DescribedTweak* t : impl_->tweaks) detail::destroy(default_allocator(), t);
-    detail::destroy(default_allocator(), impl_);
+    for (DescribedTweak* t : impl_->tweaks)
+        detail::destroy(default_allocator(MemoryKind::Tools), t);
+    detail::destroy(default_allocator(MemoryKind::Tools), impl_);
 }
 
 size_t DescribedTweaks::size() const noexcept {
@@ -179,10 +180,10 @@ Expected<void> DescribedTweaks::add(const TweakDescription& d) {
     // Several values, or a list, written in parentheses: (1 2), (fast loud), ((0 0) (1 0)).
     if (nodes.size() == 1 && (types.size() > 1 || d.count != ValueCount::Exact || list || curve))
         if (const Array* a = nodes[0].try_array()) nodes = a->nodes();
-    auto* t = detail::create<DescribedTweak>(default_allocator(), d, types, element_types,
-                                             *impl_->registry);
+    auto* t = detail::create<DescribedTweak>(default_allocator(MemoryKind::Tools), d, types,
+                                             element_types, *impl_->registry);
     if (!t->start(nodes)) {
-        detail::destroy(default_allocator(), t);
+        detail::destroy(default_allocator(MemoryKind::Tools), t);
         return refuse("its default (" + Str(d.default_text) + ") is not " + Str(d.type));
     }
     impl_->tweaks.push_back(t);

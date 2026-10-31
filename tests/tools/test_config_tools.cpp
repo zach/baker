@@ -87,7 +87,8 @@ TEST_CASE("check and the reference know the tools") {
     CHECK(report.errors[0].line() == 1);
     const std::string ref = reference(f.ctx);
     CHECK(ref.find("### `config.explain`") != std::string::npos);
-    CHECK(ref.find("Every contributor to a path's value") != std::string::npos);
+    if constexpr (!kShipping)  // a shipping build keeps no doc text
+        CHECK(ref.find("Every contributor to a path's value") != std::string::npos);
 }
 
 #if !BAKER_SHIPPING

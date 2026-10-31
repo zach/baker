@@ -152,8 +152,7 @@ const Objective* objective_named(const Book& book, Symbol name) {
 
 Str number_text(double v) {
     char buf[64];
-    std::snprintf(buf, sizeof buf, "%.6g", v);
-    return Str(buf);
+    return Str(std::string_view(buf, detail::print_g(v, 6, buf)));  // '.' in any locale
 }
 namespace {
 

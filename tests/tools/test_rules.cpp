@@ -26,23 +26,24 @@ std::vector<std::string> texts(const List<Error>& list) {
 
 // The rules of `text`'s shapes over `text` itself.
 shape::Report ruled(Context& ctx, std::string_view text) {
-    const auto tree = ok(read_string(text, "t.dta"));
+    LoadSession session;
+    const auto tree = ok(read_string(text, "t.dta", session));
     shape::Set shapes;
     shape::Report report;
-    shapes.add(*tree, report);
+    shapes.add(session, report);
     REQUIRE(report.errors.empty());
     tools::check_rules(*tree, shapes, ctx, report);
     return report;
 }
 
 const char* const kUnits =
-    "(shapes (unit (at units) (keyed) (max_hp int) (start_hp int)\n"
-    "   (rule \"starts at or below its maximum\" {<= $start_hp $max_hp})\n"
-    "   (rule \"has a name\" {!= $name \"\"} (warn))))\n";
+    "#shape (unit (@at units) (@keyed) (max_hp int) (start_hp int)\n"
+    "   (@rule \"starts at or below its maximum\" {<= $start_hp $max_hp})\n"
+    "   (@rule \"has a name\" {!= $name \"\"} (@warn)))\n";
 
 }  // namespace
 
-TEST_CASE("a rule that fails is an error with the values it read; (warn) is a warning") {
+TEST_CASE("a rule that fails is an error with the values it read; (@warn) is a warning") {
     Context ctx;
     const shape::Report good = ruled(ctx, std::string(kUnits) +
                                               "(units (grunt (max_hp 10) (start_hp 10) "
@@ -61,9 +62,9 @@ TEST_CASE("a rule that fails is an error with the values it read; (warn) is a wa
 TEST_CASE("a rule that does not evaluate is an error naming it and why") {
     Context ctx;
     const shape::Report r = ruled(ctx,
-                                  "(shapes (unit (at units) (keyed)\n"
-                                  "   (rule \"is balanced\" {balance_of $cost})\n"
-                                  "   (rule \"is a number\" {* $cost 1.5})))\n"
+                                  "#shape (unit (@at units) (@keyed)\n"
+                                  "   (@rule \"is balanced\" {balance_of $cost})\n"
+                                  "   (@rule \"is a number\" {* $cost 1.5}))\n"
                                   "(units (grunt (cost 3)))\n");
     REQUIRE(r.errors.size() == 2);
     CHECK(texts(r.errors)[0].find("rule \"is balanced\" does not evaluate: ") != std::string::npos);
@@ -74,8 +75,8 @@ TEST_CASE("a rule that does not evaluate is an error naming it and why") {
           std::string::npos);
     // A field the record lacks leaves its variable unset, and reading it fails.
     const shape::Report missing = ruled(ctx,
-                                        "(shapes (unit (at units) (keyed)\n"
-                                        "   (rule \"is cheap\" {< $cost 5})))\n"
+                                        "#shape (unit (@at units) (@keyed)\n"
+                                        "   (@rule \"is cheap\" {< $cost 5}))\n"
                                         "(units (grunt (hp 3)))\n");
     REQUIRE(missing.errors.size() == 1);
     CHECK(texts(missing.errors)[0].find("rule \"is cheap\" does not evaluate") !=
@@ -85,12 +86,11 @@ TEST_CASE("a rule that does not evaluate is an error naming it and why") {
 TEST_CASE("a rule reads another table by a key field, and sums a table") {
     Context ctx;
     const char* const shapes =
-        "(shapes\n"
-        "   (card (at cards) (keyed) (tier (key_of tiers)) (power float)\n"
-        "      (rule \"within 10% of its tier's ideal\"\n"
+        "#shape (card (@at cards) (@keyed) (tier (key_of tiers)) (power float)\n"
+        "      (@rule \"within 10% of its tier's ideal\"\n"
         "            {and {>= $power {* 0.9 {data tiers $tier ideal}}}\n"
         "                 {<= $power {* 1.1 {data tiers $tier ideal}}}}))\n"
-        "   (loot (rule \"weights sum to 100\" {== {data.sum loot weight} 100})))\n";
+        "#shape (loot (@rule \"weights sum to 100\" {== {data.sum loot weight} 100}))\n";
     const shape::Report good = ruled(ctx, std::string(shapes) +
                                               "(tiers (basic (ideal 10)) (epic (ideal 50)))\n"
                                               "(cards (spark (tier basic) (power 10.5)) "
@@ -103,9 +103,9 @@ TEST_CASE("a rule reads another table by a key field, and sums a table") {
                                              "(loot (common (weight 60)) (rare (weight 30)))\n");
     CHECK(texts(bad.errors) ==
           std::vector<std::string>{
-              "baker: within 10% of its tier's ideal ($power 30, $tier basic)  (t.dta:8, at "
+              "baker: within 10% of its tier's ideal ($power 30, $tier basic)  (t.dta:7, at "
               "cards/spark)",
-              "baker: weights sum to 100  (t.dta:9, at loot)"});
+              "baker: weights sum to 100  (t.dta:8, at loot)"});
     // {data} outside a rule's check reads nothing.
     tools::declare_rule_functions(ctx);
     CHECK_FALSE(ctx.eval("{data tiers basic ideal}", "t"));
@@ -144,24 +144,24 @@ BAKER_DEV_TEST_CASE("a layer adds or softens a rule, and a live edit that breaks
           std::string::npos);
     // A layer softens it to a warning, and adds a rule of its own that fails.
     reported.clear();
-    REQUIRE(cfg.push_layer(
-        "mod", ok(read_string("(shapes (unit\n"
-                              "   (rule \"starts at or below its maximum\" {<= $start_hp "
-                              "$max_hp} (warn))\n"
-                              "   (rule \"is modest\" {< $max_hp 5})))\n",
-                              "mod.dta"))));
+    REQUIRE(cfg.push_layer_text("mod",
+                                "#shape (unit\n"
+                                "   (@rule \"starts at or below its maximum\" {<= $start_hp "
+                                "$max_hp} (@warn))\n"
+                                "   (@rule \"is modest\" {< $max_hp 5}))\n"));
     CHECK(reported.size() == 2);
 }
 
 TEST_CASE("without the game, check() reports a rule's game functions as demand") {
     Context tool;
     tools::declare_rule_functions(tool);
+    LoadSession session;
     const auto tree =
-        ok(read_string("(shapes (card (at cards) (keyed)\n"
-                       "   (rule \"fair\" {< {power_of $name} {data caps power}})))\n"
+        ok(read_string("#shape (card (@at cards) (@keyed)\n"
+                       "   (@rule \"fair\" {< {power_of $name} {data caps power}}))\n"
                        "(caps (power 10))\n(cards (spark (name spark)))\n",
-                       "t.dta"));
-    const CheckReport report = check(*tree, tool);
+                       "t.dta", session));
+    const CheckReport report = check(*tree, tool, {.packs = &session});
     std::vector<std::string> wanted;
     for (const CheckReport::Demand& d : report.demand) wanted.emplace_back(d.name.str());
     CHECK(wanted == std::vector<std::string>{"power_of"});  // `data` is known

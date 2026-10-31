@@ -116,10 +116,11 @@ struct Console::Impl {
     Vec<Client> clients;
 };
 
-Console::Console(Context& ctx) : impl_(detail::create<Impl>(default_allocator(), ctx)) {}
+Console::Console(Context& ctx)
+    : impl_(detail::create<Impl>(default_allocator(MemoryKind::Tools), ctx)) {}
 
 Console::~Console() {
-    detail::destroy(default_allocator(), impl_);
+    detail::destroy(default_allocator(MemoryKind::Tools), impl_);
 }
 
 bool Console::listen(uint16_t port) {

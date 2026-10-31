@@ -135,6 +135,43 @@ void find_code(const Array& a, Vec<Symbol>& tags, Vec<Error>& out) {
     }
 }
 
+// The metadata a data file's arrays carry, as Baker's readers spell them.
+bool known_metadata(Symbol tag) noexcept {
+    static const Symbol words[] = {"@range", "@step",  "@desc",   "@note",
+                                   "@kind",  "@group", "@one_of", "@was"};
+    return std::find(std::begin(words), std::end(words), tag) != std::end(words);
+}
+
+// The first array, in reading order, that holds a value and a child tagged with one of the
+// words metadata had before the sigil, (range 0 10): a field now (bare). And the first
+// metadata child whose word Baker does not read, (@rnage 0 10) (unknown). Shapes are left to
+// their own reader, which refuses the old words. One walk for both, and the names interned
+// once: interning "shapes" at every array was most of check's cost.
+struct MetadataFinds {
+    const Array* bare = nullptr;
+    const Array* unknown = nullptr;
+};
+void find_metadata(const Array& a, MetadataFinds& f) {
+    static const Symbol shapes("shapes");
+    static const Symbol words[] = {"range", "step", "desc", "note", "kind", "group", "one_of"};
+    if (a.tag() == shapes) return;
+    if (!f.unknown)
+        for (const Array& m : a.metadata())
+            if (!known_metadata(m.tag())) {
+                f.unknown = &m;
+                break;
+            }
+    const bool valued = !f.bare && !a.tag().empty() && has_values(a);
+    for (size_t i = 0; i < a.size() && !(f.bare && f.unknown); ++i) {  // from 0: a root
+        const Array* c = a[i].try_array();
+        if (!c) continue;
+        if (valued && !f.bare &&
+            std::find(std::begin(words), std::end(words), c->tag()) != std::end(words))
+            f.bare = c;
+        find_metadata(*c, f);
+    }
+}
+
 bool under(const Path& path, const Path& prefix) noexcept {
     if (prefix.size() > path.size()) return false;
     for (size_t i = 0; i < prefix.size(); ++i)
@@ -181,6 +218,49 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
                 at ? at->file() : Symbol(), at ? at->line() : 0));
         }
     }
+    // A #shape changes how the stack is checked, not a value: an overlay that sent a wider
+    // range beside a value would pass a check the value alone fails.
+    if (policy.data_only || policy.scalars_only)
+        for (const ShapeDecl& d : session.shapes())
+            if (d.root == tree.file())
+                refusals.push_back(refused("#shape " + detail::quoted(d.form->tag()) +
+                                               " declares a shape; the layer may change data only",
+                                           d.file, d.line));
+    // The forms that declared before #pack, #origin and #shape, now read as data: once
+    // each per layer, at the first.
+    const Array* first = tree.size() > 0 ? tree[0].try_array() : nullptr;
+    auto old_form = [&](const Array* a, const char* form, const char* now) {
+        if (a)
+            warnings.push_back(make_error(ErrorCode::Syntax,
+                                          Str(form) + " is data; a file declares " + now, a->file(),
+                                          a->line()));
+    };
+    old_form(first && first->tag() == Symbol("pack") ? first : nullptr, "(pack ...)",
+             "its pack with #pack (NAME (level L) ...)");
+    for (size_t i = 0; i < tree.size() && i < 2; ++i)
+        if (const Array* a = tree[i].try_array();
+            a && a->tag() == Symbol("origin") && a->size() > 1 && (*a)[1].string()) {
+            old_form(a, "(origin \"...\")", "its origin with #origin (\"source\" ...)");
+            break;
+        }
+    old_form(tree.try_find("shapes"), "(shapes ...)", "each shape with #shape (NAME ...)");
+    // One warning of each per layer, at the first: an unmigrated or misspelt file is
+    // noticed at its first check.
+    MetadataFinds finds;
+    find_metadata(tree, finds);
+    if (const Array* m = finds.bare)
+        warnings.push_back(make_error(ErrorCode::Syntax,
+                                      "(" + Str(m->tag().str()) +
+                                          " ...) beside a value reads as a field; if it is "
+                                          "metadata, write (@" +
+                                          Str(m->tag().str()) + " ...)",
+                                      m->file(), m->line()));
+    if (const Array* m = finds.unknown)
+        warnings.push_back(make_error(ErrorCode::Syntax,
+                                      "unknown metadata (" + Str(m->tag().str()) +
+                                          " ...): Baker reads @range, @step, @desc, @note, "
+                                          "@kind, @group, @one_of and @was",
+                                      m->file(), m->line()));
     const Array& stack = b.root;
     Finder finder(alloc);
     // supplier() and source_in(), through the finder: the enabled layer, from the top, whose
@@ -190,7 +270,8 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
         for (size_t i = b.layers.size(); i-- > 0;) {
             detail::Resolved r;
             if (!finder.resolve(*b.layers[i], path, r)) continue;
-            if (!index && !(r.array && has_values(*r.array))) continue;
+            if (!index && !(r.array && has_values(*r.array) && !detail::composes(*r.array)))
+                continue;
             const Array& holder = *r.values.source();
             Source s{b.names[i], holder.file(), holder.line()};
             if (const Origin* o = b.session.origin_of(holder.file())) {
@@ -209,10 +290,15 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
         LayerEffectEntry e{};
         e.path = Symbol(leaf.path);
         e.value = pack(leaf.values);
+        e.op = op_of(*leaf.holder);
         e.source = Source{layer, leaf.holder->file(), leaf.holder->line()};
         if (exists) {
             e.below = pack(below);
             e.below_source = below_source(path);
+        }
+        if (leaf.holder->has_marker()) {  // a verb or a pin
+            e.stale = stale(*leaf.holder, exists ? &below : nullptr);
+            row_warnings(*leaf.holder, leaf.path, exists ? &below : nullptr, stack, warnings);
         }
         effect.push_back(std::move(e));
 
@@ -241,6 +327,24 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
         if (!policy.allow.empty() && std::none_of(policy.allow.begin(), policy.allow.end(),
                                                   [&](const Path& p) { return under(path, p); }))
             refuse("is outside the paths the layer may change");
+    }
+
+    // The candidate's declarations, each over the stack's of that name.
+    Vec<Declaration> decls(alloc);
+    declarations_of(session, tree.file(), {}, decls);
+    for (const Declaration& d : decls) {
+        LayerEffectEntry e{};
+        e.path = d.name;
+        e.value = d.form;
+        e.declares = d.directive;
+        e.source = Source{layer, d.file, d.line};
+        if (d.directive == Symbol("#shape"))
+            for (const ShapeDecl& under : b.session.shapes())
+                if (under.form->tag() == d.name) {
+                    e.below = Node(under.form);
+                    e.below_source = Source{Symbol(), under.file, under.line};
+                }
+        effect.push_back(std::move(e));
     }
 
     // The validators, over the stack with the candidate on top.
@@ -395,7 +499,7 @@ Expected<LayerReport> Config::check_layer_text(std::string_view name, std::strin
 // --- LayerChecker ---
 
 struct LayerChecker::State {
-    explicit State(const Allocator& a) : alloc(a) {}
+    explicit State(const Allocator& a) : alloc(with_kind(a, MemoryKind::Config)) {}
     const Allocator alloc;  // the host's: this, and each check's temporaries
     const void* config = nullptr;
     uint64_t generation = 0;
@@ -480,7 +584,8 @@ Expected<LayerReport> LayerChecker::check_text(std::string_view name, std::strin
 
 LayerChecker Config::checker(const Allocator& allocator) const {
     LayerChecker out;
-    out.state_ = detail::create<LayerChecker::State>(allocator, allocator);
+    out.state_ =
+        detail::create<LayerChecker::State>(with_kind(allocator, MemoryKind::Config), allocator);
     LayerChecker::State& st = *out.state_;
     st.config = this;
     st.generation = impl_->generation;

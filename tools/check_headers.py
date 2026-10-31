@@ -20,6 +20,8 @@ ALLOWED = {
     # header-only, non-allocating vocabulary types
     "string_view", "span", "optional", "expected",
 }
+# fwd.hpp is for headers that only name Baker's types, so it reaches nothing else.
+FWD_ALLOWED = {"cstdint"}
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*<([^>]+)>', re.M)
 
 
@@ -41,7 +43,7 @@ def main():
             for inc in includes(h):
                 if inc.startswith("baker/"):
                     stack.append((INCLUDE / inc[len("baker/"):], chain + [inc[len("baker/"):]]))
-                elif inc not in ALLOWED:
+                elif inc not in (FWD_ALLOWED if header.name == "fwd.hpp" else ALLOWED):
                     bad.setdefault(inc, " -> ".join(chain))
         for inc, chain in sorted(bad.items()):
             print(f"{header.name}: <{inc}> via {chain}")

@@ -23,9 +23,10 @@
 
 namespace baker {
 
+// The house layout: three spaces a level, a hundred columns.
 struct WriteOptions {
-    int indent = 2;  // spaces per nesting level
-    int width = 80;  // arrays that fit within this many columns stay on one line
+    int indent = 3;   // spaces per nesting level
+    int width = 100;  // arrays that fit within this many columns stay on one line
 };
 
 // Writes the compact single-line form of a node: (price 12.75).

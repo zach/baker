@@ -23,7 +23,8 @@ constexpr size_t round_up(size_t n) noexcept {
 }  // namespace
 
 Arena* Arena::create(const Allocator& alloc, size_t expected_bytes) {
-    auto* a = ::new (allocate(alloc, sizeof(Arena), alignof(Arena))) Arena(alloc);
+    auto* a = ::new (allocate(with_kind(alloc, MemoryKind::Trees), sizeof(Arena), alignof(Arena)))
+        Arena(alloc);
     a->next_ = std::clamp(round_up(expected_bytes), kMinBlock, kMaxBlock);
     return a;
 }
@@ -31,7 +32,7 @@ Arena* Arena::create(const Allocator& alloc, size_t expected_bytes) {
 Arena* Arena::create_holding(const Allocator& alloc, size_t bytes, char*& payload) {
     const size_t self = round_up(sizeof(Arena));
     const size_t whole = self + kBlockHeader + round_up(bytes);
-    char* mem = static_cast<char*>(allocate(alloc, whole, kAlign));
+    char* mem = static_cast<char*>(allocate(with_kind(alloc, MemoryKind::Trees), whole, kAlign));
     auto* a = ::new (mem) Arena(alloc);
     a->next_ = kMinBlock;
     a->whole_ = whole;
@@ -100,8 +101,8 @@ void Arena::adopt(Node* slot, Node&& n, bool building) {
     deps_[dep_count_++] = &target;
 }
 
-Ref<Array> Arena::make_array(std::span<Node> nodes, Symbol file, int32_t line) {
-    if (nodes.size() > UINT32_MAX) std::abort();
+Ref<Array> Arena::make_array(std::span<Node> nodes, Symbol file, int32_t line, int verb) {
+    if (nodes.size() > UINT32_MAX) fatal("an array of more than 4,294,967,295 nodes");
     const auto size = static_cast<uint32_t>(nodes.size());
     uint32_t offset = 0;
     void* mem = take(Array::bytes(size), offset);
@@ -109,13 +110,13 @@ Ref<Array> Arena::make_array(std::span<Node> nodes, Symbol file, int32_t line) {
     Node* d = a->data();
     if (size == 0) ::new (d) Node();
     for (uint32_t i = 0; i < size; ++i) adopt(d + i, std::move(nodes[i]));
-    a->finish();
+    a->finish(verb);
     own_retain();
     return Ref<Array>::adopt(a);
 }
 
 Ref<String> Arena::make_string(std::string_view text) {
-    if (text.size() >= UINT32_MAX) std::abort();
+    if (text.size() >= UINT32_MAX) fatal("a string of 4 GB or more");
     const auto size = static_cast<uint32_t>(text.size());
     uint32_t offset = 0;
     void* mem = take(sizeof(String) + size + 1, offset);
@@ -162,7 +163,7 @@ void Arena::free() noexcept {
 }
 
 void* solo_payload(OwnerKind kind, size_t bytes) {
-    void* mem = default_alloc(sizeof(SoloBlock) + bytes, alignof(SoloBlock));
+    void* mem = default_alloc(sizeof(SoloBlock) + bytes, alignof(SoloBlock), MemoryKind::Trees);
     auto* block = ::new (mem) SoloBlock{nullptr, {}};
     block->owner = &block->self;
     block->self.kind = kind;
@@ -186,7 +187,7 @@ void free_owner(Owner& owner) noexcept {
             for (uint32_t i = 0; i < size; ++i) d[i].~Node();
             a->~Array();
             block->~SoloBlock();
-            default_free(block, sizeof(SoloBlock) + Array::bytes(size));
+            default_free(block, sizeof(SoloBlock) + Array::bytes(size), MemoryKind::Trees);
             return;
         }
         case kSoloString: {
@@ -195,7 +196,7 @@ void free_owner(Owner& owner) noexcept {
             const uint32_t size = s->size_;
             s->~String();
             block->~SoloBlock();
-            default_free(block, sizeof(SoloBlock) + sizeof(String) + size + 1);
+            default_free(block, sizeof(SoloBlock) + sizeof(String) + size + 1, MemoryKind::Trees);
             return;
         }
         case kArena: Arena::of(owner).free(); return;

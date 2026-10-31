@@ -84,8 +84,8 @@ struct Formatter {
             if (i < pieces.size()) ++i;
         } else if (p.kind == Kind::Directive) {
             const std::string_view d = directive_name(p);
-            if (d == "remove") {
-                items[at].kind = Kind::Atom;  // a value, not a directive
+            if (d == "remove" || d == "append" || d == "drop") {
+                items[at].kind = Kind::Atom;  // a layer verb: a value, not a directive
             } else {
                 // The arguments that stay on the directive's line.
                 size_t args = d == "else" || d == "endif" ? 0 : 1;

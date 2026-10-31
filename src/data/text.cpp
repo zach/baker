@@ -102,9 +102,37 @@ bool is_bare_symbol(std::string_view s) noexcept {
     if (s.empty()) return false;
     for (char c : s)
         if (is_atom_end(static_cast<unsigned char>(c))) return false;
-    if (s[0] == '\'' || s[0] == '$' || s[0] == '#') return false;
+    if (s[0] == '\'' || s[0] == '$' || is_directive(s)) return false;
     if (s.size() >= 2 && s[0] == '/' && s[1] == '*') return false;
     return classify_number(s).kind == NumberKind::NotNumber;
+}
+
+bool quoted_in_command(const Node& n) noexcept {
+    const auto s = n.try_sym();
+    return s && is_operator_symbol(s->str());
+}
+
+namespace {
+bool any_operand(const Array& a, uint32_t from, uint32_t step) noexcept {
+    for (uint32_t i = from; i < a.size(); i += step)
+        if (is_infix_operand(a[i])) return true;
+    return false;
+}
+}  // namespace
+
+InfixShape infix_shape(const Array& a) noexcept {
+    const uint32_t n = a.size();
+    const auto op = n >= 3 ? a[0].try_sym() : std::nullopt;
+    if (op && a.written_infix() && any_operand(a, 1, 1) && is_operator_symbol(op->str()) &&
+        is_bare_symbol(op->str()))
+        return InfixShape::Chain;  // not `/*`, which would open a comment
+    // Printed prefix, would the reader take it infix, or refuse it as malformed infix? Slot 1
+    // an operator, and an operand at an even slot (at slot 0, in an even brace).
+    const auto head = n >= 2 ? a[1].try_sym() : std::nullopt;
+    if (head && is_operator_symbol(head->str()) &&
+        ((n & 1) ? any_operand(a, 0, 2) : is_infix_operand(a[0])))
+        return InfixShape::Quoted;
+    return InfixShape::None;
 }
 
 void append_path_name(Str& out, std::string_view name) {
@@ -114,11 +142,9 @@ void append_path_name(Str& out, std::string_view name) {
     if (!bare) out += '\'';
 }
 
-namespace {
-
 // `v` printed as "%.*g" at `precision` into `out`, with '.' for the C locale's decimal
 // point, which %g follows; its length, or 0 if it did not fit. The two %g searches below
-// print through it.
+// print through it, and so does the host kit's sim.
 size_t print_g(double v, int precision, char (&out)[64]) noexcept {
     char buf[64];
     const int n = std::snprintf(buf, sizeof buf, "%.*g", precision, v);
@@ -137,8 +163,6 @@ size_t print_g(double v, int precision, char (&out)[64]) noexcept {
     }
     return len;
 }
-
-}  // namespace
 
 namespace {
 
@@ -421,9 +445,9 @@ Str text_of(const Node& node) {
     return out;
 }
 
-Str dta_of(const Array& root) {
+Str dta_of(const Array& root, const WriteOptions& layout) {
     Str out;
-    write_dta(root, str_out(out));
+    write_dta(root, str_out(out), layout);
     return out;
 }
 

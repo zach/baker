@@ -296,3 +296,19 @@ TEST_CASE("a project names a directory of layers; dev_only leaves it out of ship
     REQUIRE_FALSE(bad);
     CHECK(to_string(bad.error()).find("(name (dir \"path\") ...)") != std::string::npos);
 }
+
+TEST_CASE("a directory's condition is each layer's in it") {
+    TempDir dir;
+    dir.write("base.dta", "(x 0)\n");
+    dir.write("mods/a.dta", "(x 1)\n");
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer("base", dir.path("base.dta")));
+    REQUIRE(cfg.push_layer_dir("mods", dir.path("mods"), {.when = "MODS"}));
+    CHECK(cfg.get<int>("x") == 0);
+    CHECK_FALSE(cfg.layer_enabled("a"));
+    REQUIRE(cfg.layer_condition("a"));
+    static constexpr std::string_view kMods[] = {"MODS"};
+    REQUIRE(cfg.set_defines(kMods));
+    CHECK(cfg.get<int>("x") == 1);
+    CHECK(cfg.layer_enabled("a"));
+}

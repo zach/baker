@@ -19,10 +19,10 @@ namespace {
 constexpr const char* kDefault =
     "; shared\n"
     "(ball\n"
-    "   (radius 24 (range 4 80) (desc \"Radius\"))\n"
-    "   (color 0.9 0.5 0.2 (range 0 1))\n"
-    "   (bounce 0.8 (note \"1.0 never settles\")))\n"
-    "(shapes (spawner (count int (range 1 50)) (interval float (range 0.1 10))))\n"
+    "   (radius 24 (@range 4 80) (@desc \"Radius\"))\n"
+    "   (color 0.9 0.5 0.2 (@range 0 1))\n"
+    "   (bounce 0.8 (@note \"1.0 never settles\")))\n"
+    "#shape (spawner (count int (@range 1 50)) (interval float (@range 0.1 10)))\n"
     "(spawner (count 3) (interval 2.5))\n";
 
 std::string read(const fs::path& p) {
@@ -112,14 +112,15 @@ TEST_CASE("the panels draw, and their requests do what their buttons say") {
         // "Keep for me" writes it into the personal layer, creating local/tester.dta.
         h.tweaks.request = {harness::TweaksState::Request::KeepLocal, "ball.radius", {}};
         h.frame();
-        CHECK(read(h.dir / "local" / "tester.dta") == "(ball (radius 30))\n");
+        CHECK(read(h.dir / "local" / "tester.dta") ==
+              "(/ball.radius 30)\n");  // a created layer is rows
         CHECK(harness::provenance(h.cfg, "ball.radius") == "tester.dta:1 (layer local)");
         // "Save" writes back where the value came from: one number changes.
         h.tweaks.request = {harness::TweaksState::Request::Set, "ball.bounce", {0.75}};
         h.frame();
         h.tweaks.request = {harness::TweaksState::Request::Save, "ball.bounce", {}};
         h.frame();
-        CHECK(read(h.dir / "default.dta").find("(bounce 0.75 (note") != std::string::npos);
+        CHECK(read(h.dir / "default.dta").find("(bounce 0.75 (@note") != std::string::npos);
         CHECK(h.tweaks.status == "saved: default.dta:5");
 
         // Shapes: a field of a shaped array, set and saved.
@@ -159,7 +160,7 @@ TEST_CASE("the panels draw, and their requests do what their buttons say") {
         h.frame();
         REQUIRE(!h.layers.report.empty());
         CHECK(h.layers.report[0] == "promoted local into default");
-        CHECK(read(h.dir / "default.dta").find("(radius 30 (range 4 80)") != std::string::npos);
+        CHECK(read(h.dir / "default.dta").find("(radius 30 (@range 4 80)") != std::string::npos);
 
         // Journal: every edit above, with its fate.
         std::vector<std::string> lines;

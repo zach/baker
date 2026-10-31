@@ -84,7 +84,7 @@ void json_defines(Str& out, const LoadSession* session) {
 }  // namespace
 
 void write_json(const CheckReport& report, TextSink text, const LoadSession* packs) {
-    Str out = "{\n  \"schema\": \"baker.check/1.4\",\n";
+    Str out = "{\n  \"schema\": \"baker.check/1.5\",\n";
     out += Str("  \"passed\": ") + (report.ok() ? "true" : "false") + ",\n";
     json_errors(out, "errors", report.errors);
     out += ",\n";

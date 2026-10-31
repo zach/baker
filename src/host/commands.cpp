@@ -106,6 +106,17 @@ Expected<void> read_book(const Loaded& l, sim::Book& book) {
     return {};
 }
 
+#if BAKER_HOST_SHAPE
+// The shapes the enabled layers declare, each layer's read alone with the stack's packs,
+// as the validator reads them.
+void add_shapes(const Config& cfg, shape::Set& set, shape::Report& report) {
+    for (const Symbol layer : cfg.layers())
+        if (cfg.layer_enabled(layer.str()))
+            if (const Ref<Array> root = cfg.layer_root(layer.str()))
+                set.add(cfg.read_session(), report, root->file());
+}
+#endif
+
 int report_check(CheckReport& report, const Loaded& l, const LoadSession* packs) {
     report.load = List<Error>(l.live.load_errors());
     tools::write_json(report, stdout_sink(), packs);
@@ -162,8 +173,9 @@ int check(const CommandLine& line, const CommandHooks& hooks) {
     // check; a field no shape declares is reported, as demand for a word, and passes.
     shape::Set shapes;
     shape::Report shaped;
-    shapes.add(*cfg.root(), shaped);
+    add_shapes(cfg, shapes, shaped);
     shape::check(*cfg.root(), shapes, shaped);
+    shape::unused(*cfg.root(), shapes, shaped);  // a shape at the wrong depth checks nothing
     tools::check_rules(*cfg.root(), shapes, l.ctx, shaped);  // a broken rule fails the check
     for (const Error& e : shaped.errors) err("shape: " + Str(to_string(e)) + "\n");
     for (const Error& e : shaped.warnings) err("shape warning: " + Str(to_string(e)) + "\n");
@@ -189,10 +201,7 @@ int reference(const CommandLine& line, const CommandHooks& hooks) {
 #if BAKER_HOST_SHAPE
     shape::Set set;
     shape::Report report;
-    for (const Symbol layer : cfg.layers())
-        if (cfg.layer_enabled(layer.str()))
-            if (const Ref<Array> root = cfg.layer_root(layer.str()))
-                set.add(*root, report, &cfg.read_session());
+    add_shapes(cfg, set, report);
     shapes.clear();
     shape::write_json(set, detail::str_out(shapes));
 #endif
@@ -211,7 +220,7 @@ int eval(const CommandLine& line, const CommandHooks& hooks) {
     if (hooks.reset) hooks.reset(l.ctx, line.seed);
     int status = 0;
     if (line.json) {
-        // One baker.reply/1.1 line per command, as a running game's console answers a
+        // One baker.reply/1.2 line per command, as a running game's console answers a
         // request: a tool reads a headless game and a live one the same way.
         int64_t id = 0;
         for (const std::string_view command : line.commands) {
@@ -240,8 +249,80 @@ int eval(const CommandLine& line, const CommandHooks& hooks) {
     return status;
 }
 
-// One line per value the layer sets: path, the value below it, its value, where.
-int print_effect(const Config& cfg, std::string_view layer, std::string_view heading) {
+// The row of `root` an effect entry was read from: the first with its key, or for a later
+// row that composes (a key's second #append), the one on the entry's line.
+const Array* row_of(const Array* root, const LayerEffectEntry& e) {
+    const Path path(e.path.str());
+    const Array* a = root && path.valid() ? root->try_get(e.path.str()) : nullptr;
+    if (!a || a->line() == e.source.line || path.empty()) return a;
+    const Array* parent =
+        path.size() == 1 ? root : root->try_get(Path(detail::text_of(path, path.size() - 1)));
+    for (size_t i = 0; parent && i < parent->size(); ++i)
+        if (const Array* c = (*parent)[i].try_array();
+            c && c->tag() == path[path.size() - 1].name && c->line() == e.source.line)
+            return c;
+    return a;
+}
+
+// Each value the layer sets as a row, (/player.speed 4.5), its value below in a comment:
+// text a layer file can hold. A verb reads bare in its slot, and metadata
+// follows. A key no row can spell is a comment.
+void print_rows(const Config& cfg, std::string_view layer, const List<LayerEffectEntry>& effect,
+                std::string_view heading) {
+    out("; " + Str(heading) + "\n");
+    const Ref<Array> root = cfg.layer_root(layer);
+    for (const LayerEffectEntry& e : effect) {
+        const std::string_view key = e.path.str();
+        if (!e.declares.empty()) {  // a declaration is written as itself, not as a row
+            out(Str(e.declares.str()) + " " + detail::text_of(e.value) + "\n");
+            continue;
+        }
+        const Array* a = row_of(root.get(), e);
+        bool spelled = a && !key.empty() && key[0] != '*';
+        for (const char c : key)
+            spelled = spelled && !detail::is_atom_end(static_cast<unsigned char>(c));
+        if (!spelled) {
+            out("; " + Str(key) + " cannot be written as a row\n");
+            continue;
+        }
+        Str row = "(/" + Str(key);
+        const Values values = a->values();
+        for (size_t i = 0; i < values.size(); ++i)
+            row += " " + (i == 0 && !e.op.empty() ? Str(e.op.str()) : detail::text_of(values[i]));
+        for (const Array& m : a->metadata())
+            row += " " + detail::text_of(Node(Ref<Array>(const_cast<Array*>(&m))));
+        row += ")  ; ";
+        row += e.below ? "was " + detail::text_of(*e.below) : Str("new");
+        if (e.shadowed) row += ", shadowed";
+        if (e.stale) row += ", stale";
+        out(row + "\n");
+    }
+}
+
+// What a layer's rows say of themselves: "# path: note" for each (@note ...), a patch's
+// preamble, which git apply and patch skip.
+Str notes_of(const Config& cfg, std::string_view layer) {
+    Str out;
+    auto effect = tools::layer_effect(cfg, layer);
+    const Ref<Array> root = cfg.layer_root(layer);
+    for (const LayerEffectEntry& e : effect ? *effect : List<LayerEffectEntry>()) {
+        const Array* a = row_of(root.get(), e);
+        const Array* note = a ? a->meta(Symbol("@note")) : nullptr;
+        if (!note) continue;
+        Str text;
+        for (const Node& v : note->values()) {
+            if (!text.empty()) text += ' ';
+            text += v.try_str() ? Str(*v.try_str()) : detail::text_of(v);
+        }
+        out += "# " + Str(e.path.str()) + ": " + text + "\n";
+    }
+    return out;
+}
+
+// One line per value the layer sets: path, the value below it, its value, where; or, with
+// `rows`, each as a row.
+int print_effect(const Config& cfg, std::string_view layer, std::string_view heading,
+                 bool rows = false) {
     auto effect = tools::layer_effect(cfg, layer);
     if (!effect) {
         err(to_string(effect.error()));
@@ -252,11 +333,19 @@ int print_effect(const Config& cfg, std::string_view layer, std::string_view hea
         out("layer '" + Str(layer) + "' changes nothing\n");
         return 0;
     }
+    if (rows) {
+        print_rows(cfg, layer, *effect, heading);
+        return 0;
+    }
     out(Str(heading) + "\n");
     for (const LayerEffectEntry& e : *effect) {
-        out("  " + Str(e.path.str()) + "  " + (e.below ? detail::text_of(*e.below) : Str("(new)")) +
-            " -> " + detail::text_of(e.value) + "  (" + Str(e.source.file.str()) + ":" +
-            detail::decimal(e.source.line) + ")" + (e.shadowed ? "  shadowed" : "") + "\n");
+        const bool verb = !e.op.empty() && e.op != Symbol("#remove");  // #remove is the value
+        const Str what = e.declares.empty() ? Str() : Str(e.declares.str()) + " ";
+        out("  " + what + Str(e.path.str()) + "  " +
+            (e.below ? detail::text_of(*e.below) : Str("(new)")) + " -> " +
+            (verb ? Str(e.op.str()) + " " : Str()) + detail::text_of(e.value) + "  (" +
+            Str(e.source.file.str()) + ":" + detail::decimal(e.source.line) + ")" +
+            (e.shadowed ? "  shadowed" : "") + (e.stale ? "  stale" : "") + "\n");
     }
     return 0;
 }
@@ -264,7 +353,8 @@ int print_effect(const Config& cfg, std::string_view layer, std::string_view hea
 int diff(const CommandLine& line, const CommandHooks& hooks) {
     Loaded l(hooks);
     if (!load(l, line)) return kCommandError;
-    return print_effect(l.live.config(), line.layer, "layer '" + Str(line.layer) + "' changes:");
+    return print_effect(l.live.config(), line.layer,
+                        "layer '" + Str(line.layer) + "' changes:", line.rows);
 }
 
 // A file's lines, each with its newline; the last may have none.
@@ -401,7 +491,7 @@ int promote(const CommandLine& line, const CommandHooks& hooks) {
                             ? fs::path(Str(l.live.project_file().str()).c_str()).parent_path()
                             : fs::path(Str(line.patch_root).c_str());
         if (root.empty()) root = ".";  // a project file named without a directory
-        Str patch;
+        Str patch = report->ok() ? notes_of(cfg, line.layer) : Str();
         if (report->ok())  // all or nothing, as --baker-write is
             for (const auto& [path, text] : captured) {
                 Str before;
@@ -424,7 +514,8 @@ int promote(const CommandLine& line, const CommandHooks& hooks) {
     if (!line.write)
         return print_effect(
             cfg, line.layer,
-            "would write into " + Str(line.to) + " (rerun with --baker-write to write):");
+            "would write into " + Str(line.to) + " (rerun with --baker-write to write):",
+            line.rows);
     auto report = cfg.promote(line.layer, line.to);
     if (!report) {
         err(describe(report.error()));
@@ -792,6 +883,8 @@ Expected<CommandLine> parse_command_line(int argc, const char* const* argv) {
             line.json = true;
         } else if (a == "write") {
             line.write = true;
+        } else if (a == "rows") {
+            line.rows = true;
         } else if (a == "check") {
             line.check = true;
         } else if (std::string_view* into = text_option(line, a)) {
@@ -866,19 +959,21 @@ int run_command(const CommandLine& line, const CommandHooks& hooks) {
 
 std::string_view command_help() noexcept {
     return "The kit's flags begin --baker-; any other flag is the game's.\n"
-           "  check                          baker.check/1.4 JSON; exit 1 on an error, a load\n"
+           "  check                          baker.check/1.5 JSON; exit 1 on an error, a load\n"
            "                                 problem, a shape error, or an undefined function\n"
            "  reference [--baker-json]       the script vocabulary, as Markdown; --baker-json:\n"
            "                                 {reference, tweaks, shapes} as Baker's JSON\n"
-           "  diff [--baker-layer L]         what layer L (default agent) changes\n"
+           "  diff [--baker-layer L] [--baker-rows]\n"
+           "                                 what layer L (default agent) changes; --baker-rows:\n"
+           "                                 as rows a layer file can hold\n"
            "  promote [--baker-from L] [--baker-to T] [--baker-write | --baker-patch FILE]\n"
-           "                                 layer L into T (default default); --baker-write\n"
+           "          [--baker-rows]         layer L into T (default default); --baker-write\n"
            "                                 writes; --baker-patch writes the change as a\n"
-           "                                 unified diff\n"
+           "                                 unified diff; --baker-rows: the change as rows\n"
            "  eval [--baker-seed N] [--baker-json] \"{command}\"...\n"
            "                                 each command's result, one a line, on the game\n"
            "                                 reset with the seed (default 1); --baker-json: one\n"
-           "                                 baker.reply/1.1 line each, as the console answers\n"
+           "                                 baker.reply/1.2 line each, as the console answers\n"
            "  sim [--baker-scenario NAME]... [--baker-seed N | --baker-seeds A-B]\n"
            "      [--baker-step-hz N] [--baker-json] [--baker-results DIR]\n"
            "                                 the project's scenarios, judged by its objectives;\n"

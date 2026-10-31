@@ -214,3 +214,22 @@ TEST_CASE("explain names the define that chose a value; check's JSON lists the d
                     R"j(    {"name": "demo", "origin": "host", "file": "", "line": 0})j") !=
           std::string::npos);
 }
+
+TEST_CASE("explain carries a layer's condition, held or not") {
+    TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer("base", dir.write("base.dta", "(speed 1)\n")));
+    REQUIRE(cfg.push_layer("handheld", dir.write("hh.dta", "(speed 2)\n"), {.when = "(not PC)"}));
+    auto entries = ok(explain(cfg, Path("speed")));
+    REQUIRE(entries.size() == 2);
+    CHECK_FALSE(entries[0].when);
+    REQUIRE(entries[1].when);
+    CHECK(to_string(*entries[1].when) == "(not PC)");
+    CHECK(entries[1].standing == Standing::Wins);
+    static constexpr std::string_view kPc[] = {"PC"};
+    REQUIRE(cfg.set_defines(kPc));
+    entries = ok(explain(cfg, Path("speed")));
+    CHECK(entries[0].standing == Standing::Wins);
+    CHECK(entries[1].standing == Standing::Disabled);
+    REQUIRE(entries[1].when);
+}

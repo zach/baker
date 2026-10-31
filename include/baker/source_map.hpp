@@ -46,12 +46,16 @@ public:
     [[nodiscard]] const SourceSpan* span(const Array& a, size_t i) const;
     // Where `a` itself is written, brackets included; for a file's root, the whole file.
     [[nodiscard]] const SourceSpan* extent(const Array& a) const;
+    // Whether a row's key made `a`, (/a.b.c 1)'s (a ...) and (b ...): written in the file as a
+    // segment of the key, with no brackets of its own. Its extent is the row's.
+    [[nodiscard]] bool row_made(const Array& a) const;
     // The text of `file` as it was read, or nothing.
     [[nodiscard]] std::optional<std::string_view> text(Symbol file) const;
     [[nodiscard]] bool empty() const noexcept;
 
     // Used by the parser and #merge to fill the table.
-    void record(const Ref<Array>& a, const SourceSpan& extent, std::span<const SourceSpan> spans);
+    void record(const Ref<Array>& a, const SourceSpan& extent, std::span<const SourceSpan> spans,
+                bool row_made = false);
     void record_text(Symbol file, std::string_view text);
 
 private:

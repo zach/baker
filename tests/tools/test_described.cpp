@@ -155,15 +155,15 @@ TEST_CASE("string and integer tweaks take allowed values, checked and in the JSO
         return messages(check_tweaks(*ok(read_string(text, "d.dta")), reg).errors);
     };
 
-    CHECK(
-        run("(fighter (attack \"heavy\") (level 2) (team 0 (one_of (0 red) (1 blue))))\n").empty());
-    auto bad = run("(fighter (attack \"hevy\") (level 5) (team 3 (one_of (0 red) 1)))\n");
+    CHECK(run("(fighter (attack \"heavy\") (level 2) (team 0 (@one_of (0 red) (1 blue))))\n")
+              .empty());
+    auto bad = run("(fighter (attack \"hevy\") (level 5) (team 3 (@one_of (0 red) 1)))\n");
     REQUIRE(bad.size() == 3);
     CHECK(bad[0] == "'fighter.attack' is 'hevy', not one of its tweak's light, heavy, kick");
     CHECK(bad[1] == "'fighter.level' is 5, not one of its tweak's 0 (easy), 1 (normal), 2 (hard)");
     CHECK(bad[2] == "'fighter.team' is 3, not one of its tweak's 0 (red), 1");  // the data's
     // The data's own list wins over the code's.
-    CHECK(run("(fighter (attack \"punch\" (one_of \"punch\" \"kick\")) (level 7 (one_of 7)))\n")
+    CHECK(run("(fighter (attack \"punch\" (@one_of \"punch\" \"kick\")) (level 7 (@one_of 7)))\n")
               .empty());
     CHECK(attack.one_of().size() == 3);
     REQUIRE(level.choices().size() == 3);

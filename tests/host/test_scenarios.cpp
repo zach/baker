@@ -7,6 +7,7 @@
 
 #include "temp_dir.hpp"
 
+#include <clocale>
 #include <map>
 #include <string>
 
@@ -389,4 +390,20 @@ TEST_CASE("sim: a scenario gives one length, and (at step N) or (at SECONDS)") {
     CHECK(bad_until.message().find("(until {command})") != std::string::npos);
     Fixture bad_at;
     CHECK_FALSE(bad_at.load(kMetrics, "(scenario s (steps 5) (at step x {counter.rate 1}))"));
+}
+
+TEST_CASE("sim: a number is written with '.' whatever the locale") {
+    CHECK(sim::number_text(1.5).view() == "1.5");
+    CHECK(sim::number_text(-0.000125).view() == "-0.000125");
+    CHECK(sim::number_text(1234567.0).view() == "1.23457e+06");
+    bool tested = false;
+    for (const char* name : {"de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "German_Germany.1252"}) {
+        if (!std::setlocale(LC_NUMERIC, name)) continue;
+        CHECK(sim::number_text(1.5).view() == "1.5");  // "1,5" before
+        CHECK(sim::number_text(-0.000125).view() == "-0.000125");
+        std::setlocale(LC_NUMERIC, "C");
+        tested = true;
+        break;
+    }
+    if (!tested) MESSAGE("no comma-decimal locale installed: the locale half is skipped");
 }

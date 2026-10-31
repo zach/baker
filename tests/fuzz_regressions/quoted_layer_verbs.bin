@@ -1,0 +1,4 @@
+(a '#append' (b #remove))
+(x #append 1 (@was 2) (@note "n"))
+('#drop' (k #drop 1))
+(y '#drop')

@@ -98,7 +98,7 @@ TEST_CASE("open_project sets the session and pushes the layers, leaving out what
     const std::string file = dir.write("baker-project.dta", kProject);
     dir.write("data/shared/common.dta", "(speed 3)\n");
     dir.write("data/default.dta",
-              "(pack base (level game) (version \"1.0\"))\n"
+              "#pack (base (level game) (version \"1.0\"))\n"
               "#include common.dta\n"
               "#ifdef PC (input mouse) #else (input pad) #endif\n");
     dir.write("data/local.dta", "(speed 9)\n");
@@ -291,7 +291,7 @@ TEST_CASE("open_project goes on past layers that do not read when asked") {
                                        "      (broken \"broken.dta\")\n"
                                        "      (missing \"missing.dta\")\n"
                                        "      (top \"top.dta\")))\n");
-    dir.write("default.dta", "#define SPEED (4)\n(speed 1)\n");
+    dir.write("default.dta", "[SPEED 4]\n(speed 1)\n");
     dir.write("broken.dta", "(speed 2\n");
     dir.write("top.dta", "(top SPEED)\n");
     const Project p = ok(read_project(file));
@@ -344,7 +344,7 @@ TEST_CASE("a project file's mistakes are located") {
         {"(project\n (layers (default \"d.dta\"))\n (levels a b))", 3, "has no 'levels'"},
         {"(project\n (layers\n  (default)))", 3, "a layer is"},
         {"(project\n (layers\n  (default \"d.dta\" optinal)))", 3,
-         "only optional, disabled and dev_only"},
+         "only optional, disabled, dev_only and one (when COND)"},
         {"(project\n (layers\n  (a \"x.dta\")\n  (a \"y.dta\")))", 4, "two layers named 'a'"},
         {"(project\n (pack_levels game))", 1, "needs (layers ...)"},
         {"(project\n (pack_levels (game)) (layers))", 2, "lists names or paths"},

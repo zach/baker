@@ -5,6 +5,7 @@
 #include <baker/curve.hpp>
 
 #include "common/containers.hpp"
+#include "data/markers.hpp"
 #include "data/text.hpp"
 
 #include <algorithm>
@@ -23,10 +24,12 @@ namespace baker::shape {
 
 namespace {
 
+// The grammar's words. Its metadata carry the sigil, so a field may be named at, kind, desc
+// or rule, and an unknown @word is an error instead of silence.
 struct Names {
-    baker::Symbol shapes{"shapes"}, at{"at"}, range{"range"}, step{"step"}, kind{"kind"},
-        desc{"desc"}, note{"note"}, optional{"optional"}, list{"list"}, any_tag{"*"},
-        keyed{"keyed"}, one_of{"one_of"}, key_of{"key_of"}, rule{"rule"}, warn{"warn"};
+    baker::Symbol at{"@at"}, range{"@range"}, step{"@step"}, kind{"@kind"}, desc{"@desc"},
+        note{"@note"}, optional{"@optional"}, list{"list"}, any_tag{"*"}, keyed{"@keyed"},
+        one_of{"@one_of"}, key_of{"key_of"}, rule{"@rule"}, warn{"@warn"};
 };
 const Names& names() {
     static const Names n;
@@ -103,16 +106,17 @@ struct Set::State {
     Vec<Ref<Array>> keep;    // the declarations the fields' text points into
 };
 
-Set::Set() : st_(detail::create<State>(default_allocator())) {}
+Set::Set() : st_(detail::create<State>(default_allocator(MemoryKind::Config))) {}
 Set::~Set() {
-    detail::destroy(default_allocator(), st_);
+    detail::destroy(default_allocator(MemoryKind::Config), st_);
 }
-Set::Set(const Set& other) : st_(detail::create<State>(default_allocator(), *other.st_)) {}
+Set::Set(const Set& other)
+    : st_(detail::create<State>(default_allocator(MemoryKind::Config), *other.st_)) {}
 Set& Set::operator=(const Set& other) {
     if (this != &other) *st_ = *other.st_;
     return *this;
 }
-Set::Set(Set&& other) noexcept : st_(detail::create<State>(default_allocator())) {
+Set::Set(Set&& other) noexcept : st_(detail::create<State>(default_allocator(MemoryKind::Config))) {
     std::swap(st_, other.st_);
 }
 Set& Set::operator=(Set&& other) noexcept {
@@ -132,8 +136,8 @@ const Shape* Set::find(baker::Symbol name) const noexcept {
 
 namespace {
 
-// Reads one field declaration: (name type (range lo hi) (step s) (kind k) (desc "")
-// (note "") (optional) (one_of a b ...)).
+// Reads one field declaration: (name type (@range lo hi) (@step s) (@kind k) (@desc "")
+// (@note "") (@optional) (@one_of a b ...)).
 bool read_field(const Array& a, Field& f, Vec<Error>& errors) {
     auto bad = [&](std::string_view why) {
         errors.push_back(make_error(ErrorCode::Syntax, why, a.file(), a.line()));
@@ -146,9 +150,21 @@ bool read_field(const Array& a, Field& f, Vec<Error>& errors) {
     f.shape = {};
     f.table = {};
     f.element = Type::Any;
+    f.min_count = 0;
+    f.max_count = UINT32_MAX;
     const Array* l = a[1].try_array();
-    const Array* elem =
-        l && l->size() == 2 && (*l)[0].is(names().list) ? (*l)[1].try_array() : nullptr;
+    // (list T), (list T N) for exactly N values, (list T N M) for N to M.
+    const bool list = l && l->size() >= 2 && l->size() <= 4 && (*l)[0].is(names().list);
+    if (list && l->size() > 2) {
+        const auto lo = (*l)[2].try_int();
+        const auto hi = l->size() > 3 ? (*l)[3].try_int() : lo;
+        if (!lo || !hi || *lo < 0 || *hi < *lo || *hi >= int64_t{UINT32_MAX})
+            return bad("field " + quoted(f.name) +
+                       " counts its list as (list T N) or (list T N M), 0 <= N <= M");
+        f.min_count = static_cast<uint32_t>(*lo);
+        f.max_count = static_cast<uint32_t>(*hi);
+    }
+    const Array* elem = list ? (*l)[1].try_array() : nullptr;
     if (const auto t = a[1].try_sym()) {
         f.type = type_named(*t);
         if (f.type == Type::Shape) f.shape = *t;
@@ -157,7 +173,7 @@ bool read_field(const Array& a, Field& f, Vec<Error>& errors) {
     } else if (elem && key_of(*elem, f.table)) {
         f.type = Type::List;
         f.element = Type::Key;
-    } else if (l && l->size() == 2 && (*l)[0].is(names().list) && (*l)[1].try_sym()) {
+    } else if (list && (*l)[1].try_sym()) {
         f.type = Type::List;
         f.element = type_named(*(*l)[1].try_sym());
         if (f.element == Type::Shape) f.shape = *(*l)[1].try_sym();
@@ -169,13 +185,17 @@ bool read_field(const Array& a, Field& f, Vec<Error>& errors) {
     for (uint32_t i = 2; i < a.size(); ++i) {
         const Array* m = a[i].try_array();
         const auto tag = m && !m->empty() ? (*m)[0].try_sym() : std::nullopt;
-        if (!tag) return bad("field " + quoted(f.name) + " has metadata that is not (tag ...)");
+        if (!tag) return bad("field " + quoted(f.name) + " has metadata that is not (@tag ...)");
+        if (!tag->is_meta())
+            return bad("field " + quoted(f.name) + " has (" + Str(tag->str()) +
+                       " ...) after its type, which is not metadata: write (@" + Str(tag->str()) +
+                       " ...)");
         const Values v = m->values();
         if (*tag == n.range) {
             const auto lo = v.size() == 2 ? v[0].try_float() : std::nullopt;
             const auto hi = v.size() == 2 ? v[1].try_float() : std::nullopt;
             if (!lo || !hi || *lo > *hi)
-                return bad("field " + quoted(f.name) + " needs (range low high), low <= high");
+                return bad("field " + quoted(f.name) + " needs (@range low high), low <= high");
             f.ranged = true;
             f.min = *lo;
             f.max = *hi;
@@ -194,16 +214,18 @@ bool read_field(const Array& a, Field& f, Vec<Error>& errors) {
                 f.type == Type::Symbol || (f.type == Type::List && f.element == Type::Symbol);
             if (!symbols || v.empty())
                 return bad("field " + quoted(f.name) +
-                           " lists (one_of ...) symbols, so its type is symbol or (list symbol)");
+                           " lists (@one_of ...) symbols, so its type is symbol or (list symbol)");
             // Declared again, a field adds what the new list names, in the order written.
             Vec<baker::Symbol> all(f.one_of.begin(), f.one_of.end());
             for (const Node& s : v) {
                 const auto sym = s.try_sym();
-                if (!sym) return bad("field " + quoted(f.name) + "'s (one_of ...) holds symbols");
+                if (!sym) return bad("field " + quoted(f.name) + "'s (@one_of ...) holds symbols");
                 if (std::find(all.begin(), all.end(), *sym) == all.end()) all.push_back(*sym);
             }
             f.one_of = List<baker::Symbol>({all.data(), all.size()});
-        }  // other metadata is the tools' business
+        } else {
+            return bad("field " + quoted(f.name) + " has unknown metadata " + quoted(*tag));
+        }
     }
     return true;
 }
@@ -211,13 +233,15 @@ bool read_field(const Array& a, Field& f, Vec<Error>& errors) {
 }  // namespace
 
 namespace {
-// Whether `next`, a field declared again, loosens `held`: another type, a range widened or
-// dropped, a required field made optional, or a symbol added to its (one_of ...).
+// Whether `next`, a field declared again, loosens `held`: another type, a range or a list's
+// count widened or dropped, a required field made optional, or a symbol added to its
+// (@one_of ...).
 bool loosens(const Field& held, const Field& next) noexcept {
     if (next.type != held.type || next.element != held.element || next.shape != held.shape ||
         !std::equal(next.table.begin(), next.table.end(), held.table.begin(), held.table.end()))
         return true;
     if (next.optional && !held.optional) return true;
+    if (next.min_count < held.min_count || next.max_count > held.max_count) return true;
     if (!held.one_of.empty() && next.one_of.size() > held.one_of.size()) return true;
     return held.ranged && (!next.ranged || next.min < held.min || next.max > held.max);
 }
@@ -230,7 +254,7 @@ std::optional<uint32_t> rank_of(const LoadSession* packs, baker::Symbol file) no
 
 namespace {
 
-// (rule "message" {expression} (warn)) into `r`; false, with a located error, if malformed.
+// (@rule "message" {expression} (@warn)) into `r`; false, with a located error, if malformed.
 bool read_rule(const Array& a, Rule& r, Vec<Error>& errors) {
     auto bad = [&](const Str& why) {
         errors.push_back(make_error(ErrorCode::Syntax, why, a.file(), a.line()));
@@ -238,7 +262,7 @@ bool read_rule(const Array& a, Rule& r, Vec<Error>& errors) {
     };
     const auto message = a.size() >= 2 ? a[1].try_str() : std::nullopt;
     if (!message || message->empty() || a.size() < 3)
-        return bad("a rule is declared as (rule \"message\" {expression}), optionally (warn)");
+        return bad("a rule is declared as (@rule \"message\" {expression}), optionally (@warn)");
     if (a[2].type() != baker::Type::Command)
         return bad("rule \"" + Str(*message) + "\" holds " + detail::preview(a[2]) +
                    ", not an {expression}");
@@ -247,30 +271,44 @@ bool read_rule(const Array& a, Rule& r, Vec<Error>& errors) {
         const Array* m = a[i].try_array();
         if (!m || m->size() != 1 || !(*m)[0].is(names().warn))
             return bad("rule \"" + Str(*message) + "\" has " + detail::preview(a[i]) +
-                       " after its expression; only (warn) may follow");
+                       " after its expression; only (@warn) may follow");
         r.warn = true;
     }
     return true;
 }
 
+// The first row in `a` that holds a layer verb, or null: one flag test for an array with none.
+const Array* verb_in(const Array& a) {
+    if (!a.has_marker()) return nullptr;
+    if (detail::verb_of(a) != detail::Marker::None) return &a;
+    for (const Node& n : a)
+        if (const Array* c = n.try_array())
+            if (const Array* found = verb_in(*c)) return found;
+    return nullptr;
+}
+
 }  // namespace
 
-void Set::add(const Array& tree, Report& report, const LoadSession* packs) {
+void Set::add(const LoadSession& session, Report& report, baker::Symbol root) {
     Vec<Error> errors(report.errors.begin(), report.errors.end());
     Vec<Error> warnings(report.warnings.begin(), report.warnings.end());
     const Names& n = names();
-    for (const Node& top : tree) {
-        const Array* decls = top.try_array();
-        if (!decls || decls->empty() || !(*decls)[0].is(n.shapes)) continue;
-        st_->keep.emplace_back(const_cast<Array*>(decls));
-        for (const Node& d : decls->values()) {
-            const Array* a = d.try_array();
-            const auto name = a && !a->empty() ? (*a)[0].try_sym() : std::nullopt;
-            if (!name) {
-                const Array& at = a ? *a : *decls;
-                errors.push_back(make_error(ErrorCode::Syntax,
-                                            "a shape is declared as (name field ...)", at.file(),
-                                            at.line()));
+    const LoadSession* packs = &session;
+    for (const ShapeDecl& decl : session.shapes()) {
+        if (!root.empty() && decl.root != root) continue;
+        st_->keep.push_back(decl.form);
+        {
+            const Array* a = decl.form.get();
+            const auto name = (*a)[0].try_sym();  // the parser took only a named form
+            // A shape is declared whole: a verb would compose one past the one-way rule,
+            // since each layer's shapes are read alone.
+            if (const Array* v = verb_in(*a)) {
+                errors.push_back(make_error(
+                    ErrorCode::Syntax,
+                    "shape '" + Str(name->str()) + "' holds " +
+                        detail::preview(Node(Ref<Array>(const_cast<Array*>(v)))) +
+                        ": a shape is declared whole, so a layer writes its fields, not verbs",
+                    v->file(), v->line()));
                 continue;
             }
             size_t i = 0;
@@ -284,7 +322,9 @@ void Set::add(const Array& tree, Report& report, const LoadSession* packs) {
             Shape& s = st_->shapes[i];
             s.file = a->file();
             s.line = a->line();
-            for (const Node& c : a->values()) {
+            // Every child after the name: its fields, and its own metadata, which values()
+            // leaves out.
+            for (const Node& c : a->nodes().subspan(1)) {
                 const Array* f = c.try_array();
                 const auto tag = f && !f->empty() ? (*f)[0].try_sym() : std::nullopt;
                 if (!tag) {
@@ -333,6 +373,15 @@ void Set::add(const Array& tree, Report& report, const LoadSession* packs) {
                     *old = rule;
                     continue;
                 }
+                if (tag->is_meta()) {  // a shape's own (@desc ...) and (@note ...) describe it
+                    if (*tag != n.desc && *tag != n.note)
+                        errors.push_back(make_error(
+                            ErrorCode::Syntax,
+                            "shape " + quoted(*name) + " has unknown metadata " + quoted(*tag) +
+                                ": (@at ...), (@keyed), (@rule ...), (@desc ...) or (@note ...)",
+                            f->file(), f->line()));
+                    continue;
+                }
                 // Declared again, a field takes the new type and whatever metadata the new
                 // declaration gives, as a merge of the two would.
                 Vec<Field>& fs = st_->fields[i];
@@ -366,7 +415,7 @@ void Set::add(const Array& tree, Report& report, const LoadSession* packs) {
         if (s.keyed && s.at.empty())
             errors.push_back(make_error(
                 ErrorCode::Syntax,
-                "shape " + quoted(s.name) + " is (keyed) but has no (at ...): keyed under what?",
+                "shape " + quoted(s.name) + " is (@keyed) but has no (@at ...): keyed under what?",
                 s.file, s.line));
     }
     report.errors = List<Error>({errors.data(), errors.size()});
@@ -390,7 +439,7 @@ struct Checker {
     Vec<Error>& errors;
     Vec<Error>& warnings;
     Vec<baker::Symbol> chain;   // the tags of the arrays from the root to here
-    Vec<const Shape*> keyed;    // the (keyed) shapes, which match by place, not by tag
+    Vec<const Shape*> keyed;    // the (@keyed) shapes, which match by place, not by tag
     Vec<const Shape*> by_name;  // by Symbol::index(): the shape of that name
     // Arrays checked already as a field's value, below the instance being walked: a stack,
     // emptied as the walk leaves that instance.
@@ -405,6 +454,8 @@ struct Checker {
     // table cost its size once, not once per lookup.
     HashMap<const Array*, HashMap<baker::Symbol, const Array*>> tables;
     bool keys = false;  // whether any field is a key: `arrays` is kept only then
+    // For unused(): each shape of the set that governed an instance, by its index.
+    Vec<bool>* used = nullptr;
 
     [[nodiscard]] const Shape* shape_named(baker::Symbol name) const noexcept {
         return name.index() < by_name.size() ? by_name[name.index()] : nullptr;
@@ -431,6 +482,7 @@ struct Checker {
 
     // `a`'s fields, from `first`, against `s`.
     void instance(const Array& a, const Shape& s, uint32_t first) {
+        if (used) (*used)[static_cast<size_t>(&s - set.shapes().data())] = true;
         const size_t mark = seen.size();
         for (uint32_t i = first; i < a.size(); ++i) {
             const Array* f = a[i].try_array();
@@ -491,6 +543,11 @@ struct Checker {
                    f);
             return;
         }
+        if (field.type == Type::List &&
+            (v.size() < field.min_count || v.size() > field.max_count)) {
+            count(f, v, field);
+            return;
+        }
         const Type t = field.type == Type::List ? field.element : field.type;
         for (const Node& n : v) {
             if (n.type() == baker::Type::Command || n.type() == baker::Type::Var ||
@@ -533,6 +590,18 @@ struct Checker {
                                names_text(field.one_of),
                            f);
         }
+    }
+
+    // A list of the wrong count: "'pos' holds 2 values, not 3".
+    BAKER_COLD void count(const Array& f, const Values& v, const Field& field) {
+        const Str want =
+            field.min_count == field.max_count
+                ? detail::decimal(field.min_count)
+                : detail::decimal(field.min_count) + " to " + detail::decimal(field.max_count);
+        report(errors, ErrorCode::Range,
+               quoted(field.name) + " holds " + detail::decimal(static_cast<int64_t>(v.size())) +
+                   " values, not " + want,
+               f);
     }
 
     // A curve field: its values a curve, and each point's y in the field's range.
@@ -691,7 +760,6 @@ struct Checker {
             const Array* c = n.array();
             if (!c) continue;
             const auto tag = !c->tag().empty() ? std::optional(c->tag()) : std::nullopt;
-            if (tag && chain.empty() && *tag == names().shapes) continue;  // declarations
             if (tag) chain.push_back(*tag);
             if constexpr (Keys) arrays.push_back(c);
             const size_t mark = nested.size();
@@ -734,7 +802,6 @@ struct RuleWalker {
             const Array* c = n.array();
             if (!c) continue;
             const auto tag = !c->tag().empty() ? std::optional(c->tag()) : std::nullopt;
-            if (tag && chain.empty() && *tag == names().shapes) continue;  // declarations
             if (tag) {
                 chain.push_back(*tag);
                 path.clear();
@@ -762,10 +829,10 @@ void each_ruled(const Array& tree, const Set& shapes, const RuleWalker::Visit& v
     if (!w.keyed.empty() || !w.by_tag.empty()) w.walk(tree);
 }
 
-void check(const Array& tree, const Set& shapes, Report& report, const LoadSession* packs) {
-    Vec<Error> errors(report.errors.begin(), report.errors.end());
-    Vec<Error> warnings(report.warnings.begin(), report.warnings.end());
-    Checker checker{shapes, errors, warnings, {}, {}, {}, {}, {}, {}, packs, {}, false};
+namespace {
+void run(const Array& tree, const Set& shapes, Vec<Error>& errors, Vec<Error>& warnings,
+         const LoadSession* packs, Vec<bool>* used) {
+    Checker checker{shapes, errors, warnings, {}, {}, {}, {}, {}, {}, packs, {}, false, used};
     checker.arrays.push_back(&tree);
     for (const Shape& s : shapes.shapes()) {
         if (s.keyed && !s.at.empty()) checker.keyed.push_back(&s);
@@ -778,7 +845,35 @@ void check(const Array& tree, const Set& shapes, Report& report, const LoadSessi
         checker.walk<true>(tree);
     else
         checker.walk<false>(tree);
+}
+}  // namespace
+
+void check(const Array& tree, const Set& shapes, Report& report, const LoadSession* packs) {
+    Vec<Error> errors(report.errors.begin(), report.errors.end());
+    Vec<Error> warnings(report.warnings.begin(), report.warnings.end());
+    run(tree, shapes, errors, warnings, packs, nullptr);
     report.errors = List<Error>({errors.data(), errors.size()});
+    report.warnings = List<Error>({warnings.data(), warnings.size()});
+}
+
+void unused(const Array& tree, const Set& shapes, Report& report) {
+    Vec<Error> errors, warnings(report.warnings.begin(), report.warnings.end()), ignored;
+    Vec<bool> used(shapes.shapes().size(), false);
+    run(tree, shapes, errors, ignored, nullptr, &used);
+    for (size_t i = 0; i < used.size(); ++i) {
+        if (used[i]) continue;
+        const Shape& s = shapes.shapes()[i];
+        Str where = "no array is tagged " + quoted(s.name);
+        if (!s.at.empty()) {
+            Str at;
+            for (const baker::Symbol t : s.at) at += (at.empty() ? "" : "/") + Str(t.str());
+            where = s.keyed ? "no array is a child of " + at
+                            : "no array tagged " + quoted(s.name) + " is in " + at;
+        }
+        warnings.push_back(make_error(ErrorCode::NotFound,
+                                      "shape " + quoted(s.name) + " governs nothing: " + where,
+                                      s.file, s.line));
+    }
     report.warnings = List<Error>({warnings.data(), warnings.size()});
 }
 
@@ -786,7 +881,7 @@ Config::Validator validator() {
     return [](const ValidatorStack& stack, const Callback<void(const Error&)>& warn) {
         Set set;
         Report report;
-        for (const Ref<Array>& tree : stack.layers) set.add(*tree, report, &stack.session);
+        for (const Ref<Array>& tree : stack.layers) set.add(stack.session, report, tree->file());
         check(stack.root, set, report, &stack.session);
         if (!warn) return;
         for (const Error& e : report.errors) warn(e);
@@ -809,7 +904,7 @@ void write_json(const Set& shapes, TextSink text) {
     for (const Shape& sh : shapes.shapes()) ss.push_back(&sh);
     std::sort(ss.begin(), ss.end(),
               [](const Shape* a, const Shape* b) { return a->name.str() < b->name.str(); });
-    Str out = "{\n  \"schema\": \"baker.shapes/1.4\",\n  \"shapes\": [";
+    Str out = "{\n  \"schema\": \"baker.shapes/1.5\",\n  \"shapes\": [";
     for (size_t i = 0; i < ss.size(); ++i) {
         const Shape& sh = *ss[i];
         out += i ? ",\n    {\"name\": " : "\n    {\"name\": ";
@@ -827,6 +922,12 @@ void write_json(const Set& shapes, TextSink text) {
             detail::json_string(out, type_text(f.type));
             out += ", \"element\": ";
             detail::json_string(out, f.type == Type::List ? type_text(f.element) : "");
+            out += ", \"count\": ";
+            if (f.type == Type::List && (f.min_count != 0 || f.max_count != UINT32_MAX))
+                out +=
+                    "[" + detail::decimal(f.min_count) + ", " + detail::decimal(f.max_count) + "]";
+            else
+                out += "null";
             out += ", \"shape\": ";
             detail::json_string(out, f.shape.str());
             out += ", \"table\": ";

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <baker/node.hpp>
+#include <baker/write.hpp>
+
 #include "common/containers.hpp"
 
 // Lexical rules shared by the parser and the printer. Keeping them in one place is what
@@ -30,7 +33,7 @@ namespace baker::detail {
 // The text forms std_interop.hpp gives a host, for messages and edits inside Baker.
 [[nodiscard]] Str text_of(const Path& path, size_t count = SIZE_MAX, char separator = '/');
 [[nodiscard]] Str text_of(const Node& node);
-[[nodiscard]] Str dta_of(const Array& root);
+[[nodiscard]] Str dta_of(const Array& root, const WriteOptions& layout = {});
 
 // JSON, for the machine-readable outputs (check, the reference, replies): one string,
 // escaped (quote, backslash, control characters; UTF-8 as it is), and a list of names.
@@ -52,6 +55,12 @@ inline constexpr std::array<bool, 256> kAtomEnd = [] {
     return kAtomEnd[c];
 }
 
+// Whether an atom (not empty) is a directive: `#` and an ASCII letter. `#`, `#1` and `#00aa00`
+// are symbols, which the reader takes and the printer writes bare.
+[[nodiscard]] constexpr bool is_directive(std::string_view atom) noexcept {
+    return atom[0] == '#' && atom.size() > 1 && (atom[1] | 0x20) >= 'a' && (atom[1] | 0x20) <= 'z';
+}
+
 enum class NumberKind : uint8_t { NotNumber, Int, Float, IntOutOfRange, FloatOutOfRange };
 
 struct Number {
@@ -67,6 +76,36 @@ struct Number {
 
 // True if `s` reads back as this symbol when written bare (unquoted).
 [[nodiscard]] bool is_bare_symbol(std::string_view s) noexcept;
+
+// The infix rule: a {...} whose odd slots are one bare operator reads head-first,
+// `{0.3 <= $value <= 0.7}` for `{<= 0.3 $value 0.7}`. An operator is a symbol of these bytes
+// only; a table, one load a byte.
+inline constexpr std::array<bool, 256> kOperatorByte = [] {
+    std::array<bool, 256> t{};
+    for (const char c : std::string_view("+-*/%<>=!&|^~")) t[static_cast<unsigned char>(c)] = true;
+    return t;
+}();
+[[nodiscard]] constexpr bool is_operator_symbol(std::string_view s) noexcept {
+    if (s.empty()) return false;
+    for (const char c : s)
+        if (!kOperatorByte[static_cast<unsigned char>(c)]) return false;
+    return true;
+}
+// The guard: a brace reads infix only if an operand is a number, variable, property or
+// command, so a brace of bare symbols, `{wheat -> flour}`, means what it did.
+[[nodiscard]] inline bool is_infix_operand(const Node& n) noexcept {
+    const Type t = n.type();
+    return t == Type::Int || t == Type::Float || t == Type::Var || t == Type::Property ||
+           t == Type::Command;
+}
+// Whether a prefix-printed command must quote this node at an odd slot: an operator, which
+// the reader would otherwise take as infix (`{+ '-' 1}`).
+[[nodiscard]] bool quoted_in_command(const Node& n) noexcept;
+// How a command prints so that it re-reads to itself: flagged written_infix() and of the
+// shape, as a chain `{k0 op k2 ...}`; prefix with its odd-slot operators quoted when the
+// reader would otherwise take it infix, `{+ '-' 1}`; else prefix.
+enum class InfixShape : uint8_t { None, Quoted, Chain };
+[[nodiscard]] InfixShape infix_shape(const Array& command) noexcept;
 
 // Appends a path segment naming `name`: bare where a Path reads it back as that name,
 // otherwise 'quoted'.
@@ -87,6 +126,10 @@ void append_path_name(Str& out, std::string_view name);
 [[nodiscard]] bool is_absolute_path(std::string_view p) noexcept;
 // Removes "." and empty segments and resolves ".." lexically: "a/./b/../c.dta" -> "a/c.dta".
 [[nodiscard]] Str normalize_path(std::string_view p);
+// `v` printed as "%.*g" at `precision` into `out`, with '.' whatever the C locale's decimal
+// point: its length, or 0 if it did not fit.
+[[nodiscard]] size_t print_g(double v, int precision, char (&out)[64]) noexcept;
+
 // Everything before the last separator: "a/b/c.dta" -> "a/b"; "c.dta" -> ""; a root is its
 // own parent: "/a" -> "/", "C:/a" -> "C:/", "user://a" -> "user://".
 [[nodiscard]] std::string_view parent_path(std::string_view p) noexcept;

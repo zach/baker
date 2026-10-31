@@ -1,6 +1,7 @@
 // Lexing and parsing: tokens, bounds checks, nesting, and located errors.
 #include <doctest.h>
 #include <baker/parse.hpp>
+#include <baker/source_map.hpp>
 #include <baker/std_interop.hpp>
 #include <baker/write.hpp>
 
@@ -255,6 +256,201 @@ TEST_CASE("an error located by an array's line has no column") {
     CHECK(v.error().column() == 0);
     CHECK(to_string(v.error()) == "baker: 'speed' is symbol, not int  (t.dta:1)");
     // A pack declaration's problem names the declaration's line only.
-    const Error pack = parse_error("(pack p (level 3))");
+    const Error pack = parse_error("#pack (p (level 3))");
     CHECK(pack.column() == 0);
+}
+
+// --- The infix rule ---
+
+namespace {
+const Array& command_at(const Ref<Array>& root, size_t i) {
+    REQUIRE(i < root->size());
+    REQUIRE((*root)[i].type() == Type::Command);
+    return *(*root)[i].array();
+}
+}  // namespace
+
+TEST_CASE("a brace whose odd slots are one operator reads head-first, its spans in order") {
+    const std::string text = "(pass {0.3 <= $value <= 0.7})";
+    LoadSession s;
+    SourceMap map;
+    s.source_map = &map;
+    auto root = read_string(text, "t.dta", s);
+    REQUIRE(root);
+    const Array& pass = *(**root)[0].array();
+    REQUIRE(pass.size() == 2);
+    REQUIRE(pass[1].type() == Type::Command);
+    const Array& band = *pass[1].array();
+    REQUIRE(band.size() == 4);
+    CHECK(band[0].is("<="));
+    CHECK(band[1].try_float() == 0.3);
+    CHECK(band[2].type() == Type::Var);
+    CHECK(band[2].var_name() == Symbol("value"));
+    CHECK(band[3].try_float() == 0.7);
+    CHECK(band.written_infix());
+    CHECK(band.line() == 1);
+    CHECK(to_string(pass[1]) == "{0.3 <= $value <= 0.7}");  // printed back as written
+    // Each node's span is the token it came from; the head's is the first operator's.
+    auto span_text = [&](size_t i) {
+        const SourceSpan* sp = map.span(band, i);
+        REQUIRE(sp);
+        return text.substr(sp->begin, sp->end - sp->begin);
+    };
+    CHECK(span_text(0) == "<=");
+    CHECK(span_text(1) == "0.3");
+    CHECK(span_text(2) == "$value");
+    CHECK(span_text(3) == "0.7");
+    REQUIRE(map.extent(band));
+    CHECK(map.extent(band)->begin == 6);
+    CHECK(map.extent(band)->end == text.size() - 1);
+    // Longer chains, and a chain of commands.
+    root = read_string("{1 + 2 + 3 + 4} {{a} - {b} - {c}}", "t.dta");
+    REQUIRE(root);
+    const Array& sum = command_at(*root, 0);
+    REQUIRE(sum.size() == 5);
+    CHECK(sum[0].is("+"));
+    for (size_t i = 1; i < 5; ++i) CHECK(sum[i].try_int() == static_cast<int64_t>(i));
+    const Array& diff = command_at(*root, 1);
+    REQUIRE(diff.size() == 4);
+    CHECK(diff[0].is("-"));
+    CHECK((*diff[1].array())[0].is("a"));
+    CHECK((*diff[3].array())[0].is("c"));
+}
+
+TEST_CASE("mixed operators in one brace are an error at the brace, with its column") {
+    const Error e = parse_error("(pass\n   {0 < $value <= 10})");
+    CHECK(e.code() == ErrorCode::Syntax);
+    CHECK(e.message() == "mixed operators in {...}: nest braces to say which applies first");
+    CHECK(e.line() == 2);
+    CHECK(e.column() == 4);
+    CHECK(to_string(e) ==
+          "baker: mixed operators in {...}: nest braces to say which applies first  (t.dta:2:4)");
+    // Nested braces say which applies first.
+    auto root = parse("{and {0 < $value} {$value <= 10}}");
+    const Array& both = command_at(root, 0);
+    CHECK(both[0].is("and"));
+    CHECK((*both[1].array())[0].is("<"));
+    CHECK((*both[2].array())[0].is("<="));
+    CHECK(both[1].array()->written_infix());
+    CHECK_FALSE(both.written_infix());
+}
+
+TEST_CASE("malformed infix is an error at the brace that names the fix") {
+    // An operand at an operator's slot, or a brace that ends with its operator: the shapes
+    // that read as a call of their first operand before, which check let pass.
+    const Error band = parse_error("(pass\n   {0.3 <= $value 0.7})");
+    CHECK(band.code() == ErrorCode::Syntax);
+    CHECK(band.message() == "infix {...} needs '<=' between every two operands");
+    CHECK(band.line() == 2);
+    CHECK(band.column() == 4);
+    CHECK(to_string(band) ==
+          "baker: infix {...} needs '<=' between every two operands  (t.dta:2:4)");
+    CHECK(parse_error("{$value <= 0.7 0.3}").message() ==
+          "infix {...} needs '<=' between every two operands");
+    const Error open = parse_error("(pass {$value <=})");
+    CHECK(open.message() == "infix {...} ends with '<=': write an operand after it");
+    CHECK(open.column() == 7);
+    // Their siblings: the operator at the end of a longer brace, an operand where the
+    // operator should be in an odd brace (not "mixed"), and heads that are a property, a
+    // command, a number.
+    CHECK(parse_error("{0.3 <= $value <=}").message() ==
+          "infix {...} ends with '<=': write an operand after it");
+    CHECK(parse_error("{$value <= 0.7 0.3 1}").message() ==
+          "infix {...} needs '<=' between every two operands");
+    CHECK(parse_error("{[hp] -= 5 1}").message() ==
+          "infix {...} needs '-=' between every two operands");
+    CHECK(parse_error("{{econ.count mill} >=}").message() ==
+          "infix {...} ends with '>=': write an operand after it");
+    CHECK(parse_error("{1 + 2 +}").message() ==
+          "infix {...} ends with '+': write an operand after it");
+    CHECK(parse_error("#autorun {$i +=}").message() ==
+          "infix {...} ends with '+=': write an operand after it");
+    // What stays a command: a call's head (a symbol) before an operator argument, an
+    // operator quoted (an object's handler named by one), a prefix call, a head-first call
+    // through a command or variable, `?`, which is no operator, and a chain.
+    auto root = parse(
+        "{f + 1 2} {f <=} {$obj '<=' 1 2} {$obj '-'} {<= 0.3 $v 0.7} {- 5 2 1} "
+        "{{find enemy} hit 10 2} {$obj move 1 2} {$c ? 1} {0.3 <= $v <= 0.7}");
+    CHECK(command_at(root, 0)[0].is("f"));
+    CHECK(command_at(root, 1).size() == 2);
+    CHECK(command_at(root, 2)[0].type() == Type::Var);
+    CHECK(command_at(root, 2)[1].is("<="));
+    CHECK(command_at(root, 3).size() == 2);
+    CHECK(command_at(root, 4)[0].is("<="));
+    CHECK(command_at(root, 5).size() == 4);
+    CHECK(command_at(root, 6)[1].is("hit"));
+    CHECK(command_at(root, 7)[1].is("move"));
+    CHECK(command_at(root, 8)[1].is("?"));
+    CHECK(command_at(root, 9).written_infix());
+}
+
+TEST_CASE("the guard, quoting and macros keep today's braces as they are") {
+    // Bare symbols only: a command as today, whatever the symbol at slot 1.
+    auto root = parse("{wheat -> flour} {a - b} {$a -> b} {a ? b : c}");
+    const Array& raw = command_at(root, 0);
+    CHECK(raw[0].is("wheat"));
+    CHECK(raw[1].is("->"));
+    CHECK_FALSE(raw.written_infix());
+    CHECK(command_at(root, 1)[0].is("a"));
+    CHECK(command_at(root, 3)[0].is("a"));
+    CHECK(command_at(root, 3).size() == 5);
+    // A variable among the operands fires it.
+    const Array& fired = command_at(root, 2);
+    CHECK(fired[0].is("->"));
+    CHECK(fired[1].type() == Type::Var);
+    CHECK(fired.written_infix());
+    // A quoted symbol at an odd slot exempts the brace; at an even slot it is an operand.
+    root = parse("{+ '-' 1} {1 + '-'} {1 '+' 2}");
+    const Array& q = command_at(root, 0);
+    CHECK(q[0].is("+"));
+    CHECK(q[1].is("-"));
+    CHECK(q[2].try_int() == 1);
+    CHECK_FALSE(q.written_infix());
+    const Array& e = command_at(root, 1);
+    CHECK(e[0].is("+"));
+    CHECK(e[1].try_int() == 1);
+    CHECK(e[2].is("-"));
+    CHECK(e.written_infix());
+    CHECK(command_at(root, 2)[0].try_int() == 1);
+    // An even count under a call's head, a unary minus, a call with an operator argument,
+    // and a prefix call are commands as today; `{<= 0.3 $v 0.7}` written prefix is not
+    // flagged.
+    root = parse("{f + 2 +} {- 5} {f + 1 2} {<= 0.3 $v 0.7} {$x = 1}");
+    CHECK(command_at(root, 0).size() == 4);
+    CHECK(command_at(root, 0)[0].is("f"));
+    CHECK(command_at(root, 1)[0].is("-"));
+    CHECK(command_at(root, 1).size() == 2);
+    CHECK(command_at(root, 2)[0].is("f"));
+    CHECK(command_at(root, 3)[0].is("<="));
+    CHECK_FALSE(command_at(root, 3).written_infix());
+    CHECK(command_at(root, 4)[0].is("="));  // `=` is a call of `=`, which nothing defines
+    // A macro used at an odd slot, or expanding to several nodes, exempts its brace; a
+    // one-node macro at an even slot is an operand.
+    root = parse(
+        "[OP +]\n[K 5]\n[TRIPLE 2 3 4]\n"
+        "{1 OP 2} {$x + K} {1 + TRIPLE}");
+    CHECK(command_at(root, 0)[0].try_int() == 1);
+    CHECK(command_at(root, 0)[1].is("+"));
+    CHECK(command_at(root, 1)[0].is("+"));
+    CHECK(command_at(root, 1)[2].try_int() == 5);
+    CHECK(command_at(root, 1).written_infix());
+    CHECK(command_at(root, 2).size() == 5);
+    CHECK(command_at(root, 2)[0].try_int() == 1);
+    // Nothing in a parenthesized array or a property changes.
+    root = parse("(a 1 + 2) [x + 1]");
+    CHECK((*(*root)[0].array())[0].is("a"));
+    CHECK((*(*root)[0].array()).size() == 4);
+}
+
+TEST_CASE("an #autorun brace reads infix too") {
+    LoadSession s;
+    auto r = read_string("#autorun {$count += 1}", "t.dta", s);
+    REQUIRE(r);
+    REQUIRE(s.autorun().size() == 1);
+    const Array& a = *s.autorun()[0].array();
+    REQUIRE(a.size() == 3);
+    CHECK(a[0].is("+="));
+    CHECK(a[1].type() == Type::Var);
+    CHECK(a[2].try_int() == 1);
+    CHECK(a.written_infix());
 }

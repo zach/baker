@@ -19,14 +19,14 @@ namespace {
 
 std::string base_text() {
     std::string s =
-        "(pack game_data (level game) (version \"1.2\"))\n(origin \"base\" (tool bake))\n(shop\n";
+        "#pack (game_data (level game) (version \"1.2\"))\n#origin (\"base\" (tool bake))\n(shop\n";
     for (int i = 0; i < 64; ++i)
         s += " (item" + std::to_string(i) + " (price " + std::to_string(i + 1) + "))\n";
     return s + ")\n";
 }
 
 const char* const kOverlay =
-    "(pack sale (level live) (requires (game_data \"1.2\")))\n"
+    "#pack (sale (level live) (requires (game_data \"1.2\")))\n"
     "(shop (item3 (price 0)) (item9 (price 5)) (item70 (price 7)))\n";
 
 // A validator that reads only its stack: free items are warned about.

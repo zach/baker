@@ -1,5 +1,5 @@
 // eval_request: one line of a tool's request, one line of JSON in reply: the schema
-// baker.reply/1.1, which docs/reply-json.md describes.
+// baker.reply/1.2, which docs/reply-json.md describes.
 
 #include <baker/parse.hpp>
 #include <baker/script.hpp>
@@ -128,7 +128,7 @@ bool is_request(const Array& tree) {
 }  // namespace
 
 void eval_request(Context& ctx, std::string_view line, TextSink reply) {
-    Str out = R"({"schema":"baker.reply/1.1","id":)";
+    Str out = R"({"schema":"baker.reply/1.2","id":)";
     LoadSession session;
     session.allocator = &ctx.allocator();  // the tree is the Context's, as eval(text) builds it
     auto tree = read_string(line, "<console>", session);

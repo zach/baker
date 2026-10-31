@@ -83,6 +83,9 @@ struct ProjectLayer {
     bool dev_only = false;  // `dev_only` in the file: never pushed under BAKER_SHIPPING
     ProjectPosition name_at{};
     ProjectPosition path_at{};
+    // (when COND) in the file: the condition, as text, for LayerOptions::when. Empty
+    // for none.
+    Symbol when{};
 };
 
 struct Project {
@@ -124,8 +127,9 @@ struct Project {
     // that steps in turns or events; empty: "step". Presentation only.
     Symbol step_name;
     // (format (indent 3) (width 100)): how the project's files are laid out, for a formatter
-    // (tools::format_text) and the kit's format command; WriteOptions' defaults where the
-    // file says nothing.
+    // (tools::format_text), the kit's format command, and the text a Config opened from the
+    // project writes (Config::set_layout); WriteOptions' house layout where the file says
+    // nothing.
     WriteOptions format{};
 
     // The tool binary's path with `$build` resolved: `build_dir` if given (a tool's flag or
@@ -210,8 +214,9 @@ struct ProjectOptions {
     std::span<const std::string_view> defines{};
 };
 
-// Sets `cfg.session()`'s pack levels, include directories, and defines from `project`, then
-// pushes its layers, bottom to top. A Config to open a project into has no layers yet; set
+// Sets `cfg.session()`'s pack levels, include directories, and defines from `project`, and
+// the Config's layout (Config::set_layout) from its (format ...), then pushes its layers,
+// bottom to top. A Config to open a project into has no layers yet; set
 // its session's reader first if the layers' text comes from somewhere other than the disk.
 // Stops at the first layer that does not read, with its error; refuses options whose skip
 // list overflowed, before changing anything. With `go_on`, a layer that

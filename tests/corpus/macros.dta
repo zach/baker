@@ -6,8 +6,8 @@
 [BLACK 0 0 0]
 [HIGHLIGHT 1.0 0.85 0.2]
 
-#define kMaxPlayers (4)
-#define kDefaultVolume (0.8)
+[kMaxPlayers 4]
+[kDefaultVolume 0.8]
 #define HAS_VOCALS
 
 ; a macro whose body holds an array: every expansion shares it
