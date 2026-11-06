@@ -108,8 +108,8 @@ TEST_CASE("readiness loop: edit, see, tune, save, experiment, and return") {
     REQUIRE(effect);
     REQUIRE(effect->size() == 1);
     CHECK((*effect)[0].path == "warden.cadence");
-    CHECK((*effect)[0].value.try_float() == 0.9);
-    CHECK((*effect)[0].below->try_float() == 1.25);
+    CHECK((*effect)[0].values[0].try_float() == 0.9);
+    CHECK((*(*effect)[0].below)[0].try_float() == 1.25);
     CHECK((*effect)[0].below_source->layer == "default");
     CHECK_FALSE((*effect)[0].shadowed);
     CHECK(cfg.toggle_layer("experiment") == false);

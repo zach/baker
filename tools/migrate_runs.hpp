@@ -1,7 +1,8 @@
 #pragma once
-// The DTA inside other files, for the migrators in tools/: runs of text, each byte with its
-// offset in the file. A .dta file is one run; a C++ file's runs are its string literals, as
-// the compiler joins adjacent ones; a Markdown file's are its DTA blocks and code spans.
+// The DTA inside other files, for baker_migrate (tools/migrate.cpp): runs of text, each
+// byte with its offset in the file. A .dta file is one run; a C++ file's runs are its string
+// literals, as the compiler joins adjacent ones; a Markdown file's are its DTA blocks and
+// code spans.
 
 #include <algorithm>
 #include <cstddef>

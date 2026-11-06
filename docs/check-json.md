@@ -54,7 +54,7 @@ reads `passed` and shows the lists:
 | `findings` | list of problems | informational: packs that declare one owner |
 | `load` | list of problems | what loading the data reported: a file that did not parse, an `#autorun` command that failed. Filled by the host (1.1) |
 | `shape_errors` | list of problems | the data's shape check: values out of range or of the wrong type. Filled by the host (1.1) |
-| `shape_warnings` | list of problems | fields no shape declares; never a failure. Filled by the host (1.1) |
+| `shape_warnings` | list of problems | fields no shape declares, and a view the game compiled against another layout of its shape (`--baker-strict-views` moves those to `shape_errors`); never a failure. Filled by the host (1.1) |
 | `tweak_errors` | list of problems | the data against the tweaks the Config binds: a value that does not convert to its tweak's type, a number outside its tweak's range, a symbol outside its `one_of`. Filled by `check` of a Config (1.3) |
 | `tweak_warnings` | list of problems | a tweak whose path the data lacks, so it keeps its default; a key beside a group's tweaks that no tweak reads, as a misspelled key looks. Never a failure (1.3) |
 

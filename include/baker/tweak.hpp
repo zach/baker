@@ -81,6 +81,11 @@ struct TweakMeta {
     std::string_view kind{};
     std::string_view group{};  // default: the path without its last segment
     bool dev_only = false;     // under BAKER_SHIPPING, ignore the data and keep the default
+    // The data may leave it out: its default, from the host's own content, is the value, and
+    // a layer supplies one only to change it. check_tweaks does not warn that the data lacks
+    // it, and holds a value the data does supply to the tweak as ever. For check and tools
+    // only: a shipping build keeps no flag, and its check warns as for any tweak.
+    bool optional = false;
     // The symbols a symbol tweak's value may be, for a panel or an editor to offer, in order:
     //   static constexpr std::string_view kButtons[] = {"light", "heavy", "kick"};
     //   Tweak<Symbol> button{"moves.jab.button", Symbol("light"), {.one_of = kButtons}};
@@ -109,6 +114,7 @@ struct ShippedTweakMeta {
     std::span<const TweakChoice> choices;
     bool dev_only;
     static constexpr double step = 0;
+    static constexpr bool optional = false;
     static constexpr std::string_view desc{};
     static constexpr std::string_view kind{};
     static constexpr std::string_view group{};
@@ -147,6 +153,8 @@ public:
     [[nodiscard]] std::string_view path() const noexcept { return path_; }
     // The code's dev_only (TweakMeta): under BAKER_SHIPPING, the data is ignored.
     [[nodiscard]] bool dev_only() const noexcept { return meta_.dev_only; }
+    // The code's optional (TweakMeta): the data may leave the tweak out.
+    [[nodiscard]] bool optional() const noexcept { return meta_.optional; }
     // True while the config supplies the value; false while the default stands.
     [[nodiscard]] bool bound() const noexcept { return bound_ != nullptr; }
     [[nodiscard]] TweakRegistry& registry() const noexcept { return *registry_; }
@@ -309,7 +317,7 @@ private:
     Config* config_ = nullptr;
 };
 
-// Every tweak in `tweaks` as JSON (schema baker.tweaks/1.5, docs/reference-json.md), sorted by
+// Every tweak in `tweaks` as JSON (schema baker.tweaks/1.6, docs/reference-json.md), sorted by
 // path: its type and value types, default and current value, metadata (the data's winning
 // over the code's), and, while a config supplies it, where the value came from. For tools
 // and agents.

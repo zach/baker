@@ -429,3 +429,44 @@ TEST_CASE("a tool path in the build directory resolves where the tool says") {
     CHECK(std::string(read_project(bad).error().message()).find("(build \"path\")") !=
           std::string::npos);
 }
+
+TEST_CASE("a project names the layers its views are generated from") {
+    TempDir dir;
+    const std::string file = dir.write(
+        "baker-project.dta",
+        "(project (layers (core \"core.dta\") (content \"content.dta\") (local \"l.dta\" "
+        "dev_only)\n"
+        "                 (hh \"hh.dta\" (when HANDHELD)))\n"
+        "         (views (layers core content) (shapes item unit) (namespace game::data)))\n");
+    const Project p = ok(read_project(file));
+    REQUIRE(p.views.layers.size() == 2);
+    CHECK(p.views.layers[1] == Symbol("content"));
+    REQUIRE(p.views.shapes.size() == 2);
+    CHECK(p.views.shapes[0] == Symbol("item"));
+    CHECK(p.views.ns == Symbol("game::data"));
+    CHECK(p.views.at.line == 3);
+    const Project none =
+        ok(read_project(dir.write("none.dta", "(project (layers (a \"a.dta\")))")));
+    CHECK(none.views.layers.empty());
+    CHECK(none.views.ns.empty());
+
+    const auto error = [&](const char* views) {
+        const std::string f = dir.write(
+            "bad.dta", std::string("(project (layers (core \"c.dta\") (local \"l.dta\" dev_only) "
+                                   "(hh \"h.dta\" (when HANDHELD)))\n") +
+                           views + ")");
+        auto r = read_project(f);
+        REQUIRE_FALSE(r);
+        return std::string(to_string(r.error()));
+    };
+    CHECK(error("(views (shapes x))").find("names its contract layers") != std::string::npos);
+    CHECK(error("(views (layers core) (ns x))").find("views are (views (layers") !=
+          std::string::npos);
+    CHECK(error("(views (layers core 3))").find("hold names") != std::string::npos);
+    CHECK(error("(views (layers nope))").find("'nope', which (layers ...) does not have") !=
+          std::string::npos);
+    CHECK(error("(views (layers local))").find("dev_only or under (when COND)") !=
+          std::string::npos);
+    CHECK(error("(views (layers hh))").find("dev_only or under (when COND)") != std::string::npos);
+    CHECK(error("(views (layers core) (namespace))").find("the namespace is") != std::string::npos);
+}

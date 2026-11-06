@@ -10,6 +10,7 @@
 #include "common/containers.hpp"
 #include "merge.hpp"
 #include "session.hpp"
+#include "table_build.hpp"
 #include "text.hpp"
 
 #include <atomic>
@@ -56,6 +57,9 @@ struct LayerState {
     // again only if one changed. Unknown when a cache replayed it, which parses nothing.
     Vec<Symbol> tested;
     bool tested_known = false;
+    // Its tree holds an (@aka ...), or it was replayed from a cache, which counts none: the
+    // merge then resolves a key the stack lacks against the aliases below it.
+    bool aliases = false;
     // A directory of layers (push_layer_dir): its own layer, which holds nothing, is `dir`'s
     // marker, and the layers found in it stand directly above, each with `group` its name.
     // The marker's deps are the directory itself, its order.dta, and the layer.dta files its
@@ -133,6 +137,15 @@ Path parent_of(const Path& path);
 // The nodes a path's value consists of: the values of the array it names, or the one node
 // an index selects. False if the path does not resolve.
 bool value_nodes(const Array& root, const Path& path, Vec<Node>& out);
+// The list a layer row's verb changes at `path` in `root`: every child of the array there up
+// to its metadata, records too, which an #append adds after and a #drop removes from. False
+// if the path does not name an array.
+bool list_nodes(const Array& root, const Path& path, Vec<Node>& out);
+// What `row`, a layer's row at `path`, stands over in `root`: the list its verb changes if it
+// composes, else the path's values.
+inline bool below_nodes(const Array& root, const Path& path, const Array& row, Vec<Node>& out) {
+    return detail::composes(row) ? list_nodes(root, path, out) : value_nodes(root, path, out);
+}
 
 bool same_nodes(std::span<const Node> a, std::span<const Node> b);
 
@@ -142,6 +155,10 @@ struct Leaf {
     Str path;  // dotted
     const Array* holder;
     Vec<Node> values;
+    // leaves_of: the children after the holder in its array with its tag, which merge into the
+    // holder's record, and that array.
+    uint32_t folded = 0;
+    const Array* parent = nullptr;
 };
 
 // What a check was made against (CheckStamp): a layer's name with its text, or with its
@@ -157,7 +174,7 @@ struct Leaf {
 void leaf_values(const Array& a, Vec<Node>& out);
 Vec<Node> leaf_values(const Array& a);
 // The array holding `path`'s value in `root` (its parent's, for an element), or null.
-const Array* row_at(const Array& root, const Path& path);
+const Array* row_at(const Array& root, const Path& path, const Array* merged = nullptr);
 // A layer row's verb as LayerEffectEntry::op names it: empty for a plain row.
 inline Symbol op_of(const Array& row) {
     const detail::Marker m = detail::verb_of(row);
@@ -173,6 +190,13 @@ void row_warnings(const Array& row, std::string_view path, const Vec<Node>* belo
                   const Array& stack, Vec<Error>& out);
 // Each tag's first child only, as lookup sees it, depth first.
 Vec<Leaf> leaves_of(const Array& root);
+// Where `layer`, merged over `below`, folds children into one record. At each key the
+// layer shares with the stack: a tag the array below holds more than once, a list of records
+// of which the layer reaches only the first; or a tag the layer writes more than once with
+// values, which overwrite one another in one record. A warning for each, at the layer's first
+// child with the tag. Quiet for a key new to the stack (added whole), a table split across
+// rows (keys without values merge key by key, as written), a composing row and metadata.
+void fold_warnings(const Array& below, const Array& layer, Vec<Error>& out);
 
 // A declaration a layer's read made: #shape (NAME ...), #pack (NAME ...) or
 // #origin ("source" ...), which the layer's tree does not hold, as the layer tools list it.
@@ -260,10 +284,18 @@ struct Config::Impl {
     ConfigOptions options;
     WriteOptions layout{};           // of the text it writes
     Str cache_dir{alloc};            // options.cache_dir views this
+    Str stack_image{alloc};          // options.stack_image views this
+    bool hold_tables = false;        // while an image's layers push: no build per push
     mutable Str scan{alloc};         // changed()'s buffer, kept so that a poll allocates nothing
     mutable Vec<Str> listed{alloc};  // the same for a directory's listing
     // Every merge's temporaries, reused: a merge allocates only the arrays it keeps.
     mutable detail::MergeScratch merge_scratch{alloc};
+    // The merged tree as of the last commit or apply_edits: what a per-layer lookup consults
+    // for a renamed record's aliases, only while some layer has one.
+    Ref<Array> merged_root;
+    [[nodiscard]] const Array* alias_root() const noexcept {
+        return merge_scratch.aliases ? merged_root.get() : nullptr;
+    }
     LoadSession base{alloc};  // the sessions the Config keeps are on its allocator
     LoadSession as_read{
         alloc};  // read_session(): the last file layer's session, as of the last merge
@@ -278,6 +310,12 @@ struct Config::Impl {
         ValidatorOptions options;
     };
     Vec<Check> validators{alloc};
+    // Baked tables: each registered spec, its current block, and the arrays it was
+    // built from, so a change that shares them rebuilds nothing.
+    Vec<detail::TableSlot> tables{alloc};
+    // Builds or rebuilds each table from `root`: all of them when `all`, else those whose
+    // source arrays `root` does not share.
+    void build_tables(const Array& root, bool all);
     // The enabled layers' trees, for the validators' stack (ValidatorStack::layers): refilled
     // at each merge, its capacity kept.
     mutable Vec<Ref<Array>> enabled_roots{alloc};
@@ -519,21 +557,26 @@ struct Config::Impl {
 
     // The enabled layer below `top` (skipping `skip`) whose own tree has `path`'s value:
     // overwrite merging means its values won. A row that composes (#append, #drop) supplies
-    // none: the value it changes does.
+    // none: the value it changes does. With `list`, the list a verb changes: an array with
+    // any element, records too (list_nodes).
     [[nodiscard]] std::optional<size_t> supplier(const Path& path, size_t top,
-                                                 size_t skip = SIZE_MAX) const {
+                                                 size_t skip = SIZE_MAX, bool list = false) const {
         const bool index = last_is_index(path);
         for (size_t i = top; i-- > 0;) {
             if (i == skip || !layers[i].options.enabled || composes_at(i, path)) continue;
             detail::Resolved r;
-            if (detail::resolve(*layers[i].root, path, r) != detail::ResolveStatus::Ok) continue;
-            if (index || (r.array && has_values(*r.array))) return i;
+            if (detail::resolve_in_layer(*layers[i].root, path, alias_root(), r) !=
+                detail::ResolveStatus::Ok)
+                continue;
+            if (index || (r.array && (list ? !r.array->values().empty() : has_values(*r.array))))
+                return i;
         }
         return std::nullopt;
     }
     // Whether layer `i` composes `path`'s value: one flag test for a layer with no verb.
     [[nodiscard]] bool composes_at(size_t i, const Path& path) const {
-        const Array* row = layers[i].root->has_marker() ? row_at(*layers[i].root, path) : nullptr;
+        const Array* row =
+            layers[i].root->has_marker() ? row_at(*layers[i].root, path, alias_root()) : nullptr;
         return row && detail::composes(*row);
     }
     // A write of `path` into layer `from` would be appended to or dropped from again by a
@@ -543,7 +586,7 @@ struct Config::Impl {
                                                 size_t skip = SIZE_MAX) const {
         for (size_t i = layers.size(); i-- > from;)
             if (i != skip && layers[i].options.enabled && composes_at(i, path)) {
-                const Array& row = *row_at(*layers[i].root, path);
+                const Array& row = *row_at(*layers[i].root, path, alias_root());
                 return refused(quoted(path) + " is composed by layer '" + layers[i].name + "': " +
                                    detail::preview(Node(Ref<Array>(const_cast<Array*>(&row)))) +
                                    "; write the layer below it, or promote the layer",
@@ -554,7 +597,7 @@ struct Config::Impl {
 
     [[nodiscard]] Source source_in(const LayerState& l, const Path& path) const {
         detail::Resolved r;
-        if (detail::resolve(*l.root, path, r) != detail::ResolveStatus::Ok)
+        if (detail::resolve_in_layer(*l.root, path, alias_root(), r) != detail::ResolveStatus::Ok)
             return {Symbol(l.name), {}, 0};
         return located(l, *r.values.source());
     }

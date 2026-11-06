@@ -174,6 +174,7 @@ struct LoadSession::State {
     Vec<Definition> definitions;       // macro definitions, in the order read
     Vec<ActiveDefine> flags;           // the flags that stand, in the order made
     Vec<ConditionalSection> sections;  // the #ifdef branches the reads took
+    Vec<SkippedShape> skipped_shapes;  // #shape directives inside branches not taken
     Vec<Symbol> tested;   // each name an #ifdef, #ifndef, #define or #undef named, as read
     uint64_t parses = 0;  // the files parsed: a cache's replay parses none
     HashMap<Symbol, uint32_t> macro_pack;  // the pack that defined each macro, by index
@@ -192,6 +193,7 @@ struct LoadSession::State {
     Vec<Str> include_stack;
     uint64_t nodes = 0;
     bool had_rows = false;           // a file of this read held rows: compact its tree
+    uint32_t aliases = 0;            // arrays with an (@aka ...): the merge resolves by them
     detail::NewSymbols new_symbols;  // counted by the symbol table
     uint32_t includes = 0;
 };
@@ -475,6 +477,7 @@ private:
         // Metadata comes after the value. Inline, so an array without metadata pays one test;
         // a command's and a property's forms are positional and keep their order.
         if (arr->meta_first() && f.kind == Frame::Array && !metadata_placed(*arr, f)) return false;
+        if (arr->meta_first() && arr->meta(detail::aka_tag())) ++s_.st_->aliases;
         if (f.verb && !verb_placed(*arr, f)) return false;
         if (f.row) return wrap_row(std::move(arr), f, t.end);
         const SourceSpan span{file_, f.begin, t.end, {}};
@@ -989,6 +992,9 @@ private:
     bool skipped_directive(const Token& t) {
         if (t.text == "ifdef" || t.text == "ifndef") return conditional(t, false);
         if (t.text == "else" || t.text == "endif") return else_or_endif(t);
+        if (t.text == "shape")  // for shape::contract_set: a view's shape set is one per build
+            s_.st_->skipped_shapes.push_back(
+                {file_, t.line, Symbol(s_.st_->include_stack.front())});
         return true;
     }
 
@@ -1482,6 +1488,9 @@ std::span<const Origin> LoadSession::origins() const noexcept {
 std::span<const ShapeDecl> LoadSession::shapes() const noexcept {
     return {st_->shapes.data(), st_->shapes.size()};
 }
+std::span<const SkippedShape> LoadSession::skipped_shapes() const noexcept {
+    return {st_->skipped_shapes.data(), st_->skipped_shapes.size()};
+}
 const Origin* LoadSession::origin_of(Symbol file) const noexcept {
     for (const Origin& o : st_->origins)
         if (o.file == file) return &o;
@@ -1506,6 +1515,12 @@ std::span<const CacheFile> SessionAccess::files(const LoadSession& s) noexcept {
 }
 const SessionAccess::Defines& SessionAccess::defines(const LoadSession& s) noexcept {
     return s.st_->defines;
+}
+uint32_t SessionAccess::aliases(const LoadSession& s) noexcept {
+    return s.st_->aliases;
+}
+void SessionAccess::set_aliases(LoadSession& s, uint32_t count) noexcept {
+    s.st_->aliases = count;
 }
 std::span<const Symbol> SessionAccess::tested(const LoadSession& s) noexcept {
     return {s.st_->tested.data(), s.st_->tested.size()};
@@ -1745,6 +1760,7 @@ Expected<Ref<Array>> read_string(std::string_view text, std::string_view name,
         LoadSession::State& st = *session.st_;
         st.nodes = 0;
         st.had_rows = false;
+        st.aliases = 0;
         st.new_symbols = {0, session.limits.max_new_symbols, &st.nodes, session.limits.max_nodes};
         st.includes = 0;
         st.recorded = session.record_for_cache;

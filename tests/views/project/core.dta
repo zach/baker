@@ -1,0 +1,10 @@
+#shape (vec2 (@view) (x float) (y float))
+#shape (boss (@at bosses) (@keyed) (@view)
+   (hp   int (@range 1 100000) (@renamed_from health))
+   (pos  vec2 (@optional))
+   (tags (list symbol) (@optional))
+   (loot any (@optional) (@view no) (@desc "A command: what it drops")))
+
+(bosses
+   (dragon (hp 4000) (pos (x 1) (y 2.5)) (tags fire flying) (loot {drop gold}))
+   (golem (health 2500)))  ; the old name, which the reader accepts

@@ -1,0 +1,6 @@
+; Content: a shape the project lists as a view, and a field added to a contract shape.
+#shape (item (@at items) (@keyed) (price float) (stack int (@optional)))
+#shape (boss (hint string (@optional)))
+
+(items (potion (price 12.5) (stack 20)) (sword (price 150)))
+(bosses (dragon (hint "Stay low")))

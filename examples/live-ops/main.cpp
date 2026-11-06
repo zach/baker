@@ -56,7 +56,7 @@ bool stage(const baker::Config& cfg, const std::string& name, baker::LayerReport
     for (const baker::LayerEffectEntry& e : report->effect)
         std::printf("  %s: %s -> %s\n", e.path.c_str(),
                     e.below ? baker::to_string(*e.below).c_str() : "(none)",
-                    baker::to_string(e.value).c_str());
+                    baker::to_string(e.values).c_str());
     return true;
 }
 

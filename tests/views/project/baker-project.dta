@@ -1,0 +1,10 @@
+; A project whose build generates views (D281): the contract stack is core and content; the
+; mods directory and the dev_only layer may add fields, which stay out of the structs.
+(project
+   (defines PC)
+   (layers
+      (core "core.dta")
+      (content "content.dta")
+      (mods (dir "mods") optional)
+      (local "local.dta" optional dev_only))
+   (views (layers core content) (shapes item) (namespace views_gen)))

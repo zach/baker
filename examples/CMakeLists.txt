@@ -66,6 +66,19 @@ if(baker_test_dev)
     ${CMAKE_CURRENT_SOURCE_DIR}/config/data)
 endif()
 
+# --- content-tables: records read into structs the build generates from their shape.
+if(BAKER_BUILD_SHAPE)
+  add_executable(baker_example_content_tables content-tables/main.cpp)
+  target_link_libraries(baker_example_content_tables PRIVATE baker::shape)
+  baker_generate_views(baker_example_content_tables
+    PROJECT ${CMAKE_CURRENT_SOURCE_DIR}/content-tables/data/baker-project.dta)
+  if(BAKER_BUILD_TESTS)  # in shipping builds too: the image is what ships
+    baker_example_test(baker_example_content_tables baker_example_content_tables
+      "^views: 1, up to date${nl}jab: startup 4, damage 3[.]5, button light, cancels into slam kick; icon art/jab[.]png${nl}kestrel[.]slam is a7d2c41e9b06f58a3c1d2e4f60718293, startup 9${nl}kestrel[.]slam: \"Launches\"${nl}kestrel[.]slam runs a command on a hit${nl}wren[.]poke: \"Safe at range\"${nl}4 moves read${nl}table: 4 moves; slam is row 1, damage 12, id kept${nl}table: heavy is slam, row 1${nl}image: [0-9]+ bytes, 4 moves, jab cancels into slam${nl}baker: field 'startup' of 'move' is not an int: fast .*fighters/kestrel/moves/jab"
+      ${CMAKE_CURRENT_SOURCE_DIR}/content-tables/data/baker-project.dta game.datb)
+  endif()
+endif()
+
 # --- live-ops: published overlays staged, applied under a policy, refused, rolled back.
 # Runs in shipping builds too: that is where it matters.
 if(BAKER_BUILD_SHAPE)

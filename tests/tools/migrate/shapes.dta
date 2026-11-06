@@ -1,0 +1,7 @@
+; Both migrations, in either order, give the same text (D274).
+(shapes
+  (enemy (at /enemies/*)
+    (desc "One enemy.")
+    (hp int (range 1 100))
+    (taunt string (optional))))
+(enemies (grunt (hp 10 (range 1 50))))

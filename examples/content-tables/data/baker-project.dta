@@ -1,0 +1,10 @@
+; A game whose records designers author and whose structs the build generates (D269):
+; the core and content layers are the contract the views come from; a mod or a personal
+; layer may add fields, which stay in the tree.
+(project
+   (layers
+      (core "core.dta")
+      (content "content.dta")
+      (local "local.dta" optional dev_only))
+   (assets (texture ".png"))
+   (views (layers core content) (namespace game)))

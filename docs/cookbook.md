@@ -11,6 +11,7 @@ this says how they fit a studio's day. Each pattern links the example that runs 
 - [Experiments and A/B comparison](#experiments-and-ab-comparison)
 - [Live ops](#live-ops)
 - [The binary cache in a build step](#the-binary-cache-in-a-build-step)
+- [Views in the build](#views-in-the-build)
 - [Linking a shipped game](#linking-a-shipped-game)
 - [Harness packs](#harness-packs)
 - [A developer console over `eval`](#a-developer-console-over-eval)
@@ -67,6 +68,13 @@ static baker::Tweak<float> kJumpHeight{"player.jump.height", 1.2f,
 - **`dev_only`** marks a tweak a shipped build must not take from data: under
   `BAKER_SHIPPING` it keeps its default, and `set()` is refused. Use it for cheats and
   debug switches.
+- **`optional`** marks a tweak the data may leave out: its default, from your own content
+  (an asset file's values bound as tweaks so layers can retune them by name), is the value,
+  and a layer supplies one only to change it. `check` then does not warn that the data lacks
+  it, which for a library of records would be a warning per field; it still holds a value a
+  layer does supply to the tweak's type, range and allowed values, and still warns of a
+  misspelt sibling. The reference's JSON names it. Leave it off for a constant the data
+  must carry. It is for checking only: a shipping build keeps no flag.
 - **Tests** give a tweak its own `TweakRegistry` and Config, so they do not share the
   global one.
 
@@ -131,6 +139,7 @@ and the game and every tool read it.
    (tool "build/bin/my_game")         ; for tools: the binary that answers the commands
    (console 4555)                     ; for tools: the port the game's console listens on
    (format (indent 3) (width 100))    ; how its files are laid out, by format and write-back
+   (assets (mesh ".glb" ".fbx"))      ; the kinds (asset KIND) fields name, and their files
    (scenarios "sim")                  ; for sim: scenarios and objectives (docs/sim-json.md)
    (objectives "metrics")
    (layers                            ; bottom to top
@@ -246,8 +255,8 @@ Live tuning goes to the `scratch` layer, so "my tuning versus the files" is also
 `cfg.toggle_layer("scratch")`.
 
 `source()` names the layer a value comes from; `tools::explain(cfg, path)` names every layer that
-has a say, bottom to top. Each entry gives the layer, its value, its file and line, and how
-it stands:
+has a say, bottom to top. Each entry gives the layer, its values (one node each, so
+`(aim 0 0)` is two and `(aim (0 0))` one), its file and line, and how it stands:
 
 - `Wins`: it supplies the value `get` returns.
 - `Shadowed`: a layer above overrides it.
@@ -526,6 +535,81 @@ and one allocation each: a 6.2 MB tree in 2.3–2.5 ms.
   its load made. It is build output: it detects damage, not tampering, so text from a
   source you do not trust goes through the parser. A `Cipher` (`LoadSession::cipher`)
   enciphers caches, if a game wants players not to edit them.
+
+## Views in the build
+
+A shape marked `(@view)` becomes a C++ struct (`docs/language.md`, Views). The build makes
+it, and keeps it current:
+
+```dta
+; baker-project.dta
+(project
+   (layers (core "core.dta") (content "content.dta") (mods (dir "mods") optional))
+   (views (layers core content) (shapes item) (namespace game)))
+```
+
+```cmake
+baker_generate_views(my_game PROJECT ${CMAKE_SOURCE_DIR}/data/baker-project.dta)
+```
+
+- **What it writes,** under the build tree and on `my_game`'s include path: `move.hpp` (the
+  struct and its digest, reaching only `<baker/view.hpp>`), `move_read.hpp` (its reader,
+  reaching `<baker/view_read.hpp>`, for the files that read), `views.hpp` (every view,
+  and `game::kViews` for the drift check), and `tables.hpp` (`game::register_tables(cfg)`,
+  which adds a baked table for every keyed view; include it where the Config is opened).
+  Name a struct in many files and read it in one.
+- **The contract** is the layers `(views (layers ...))` names: a mod, an overlay or a
+  personal layer may add fields, which stay in the tree. `(shapes ...)` adds views for
+  shapes not marked `(@view)`. The contract layers are the same in every build, so a
+  `#shape` under `#ifdef` there, or a `dev_only` or `(when COND)` contract layer, is
+  refused.
+- **When it reruns.** `baker_bake --views` writes a depfile naming every file it read and
+  rewrites a header only when its text changed, so a `@range` or `@desc` edit rebuilds
+  nothing, and a new field rebuilds what includes the struct. A cross-compile sets
+  `BAKER_BAKE_EXECUTABLE` to a `baker_bake` built for the host.
+- **Drift.** In development, after the load:
+
+  ```cpp
+  baker::shape::Report report;
+  const auto roots = baker::shape::contract_roots(cfg, project.views.layers.items());
+  const auto contract = baker::shape::contract_set(cfg.read_session(), roots.items(), report);
+  baker::shape::check_views(contract, game::kViews, report);   // warnings: regenerate
+  ```
+
+  A game using the host kit sets `CommandHooks::views = game::kViews`, and `check` reports
+  the same as a shape warning; the farm runs `check --baker-strict-views`, which makes it
+  an error, so a designer's change to a layout never ships against stale code. A shipping
+  build keeps no view names, and matches by digest alone.
+
+## Renaming a record, a field, and naming a file
+
+Content changes its names. Baker keeps the old ones answering (`docs/language.md`,
+Identity), and the host kit's commands do the rewriting:
+
+- **A record.** `game rename fighters.kestrel.moves.heavy slam --baker-write` gives the
+  record its new key in the layer that declares it, keeps `(@aka heavy)` in it, mints an
+  `(@id ...)` if it had none, and rewrites every `(key_of ...)` value naming it in every
+  layer. An overlay that still says `(heavy (hint "Launches"))`, a mod you do not own,
+  merges into `slam` through the alias. `check` lists an alias nothing names any more, as a
+  finding, for the day you drop it.
+- **A field.** Declare the old name on the shape, `(startup int (@renamed_from windup))`:
+  a record that says `windup` is checked as `startup`, with a warning, and the generated
+  view reads it. `game format` rewrites `windup` to `startup` in every file of the stack.
+  Nothing is renamed at load.
+- **An ID for every record.** `game format --baker-mint-ids fighters.kestrel.moves` writes
+  an `(@id ...)` into each record of the table without one, or copied with another's, in
+  the layer that declares it. Tools and change records anchor on the ID; references keep
+  naming keys.
+- **A file outside Baker.** A field `(icon (asset texture))` holds a path relative to the
+  project file's directory; the project declares `(assets (texture ".png"))`. `check` fails
+  on an extension the kind does not list or a file that is not there, and `game assets`
+  writes every edge as `baker.assets/1` for the pipeline.
+
+`examples/content-tables` does all four: `slam` was `heavy`, `startup` was `windup`, the
+jab names its icon, and the output shows each. It also registers its moves as a baked
+table, finds `slam` by path and by its old key, and, given a file name, writes the contract
+layers and the table as a stack image and opens a second Config from it, as a shipped
+build does (`docs/language.md`, Tables).
 
 ## Content packages: patches, DLC, and mods
 

@@ -45,7 +45,8 @@ transport you choose carry Baker's tools: a socket, a pipe, an in-game console.
 `baker::tools` library, in `<baker/tools/...>` and namespace `baker::tools`: the reference
 and the check report as JSON, `explain`, `layer_effect` and `diff`, the console's
 `config.*` commands, the vocabulary declared from a reference (`DescribedTweaks`,
-`declare_type`, `declare_object`), `script_functions` and `read_structure`. A tool links it
+`declare_type`, `declare_object`), `script_functions`, `read_structure`, `format_text` and
+`migrate_text`. A tool links it
 directly; a game links it only through the host kit, which uses it. What a game runs on its
 own data stays in the core: `check`, `source`, write-back, the tweaks' JSON (so a data-only
 program can write it), `split_metadata` and `presented_kind`.
@@ -74,6 +75,23 @@ An editor works on text that rarely parses, and checks it on every pause:
   editor applies them without moving the cursor through unchanged text; `.begin` and
   `.end` lay out only the forms a selection touches. Formatting twice changes nothing. 2 MB
   takes about 60 ms.
+- **Old spellings, with their fixes.** `tools::migrate_text(text, sink)` finds each form a
+  language migration rewrites, writes the text with all of them rewritten to `sink`, and
+  returns them as findings. Each finding gives its migration (`Migration::Metadata`, the `@`
+  of metadata; `Migration::Declarations`, `#pack`, `#origin`, `#shape` and `[NAME ...]`
+  macros), its byte span, a warning worded as a check words it, and its edits: byte spans
+  of the text replaced, and nothing else changed. An editor shows the warnings in every file
+  of a project and offers a finding's edits as a quick fix (`apply_findings` with that one
+  finding), or all of them for the file; a CI step fails on any finding; an agent writing
+  from older examples is told what to change. What a migration will not decide, an array
+  whose children are all tagged and the last with a metadata word, is a finding with no
+  edits that says why. Text that does not parse gets the findings that can be located.
+  Migrating the result finds nothing to rewrite. 2 MB takes about 25 ms.
+
+  The `baker_migrate` tool (in `tools/`) runs it over files: `--write` rewrites them,
+  `--report` lists what would change, `--check` exits 1 if anything would, `--only metadata`
+  or `--only declarations` picks one, and `--cpp` and `--md` migrate the Baker text in C++
+  string literals and in Markdown.
 - **The house layout.** Three spaces a level and a hundred columns is `WriteOptions`'
   default, and the layout of a project without `(format ...)`. A Config opened from a
   project (`open_project`) writes in the project's layout: the forms promote and write-back
@@ -175,22 +193,29 @@ error, so a misspelling is caught.
 
 | Command | What it writes |
 |---|---|
-| `check` | [check's report](check-json.md); exit 1 on an error, a load problem, a shape error, or a call to an undefined function; a shape that governs no array is a shape warning |
+| `check [--baker-strict-views]` | [check's report](check-json.md); exit 1 on an error, a load problem, a shape error (an asset that is not there is one), or a call to an undefined function; a shape that governs no array is a shape warning, and so is a view the game compiled against another layout of its shape (`CommandHooks::views`), which `--baker-strict-views` makes an error, for a farm |
 | `reference [--baker-json]` | the script vocabulary as Markdown, or `{"reference", "tweaks", "shapes"}` |
+| `assets` | every asset the merged stack names, as [`baker.assets/1`](assets-json.md), sorted by file, line and path; exit 1 when a file is not there |
 | `eval [--baker-seed N] [--baker-json] "{command}"...` | each command's result on the game reset with the seed; `--baker-json`: one reply line each |
 | `diff [--baker-layer L]` | what layer L (default `agent`) changes, value by value: a verb as `-> #append v`, and `stale` where a row's `(@was ...)` pin no longer names the value below |
 | `promote [--baker-from L] [--baker-to T] [--baker-write \| --baker-patch FILE]` | what promoting L into T would write; `--baker-write` writes; `--baker-patch` writes a unified diff and nothing else, after a line `# path: note` for each row's `(@note ...)`, which `git apply` skips |
 | `sim [--baker-scenario NAME]... [--baker-seed N \| --baker-seeds A-B] [--baker-step-hz N] [--baker-json] [--baker-results DIR]` | the project's scenarios run and judged by its objectives ([`baker.sim/1.3`](sim-json.md)); exit 1 when one fails |
 | `compare --baker-before DIR --baker-after DIR` | which objectives broke or were fixed between two `sim --baker-results` ([`baker.compare/1`](sim-json.md)) |
-| `format [--baker-check] [--baker-json] [FILE...]` | lays out each file (the stack's own files under the project's directory if none is named) with the project's `(format ...)`; `--baker-check` changes nothing and exits 1, listing each file that would change, for CI and a pre-commit hook; `--baker-json`: `{"schema": "baker.format/1", "files": [{"file", "changed", "line_end", "edits": [[begin, end, newlines, spaces], ...], "errors"}]}` |
+| `rename OLD NEW [--baker-write]` | the record at path OLD (`weapons.laser`) keyed NEW in the layer that declares it, with `(@aka OLD)` kept and an `(@id ...)` minted if it has none, and every `(key_of ...)` value naming it rewritten in every enabled layer; without `--baker-write`, the edits are listed, one a line, and nothing is written. Refuses, writing nothing, when NEW is a sibling's key or alias, or when an edit cannot be placed in the text (a record a row's path made, a macro's expansion): edit those where they are written. An overlay's own record keeps the old key, which the alias resolves |
+| `bake --baker-stack FILE` | the contract layers (`(views (layers ...))`) loaded as the game loads them, with its tables registered, written as one stack image (`<baker/image.hpp>`) for a shipped build to open through `ConfigOptions::stack_image` in place of the layers' text; the game's own binary bakes, so the tables are laid out as its compiler lays them out |
+| `format [--baker-check] [--baker-json] [--baker-mint-ids TABLE] [FILE...]` | lays out each file (the stack's own files under the project's directory if none is named) with the project's `(format ...)`, after spelling each field by its shape's name where a record uses one the shape `(@renamed_from ...)`; `--baker-mint-ids TABLE` first writes an `(@id ...)` into each record of TABLE that has none, or repeats another's, in the layer that declares the record; `--baker-check` changes nothing and exits 1, listing each file that would change, for CI and a pre-commit hook; `--baker-json`: `{"schema": "baker.format/1.1", "files": [{"file", "changed", "rewrites", "line_end", "edits": [[begin, end, newlines, spaces], ...], "errors"}]}`, where `rewrites` counts the renames and IDs and `edits` lays out the text after them |
 
 Each runs on a fresh Context with your functions bound (`CommandHooks::bind`), the stack
 opened as the game opens it, and, for `eval`, your state reset (`CommandHooks::reset`).
+`CommandHooks::tables` (the generated `register_tables`) registers your baked tables with
+each command's Config, so `check` fails on a record a table cannot read whole;
+`CommandHooks::config` is the `ConfigOptions` each command's Config is made with (its
+caches, its stack image).
 `sim` steps your game with `CommandHooks::step`, and `check` reads the project's scenarios
 and objectives with the data. A game that can only step inside its engine's main loop
 drives a `SimRun` from its frames instead ([how](sim-json.md#a-run-your-own-loop-advances)). `extra_trees` adds other files of your own to `check`. The exit status is 0, 1
-when something failed, 2 when it could not run. In a shipping build, `diff` and `promote`
-refuse. A tool reads the commands' standard output as the document itself, so your
+when something failed, 2 when it could not run. In a shipping build, `diff`, `promote` and
+`rename` refuse. A tool reads the commands' standard output as the document itself, so your
 functions and `#autorun` must print nothing there while a command runs. Where that cannot
 be kept clean (an engine prints its own lines), `--baker-output FILE` writes the output to a
 file instead, or `CommandHooks::output` routes it. `CommandHooks::reader` reads the stack
@@ -208,8 +233,8 @@ through your file access, as `Live` does, for files under an engine's own roots.
   the game may use as its default while its own command line wins), and its scenarios and
   objectives (`(scenarios ...)`, `(objectives ...)`).
 - **Documents.** [The reference](reference-json.md), [check's report](check-json.md),
-  [the reply](reply-json.md) and [sim's results](sim-json.md) are versioned JSON. A field is added only with a new minor
-  version.
+  [the reply](reply-json.md), [sim's results](sim-json.md) and [the assets](assets-json.md)
+  are versioned JSON. A field is added only with a new minor version.
 - **The console.** One request per line, one JSON reply per line, to a running game.
   `{config.epoch}` says whether anything changed since a tool last asked.
 - **Commands.** Your game binary's own commands, run by the tool.

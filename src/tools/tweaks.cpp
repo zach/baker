@@ -48,6 +48,7 @@ struct DescribedParts {
                      .kind = kind_text.view(),
                      .group = group_text.view(),
                      .dev_only = d.dev_only,
+                     .optional = d.optional,
                      .one_of = {one_of_views.data(), one_of_views.size()},
                      .choices = {choices.data(), choices.size()}};
     }

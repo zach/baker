@@ -1,0 +1,18 @@
+; The moves table: its shape, marked (@view), is what the build generates game::Move from.
+#shape (move (@at fighters * moves) (@keyed) (@view)
+   (startup     int (@range 1 60) (@kind frames) (@desc "Frames before the hit lands")
+                (@renamed_from windup))  ; a record may still say windup; format rewrites it
+   (damage      float (@range 0 200))
+   (button      symbol (@one_of light heavy kick) (@optional))
+   (cancel_into (list (key_of moves)) (@optional) (@desc "Moves this one may cancel into"))
+   (on_hit      any (@optional) (@view no) (@desc "A command that runs when it lands"))
+   (icon        (asset texture) (@optional) (@desc "The command list's picture")))
+
+(fighters
+   (kestrel (moves
+      (jab   (startup 4) (damage 3.5) (button light) (cancel_into slam kick) (icon "art/jab.png"))
+      ; Renamed from heavy by `game rename fighters.kestrel.moves.heavy slam --baker-write`:
+      ; the ID stays, and the alias keeps the content layer's (heavy ...) merging in.
+      (slam  (@id a7d2c41e9b06f58a3c1d2e4f60718293) (startup 9) (damage 12) (button heavy)
+             (on_hit {stagger 0.3}) (@aka heavy))
+      (kick  (startup 7) (damage 8) (button kick)))))

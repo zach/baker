@@ -48,6 +48,16 @@ Node tagged(const char* tag, Node value) {
     return Node(array(Symbol(tag), std::move(value)));
 }
 
+// (tag v1 v2 ...): one value a child, so (value (0 0)), one array, reads apart from
+// (value 0 0), two numbers.
+Node tagged(const char* tag, const RowValues& values) {
+    Vec<Node> items;
+    items.reserve(values.size() + 1);
+    items.emplace_back(Symbol(tag));
+    for (const Node& v : values) items.push_back(v);
+    return Node(Array::make_from(std::span<Node>(items.data(), items.size())));
+}
+
 Node list(Vec<Node>& items) {
     return Node(Array::make_from(std::span<Node>(items.data(), items.size())));
 }
@@ -87,7 +97,7 @@ Expected<Node> explain_node(Config& cfg, std::string_view path) {
     for (const ExplainEntry& e : *entries) {
         Vec<Node> fields;
         fields.push_back(tagged("layer", Node(e.layer)));
-        fields.push_back(tagged("value", e.value));
+        fields.push_back(tagged("value", e.values));
         fields.push_back(tagged("standing", Node(standing_name(e.standing))));
         if (!e.op.empty()) fields.push_back(tagged("op", Node(e.op)));
         add_source(fields, e.source, false);
@@ -150,7 +160,9 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             auto entries = explain(tools->cfg, Path(path.text));
             if (!entries) return Unexpected(std::move(entries).error());
             for (const ExplainEntry& e : *entries)
-                if (e.standing == Standing::Wins && e.layer != "code") return e.value;
+                if (e.standing == Standing::Wins && e.layer != "code")
+                    return e.values.size() == 1 ? e.values[0]
+                                                : Node(Array::make_copy(e.values.nodes()));
             return Unexpected(make_error(
                 ErrorCode::NotFound, "nothing sets '" + Str(path.text) + "'; its default stands"));
         },
@@ -178,8 +190,9 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
         "(origin O) (tool T) when a tool generated the file.");
     bind(
         "config.explain", [tools](Name path) { return explain_node(tools->cfg, path.text); },
-        "Every contributor to a path's value, bottom to top: each entry's layer, value, "
-        "standing (wins, shadowed, removes, composes, disabled), op (#append, #drop, #remove), "
+        "Every contributor to a path's value, bottom to top: each entry's layer, values (one child "
+        "each), standing (wins, shadowed, removes, composes, disabled), op (#append, #drop, "
+        "#remove), "
         "file, and line.");
     bind(
         "config.layers",
@@ -204,19 +217,22 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
                 Vec<Node> f;
                 f.push_back(tagged("path", Node(e.path)));
                 if (!e.declares.empty()) f.push_back(tagged("declares", Node(e.declares)));
-                f.push_back(tagged("value", e.value));
+                f.push_back(tagged("value", e.values));
                 if (!e.op.empty()) f.push_back(tagged("op", Node(e.op)));
-                if (e.below) f.push_back(tagged("below", *e.below));
+                if (e.below) f.push_back(tagged("below", *e.below));  // (below): an empty list
                 add_source(f, e.source, false);
                 f.push_back(tagged("shadowed", Node(int64_t{e.shadowed})));
                 if (e.stale) f.push_back(tagged("stale", Node(int64_t{1})));
+                if (e.folded) f.push_back(tagged("folded", Node(int64_t{e.folded})));
                 out.push_back(list(f));
             }
             return list(out);
         },
-        "What a layer changes: each path, its value, its verb (op) if it composes or removes, "
-        "the value below it, its file and line, whether a layer above shadows it, and (stale 1) "
-        "when its (@was ...) pin no longer names the value below.");
+        "What a layer changes: each path, its values (value v...), one child each, its verb "
+        "(op) if it composes or removes, the values below it (under a verb, the list it "
+        "changes), its file and line, whether a layer above shadows it, and (stale 1) when its "
+        "(@was ...) pin no longer names the values below, and (folded N) when N more of the "
+        "layer's children with the row's tag merge into its record.");
     bind(
         "config.diff",
         [tools](Name a, Name b) -> Expected<Node> {
@@ -231,12 +247,15 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
                 if (!d.op_a.empty()) f.push_back(tagged("op_a", Node(d.op_a)));
                 if (d.b) f.push_back(tagged("b", *d.b));
                 if (!d.op_b.empty()) f.push_back(tagged("op_b", Node(d.op_b)));
+                if (d.folded_a) f.push_back(tagged("folded_a", Node(int64_t{d.folded_a})));
+                if (d.folded_b) f.push_back(tagged("folded_b", Node(int64_t{d.folded_b})));
                 out.push_back(list(f));
             }
             return list(out);
         },
-        "The paths two layers set differently, with each one's value (absent: not set) and "
-        "verb (op_a, op_b).");
+        "The paths two layers set differently, with each one's values, one child each (absent: "
+        "not set), verb (op_a, op_b), and the children each folds into its record (folded_a, "
+        "folded_b).");
 
     if constexpr (!kShipping) {
         // --- Live edits and telemetry: development builds only. ---

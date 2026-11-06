@@ -15,6 +15,7 @@
 //      (console 4555)                     ; for tools: the port the game's console listens on
 //      (scenarios "sim")                  ; for tools: scenario files, or directories of them
 //      (objectives "metrics")             ; for tools: objective files, or directories
+//      (views (layers default) (namespace game::data)) ; for baker_bake --views: C++ views
 //      (layers                            ; bottom to top
 //         (default "data/default.dta")
 //         (mods (dir "mods") optional)    ; a layer for each mod in mods/ (push_layer_dir)
@@ -68,6 +69,26 @@ struct ProjectPosition {
 // A pack level, include directory, or define, and where it is written.
 struct ProjectEntry {
     Symbol value;  // an include directory joined with the project file's directory
+    ProjectPosition at{};
+};
+
+// (views (layers core content) (shapes item) (namespace game::data)): what `baker_bake
+// --views` generates C++ views from. `layers` are names from (layers ...): the
+// contract stack, bottom to top, whose #shape forms the views come from; neither dev_only
+// nor under a (when COND). `shapes` are views besides those marked (@view); `ns` is the
+// namespace, "baker_views" when the file says nothing. Empty `layers`: no views.
+struct ProjectViews {
+    List<Symbol> layers;
+    List<Symbol> shapes;
+    Symbol ns;
+    ProjectPosition at{};
+};
+
+// (assets (mesh ".glb" ".fbx") (texture ".png")): the kinds an (asset KIND) field may name,
+// each with the extensions it takes, dotted; a kind with none takes any file.
+struct ProjectAssetKind {
+    Symbol name;
+    List<Symbol> extensions;
     ProjectPosition at{};
 };
 
@@ -131,6 +152,8 @@ struct Project {
     // project writes (Config::set_layout); WriteOptions' house layout where the file says
     // nothing.
     WriteOptions format{};
+    ProjectViews views;
+    List<ProjectAssetKind> assets;  // (assets ...): empty when the file names none
 
     // The tool binary's path with `$build` resolved: `build_dir` if given (a tool's flag or
     // setting), else the project's (build ...), else "build" beside the project file. A

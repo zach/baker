@@ -175,10 +175,10 @@ Vec<Node> leaf_values(const Array& a) {
     return out;
 }
 
-const Array* row_at(const Array& root, const Path& path) {
+const Array* row_at(const Array& root, const Path& path, const Array* merged) {
     detail::Resolved r;
-    const bool ok = detail::resolve(root, last_is_index(path) ? parent_of(path) : path, r) ==
-                    detail::ResolveStatus::Ok;
+    const bool ok = detail::resolve_in_layer(root, last_is_index(path) ? parent_of(path) : path,
+                                             merged, r) == detail::ResolveStatus::Ok;
     return ok ? r.array : nullptr;
 }
 
@@ -233,24 +233,67 @@ void row_warnings(const Array& row, std::string_view path, const Vec<Node>* belo
 
 // Each tag's first child only, as lookup sees it: found by the tag run's scan in a small
 // array, and by a set past kIndexed children, so a wide layer is linear.
+// How many children of `a` from `first` have `tag`, a row that composes left out.
+static uint32_t rows_tagged(const Array& a, size_t first, Symbol tag, bool marked) {
+    uint32_t n = 0;
+    for (size_t k = first; k < a.size(); ++k)
+        if (const Array* s = a[k].try_array();
+            s && (*s)[0].is(tag) && !(marked && detail::composes(*s)))
+            ++n;
+    return n;
+}
+
 static void collect_leaves(const Array& a, size_t first, const Str& prefix, Vec<Leaf>& out) {
     constexpr size_t kIndexed = 32;
-    HashMap<Symbol, char> seen;
+    constexpr uint32_t kEmitted = 0x80000000U;
     const bool indexed = a.size() > kIndexed;
     const bool marked = a.has_marker();  // a verb or a pin below: one test for all children
+    // A long array that repeats no tag, the usual case, has each child as its key's first
+    // row: its tags sorted tell, which costs less than a hash of them. One that repeats gets
+    // its rows by tag, counted in one pass: the first of each is the leaf, and the rest fold
+    // into it. kEmitted marks a tag whose first row is out.
+    HashMap<Symbol, uint32_t> rows;
+    bool repeats = false;
+    if (indexed) {
+        Vec<const void*> ids;
+        ids.reserve(a.size());
+        for (size_t k = first; k < a.size(); ++k)
+            if (is_tagged(a[k])) ids.push_back((*a[k].try_array())[0].try_sym()->id());
+        std::sort(ids.begin(), ids.end());
+        repeats = std::adjacent_find(ids.begin(), ids.end()) != ids.end();
+    }
+    if (repeats)
+        for (size_t k = first; k < a.size(); ++k)
+            if (is_tagged(a[k])) {
+                const Array& s = *a[k].try_array();
+                rows[*s[0].try_sym()] += marked && detail::composes(s) ? 0 : 1;
+            }
     for (size_t i = first; i < a.size(); ++i) {
         if (!is_tagged(a[i])) continue;
         const Array& child = *a[i].try_array();
         const Symbol tag = *child[0].try_sym();
         if (marked && tag.is_meta() && tag == detail::was_tag()) continue;  // the layer's own pin
         // A key's later rows are leaves too when they compose: each applies, in order.
-        const bool first_row = indexed ? seen.emplace(tag, 0).second : a.try_find(tag) == &child;
+        uint32_t* count = repeats ? &rows[tag] : nullptr;
+        const bool first_row = count     ? (*count & kEmitted) == 0
+                               : indexed ? true
+                                         : a.try_find(tag) == &child;
+        if (count) *count |= kEmitted;
         const bool composes = marked && detail::composes(child);
         if (!first_row && !composes) continue;
         Str path = prefix;
         if (!path.empty()) path += '.';
         detail::append_path_name(path, tag.str());
-        if (has_values(child)) out.push_back({path, &child, leaf_values(child)});
+        if (has_values(child)) {
+            // Its later siblings of the same tag fold into it; tools only.
+            uint32_t folded = 0;
+            if constexpr (!kShipping)
+                if (!composes)
+                    folded = count     ? (*count & ~kEmitted) - 1
+                             : indexed ? 0
+                                       : rows_tagged(a, i, tag, marked) - 1;
+            out.push_back({path, &child, leaf_values(child), folded, &a});
+        }
         if (!composes) collect_leaves(child, 1, path, out);  // operands are not keys
     }
 }

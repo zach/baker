@@ -47,6 +47,7 @@
 #include <baker/allocator.hpp>
 #include <baker/node.hpp>
 #include <baker/path.hpp>
+#include <baker/record_id.hpp>
 
 #include <cassert>
 #include <cstddef>
@@ -56,6 +57,16 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+
+// values() is in every walk's inner loop: inlined even where the caller is too large for the
+// compiler to inline it on its own.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define BAKER_DETAIL_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define BAKER_DETAIL_INLINE [[gnu::always_inline]] inline
+#else
+#define BAKER_DETAIL_INLINE inline
+#endif
 
 namespace baker {
 
@@ -410,6 +421,13 @@ struct Resolved {
 };
 enum class ResolveStatus : uint8_t { Ok, Missing, Malformed };
 [[nodiscard]] ResolveStatus resolve(const Array& root, const Path& path, Resolved& out) noexcept;
+// resolve() over one layer's own tree, where a renamed record may be spelled by an alias:
+// a segment the layer lacks is retried with the (@aka ...) names of the record at
+// that prefix in `merged` (the stack's merged tree; null: no retry). `spelled`, if given,
+// gets the path as the layer spells it.
+[[nodiscard]] ResolveStatus resolve_in_layer(const Array& layer, const Path& path,
+                                             const Array* merged, Resolved& out,
+                                             Path* spelled = nullptr);
 // get(path) on `root` failed; re-walks the path to say where and why. `values`, if given,
 // are the evaluated values that did not convert.
 [[nodiscard]] Error get_error(const Array& root, const Path& path, const ConvertInfo* info,
@@ -549,7 +567,7 @@ public:
     // (color 0.9 0.5 0.2 (@range 0 1)) is three numbers to every reader; the boundary is
     // kept in flags_ by finish(), set() and sort_for_lookup(), so this is a compare and a
     // subspan.
-    [[nodiscard]] Values values() const noexcept {
+    [[nodiscard]] BAKER_DETAIL_INLINE Values values() const noexcept {
         // No metadata first, the common case, as one test; then a boundary the 13 bits hold.
         if (const uint32_t m = flags_ >> kMetaShift) {
             const uint32_t end = m != kMetaFar ? m : meta_first_far();
@@ -563,6 +581,9 @@ public:
         const uint32_t m = meta_first();
         return m ? Metadata(data() + m, end()) : Metadata();
     }
+    // This record's identity, its (@id ...) (<baker/record_id.hpp>); empty for none, or
+    // one that is malformed (id_validator reports those).
+    [[nodiscard]] RecordId record_id() const noexcept;
     // The metadata child tagged `tag` ("@range"), or null: a scan of the tag run from the
     // first metadata child, as try_find scans from the start.
     [[nodiscard]] const Array* meta(Symbol tag) const noexcept {
@@ -987,3 +1008,5 @@ template <class... Ts>
 }
 
 }  // namespace baker
+
+#undef BAKER_DETAIL_INLINE  // used above only

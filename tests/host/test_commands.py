@@ -7,6 +7,7 @@ CTest runs it. Each case works on a fresh copy, so the stack's own files are nev
 Exits 1 on a failure.
 """
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -72,13 +73,48 @@ def check(s):
     expect(code == 0, "the local layer is left out (its value would fail the shape)")
 
 
+def views(s):
+    """The views the game compiled, against the stack's shapes."""
+    code, out, err = s.run("check", agent="")
+    r = json.loads(out)
+    expect(code == 0 and not any("regenerate the views" in w["message"] for w in r["shape_warnings"]),
+           "a game whose views match its shapes passes check with no view warning")
+    default = s.dir / "data" / "default.dta"
+    text = default.read_text()
+    default.write_text(text.replace("(lives int)", "(lives int (@cxx int64))"))
+    code, out, err = s.run("check", agent="")
+    r = json.loads(out)
+    expect(code == 0 and any("regenerate the views" in w["message"] for w in r["shape_warnings"]),
+           f"a shape whose layout moved is a shape warning: {err}")
+    expect("view warning:" in err, "and is printed as one")
+    code, out, err = s.run("check", "--baker-strict-views", agent="")
+    r = json.loads(out)
+    expect(code == 1 and any("regenerate the views" in e["message"] for e in r["shape_errors"]),
+           f"--baker-strict-views makes it an error: {err}")
+    default.write_text(text)
+
+
+def aliases(s):
+    """An (@aka old) nothing names is a finding; a layer naming it merges into the record."""
+    code, out, err = s.run("check", agent="")
+    r = json.loads(out)
+    expect(code == 0 and any("alias 'hero' of player is named by no layer" in f["message"]
+                             for f in r["findings"]), f"an unused alias is a finding: {err}")
+    code, out, _ = s.run("check", agent="(hero (speed 4))\n")
+    r = json.loads(out)
+    expect(code == 0 and not any("alias 'hero'" in f["message"] for f in r["findings"]),
+           "a layer that names the old key uses the alias")
+    code, out, _ = s.run("eval", "{config.get player.speed}", agent="(hero (speed 4))\n")
+    expect(code == 0 and out == "4\n", f"and merges into the renamed record: {out!r}")
+
+
 def reference(s):
     code, out, _ = s.run("reference", "--baker-json", agent="")
     r = json.loads(out)
     names = [f["name"] for f in r["reference"]["functions"]]
     expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.5" and "spawn" in names,
            "reference --baker-json: the game's functions")
-    expect(r["shapes"]["schema"] == "baker.shapes/1.5" and r["tweaks"]["schema"] == "baker.tweaks/1.5",
+    expect(r["shapes"]["schema"] == "baker.shapes/1.8" and r["tweaks"]["schema"] == "baker.tweaks/1.6",
            "reference --baker-json: tweaks and shapes")
     code, out, _ = s.run("reference")
     expect(code == 0 and "spawn" in out, "reference: Markdown")
@@ -140,7 +176,7 @@ def format_files(s):
            "format --baker-check lists an unformatted file and changes nothing")
     code, out, _ = s.run("format", "--baker-json", "data/messy.dta")
     r = json.loads(out)
-    expect(code == 0 and r["schema"] == "baker.format/1" and r["files"][0]["changed"]
+    expect(code == 0 and r["schema"] == "baker.format/1.1" and r["files"][0]["changed"]
            and len(r["files"][0]["edits"]) >= 2 and messy.read_text() == text,
            "format --baker-json gives the edits and changes nothing")
     code, _, _ = s.run("format", "data/messy.dta")
@@ -152,10 +188,167 @@ def format_files(s):
     expect(code in (0, 1), "with no files, format takes the stack's own files")
 
 
+def renames(s):
+    """A field under a name its shape renamed: check warns, format rewrites it."""
+    shape = "#shape (player (lives int (@renamed_from hp)))\n"
+    code, out, err = s.run("check", agent=shape + "(player (hp 5))\n")
+    r = json.loads(out)
+    expect(code == 1 and any("'hp' was renamed 'lives', and the record has both" in e["message"]
+                             for e in r["shape_errors"]),
+           f"the base's new name and an overlay's old one: an error naming both: {err}")
+    default = s.dir / "data" / "default.dta"
+    text = default.read_text()
+    default.write_text(text.replace("(lives 3)", "(hp 3)"))
+    code, out, err = s.run("check", agent=shape)
+    r = json.loads(out)
+    expect(code == 0 and any("'hp' is now 'lives' (format rewrites it)" in w["message"]
+                             for w in r["shape_warnings"]), f"the old name alone is a warning: {err}")
+    code, out, _ = s.run("format", "--baker-json", "data/default.dta", agent=shape)
+    r = json.loads(out)
+    expect(code == 0 and r["files"][0]["rewrites"] == 1 and "(hp 3)" in default.read_text(),
+           "format --baker-json counts the rewrite and changes nothing")
+    code, out, _ = s.run("format", "--baker-check", "data/default.dta", agent=shape)
+    expect(code == 1 and "default.dta" in out, "--baker-check lists a file a rename would change")
+    code, out, err = s.run("format", "data/default.dta", agent=shape)
+    expect(code == 0 and "(lives 3)" in default.read_text() and "(hp 3)" not in default.read_text()
+           and "; how fast" in default.read_text(), f"format rewrites the old name, keeping the rest: {err}")
+    code, out, _ = s.run("check", agent=shape)
+    r = json.loads(out)
+    expect(code == 0 and not r["shape_warnings"], "after which check is quiet")
+    default.write_text(text)
+
+
+def tables(s):
+    """The game's baked tables register with each command's Config; a record a table cannot read fails check."""
+    code, out, err = s.run("check", agent="(pets (dog (hp {heal})))\n")
+    r = json.loads(out)
+    expect(code == 1 and any("'hp'" in e["message"] and e.get("path") == "pets.dog"
+                             for e in r["shape_errors"]),
+           f"a view field that is not a literal is a shape error from the table's build: {err} {out}")
+    code, out, _ = s.run("check", agent="(pets (cat (hp 2)))\n")
+    expect(code == 0, "a record a table reads whole passes")
+
+
+def assets(s):
+    """assets: every asset the stack names, baker.assets/1; check fails on a missing one."""
+    code, out, err = s.run("assets", agent="")
+    r = json.loads(out)
+    expect(code == 0 and r["schema"] == "baker.assets/1" and len(r["assets"]) == 1
+           and r["assets"][0]["from"]["path"] == "player.model" and r["assets"][0]["kind"] == "mesh"
+           and r["assets"][0]["target"] == "assets/hero.glb" and r["assets"][0]["exists"]
+           and r["assets"][0]["from"]["file"].endswith("default.dta") and r["assets"][0]["from"]["id"] == "",
+           f"assets lists the edge, found by listing its directory: {out} {err}")
+    code, out, err = s.run("assets", agent="(player (model \"assets/none.glb\"))\n")
+    r = json.loads(out)
+    expect(code == 1 and not r["assets"][0]["exists"] and r["assets"][0]["from"]["file"].endswith("agent.dta"),
+           f"a file that is not there: exists false, exit 1, from the layer that names it: {out}")
+    code, out, err = s.run("check", agent="(player (model \"assets/none.glb\"))\n")
+    r = json.loads(out)
+    expect(code == 1 and any('asset "assets/none.glb" of player.model is not there' in e["message"]
+                             for e in r["shape_errors"]), f"check fails on it: {err}")
+    code, out, err = s.run("check", agent="(player (model \"assets/hero.obj\"))\n")
+    r = json.loads(out)
+    expect(code == 1 and any('not a mesh (.glb)' in e["message"] for e in r["shape_errors"]),
+           f"an extension the kind does not list: {err}")
+    code, out, err = s.run("check", agent="#shape (player (icon (asset texture) (@optional)))\n"
+                                           "(player (icon \"assets/hero.glb\"))\n")
+    r = json.loads(out)
+    expect(code == 1 and any("declares no kind 'texture'" in e["message"] for e in r["shape_errors"]),
+           f"a kind the project does not declare: {err}")
+
+
+def bake(s):
+    """bake --baker-stack writes the contract layers and the tables as one image a Config opens."""
+    code, out, err = s.run("bake", "--baker-stack", "game.datb", agent="(player (speed 9))\n")
+    image = s.dir / "game.datb"
+    expect(code == 0 and "wrote game.datb: 1 layers, 1 tables" in out and image.stat().st_size > 64,
+           f"bake writes the image of the contract layers alone: {out} {err}")
+    expect(image.read_bytes()[:10] == b"MOIRA.IMG1", "a stack image")
+    # The game opens it in place of the layers' text: the base layer's values come from the image.
+    (s.dir / "data" / "default.dta").write_text("(player (speed 1) (lives 1) (model \"assets/hero.glb\"))\n")
+    code, out, err = s.run("eval", "{config.get player.speed}", "--image", "game.datb", agent="")
+    expect(code == 0 and out == "3.5\n", f"the image's layer, not the file's: {out!r} {err}")
+    code, out, err = s.run("check", "--image", "game.datb", agent="")
+    r = json.loads(out)
+    expect(code == 0 and r["passed"], f"check with the image passes, its tables taken from it: {err}")
+    code, _, err = s.run("bake", agent="")
+    expect(code == 2 and "--baker-stack" in err, "bake needs the file to write")
+
+
+def rename(s):
+    """rename OLD NEW: the key in the declaring layer, (@aka OLD), an ID, and every key_of."""
+    if sys.argv[3:] == ["shipping"]:
+        return  # refuses there, as `shipping` checks
+    default = s.dir / "data" / "default.dta"
+    text = default.read_text()
+    added = ("#shape (wave (@at waves2) (@keyed) (foe (key_of foes)) (also (list (key_of foes)) (@optional)))\n"
+             "(foes (grunt (hp 1)) (brute (@id a0000000000000000000000000000002) (hp 2)))\n"
+             "(waves2 (first (foe grunt)) (second (foe brute) (also grunt brute grunt)))\n")
+    default.write_text(text + added)
+    agent = "(waves2 (third (foe grunt)))\n(foes (grunt (hp 5)))\n"
+    code, out, err = s.run("rename", "foes.grunt", "runt", agent=agent)
+    expect(code == 0 and "rerun with --baker-write" in out and default.read_text() == text + added
+           and "grunt -> runt" in out and "(@aka grunt)" in out and "(@id " in out
+           and out.count("(foe ...): grunt -> runt") == 2 and "(also ...): grunt -> runt" in out,
+           f"a dry run lists the edits and writes nothing: {out} {err}")
+    code, out, err = s.run("rename", "foes.grunt", "runt", "--baker-write", agent=agent)
+    after = default.read_text()
+    expect(code == 0 and "(runt (@id " in after and "(@aka grunt)" in after and "(foe runt)" in after
+           and "(also runt brute runt)" in after and "(brute (@id a0000000000000000000000000000002)" in after,
+           f"--baker-write: the key, its alias and ID, and every reference: {after}")
+    expect(re.search(r"\(runt \(@id [a-f][0-9a-f]{31}\) \(hp 1\) \(@aka grunt\)\)", after) is not None,
+           f"the ID after the key, the alias after the last child: {after}")
+    agent_text = (s.dir / "data" / "agent.dta").read_text()
+    expect("(foe runt)" in agent_text and "(foes (grunt (hp 5)))" in agent_text,
+           f"an overlay's reference is rewritten; its record keeps the old key, which the alias resolves: {agent_text}")
+    code, out, _ = s.run("check", agent=agent)
+    r = json.loads(out)
+    expect(code == 0 and not r["shape_errors"], f"after which the stack checks clean: {out}")
+    code, out, _ = s.run("eval", "{config.get foes.runt.hp}", agent=agent)
+    expect(code == 0 and out == "5\n", f"and the overlay merges into the renamed record: {out!r}")
+    # Refusals: a key taken, an alias taken, a record that is not there, a bad key.
+    code, _, err = s.run("rename", "foes.runt", "brute", agent=agent)
+    expect(code == 2 and "'brute' is already a key of foes" in err, "a key a sibling has")
+    code, _, err = s.run("rename", "foes.brute", "grunt", agent=agent)
+    expect(code == 2 and "'grunt' is an alias of 'runt'" in err, "a key that is a sibling's alias")
+    code, _, err = s.run("rename", "foes.nosuch", "x", agent=agent)
+    expect(code == 2 and "no record 'foes.nosuch'" in err, "a record the stack lacks")
+    code, _, err = s.run("rename", "foes.runt", "two words", agent=agent)
+    expect(code == 2 and "is not a key" in err, "a key that is not one symbol")
+    code, _, err = s.run("rename", "foes.runt", agent=agent)
+    expect(code == 2 and "rename takes OLD" in err, "the arguments")
+    default.write_text(text)
+
+
+def mint_ids(s):
+    """format --baker-mint-ids TABLE: an ID for each record without one, in its declaring layer."""
+    default = s.dir / "data" / "default.dta"
+    text = default.read_text()
+    default.write_text(text + "(foes (grunt (hp 1)) (brute (@id a0000000000000000000000000000001) (hp 2))"
+                       " (copy (@id a0000000000000000000000000000001) (hp 2)) (@desc \"the foes\"))\n")
+    code, out, err = s.run("format", "--baker-mint-ids", "foes", "--baker-json", agent="(foes (grunt (hp 9)))\n")
+    r = json.loads(out)
+    by_file = {f["file"].rsplit("/", 1)[-1]: f for f in r["files"]}
+    expect(code == 0 and by_file["default.dta"]["rewrites"] == 2 and by_file["agent.dta"]["rewrites"] == 0,
+           f"two records need an ID: the one without, and the copy; the overlay none: {err} {out}")
+    code, out, err = s.run("format", "--baker-mint-ids", "foes", agent="(foes (grunt (hp 9)))\n")
+    after = default.read_text()
+    ids = re.findall(r"\(@id ([0-9a-f]{32})\)", after)
+    expect(code == 0 and len(ids) == 3 and len(set(ids)) == 3 and ids[1] == "a0000000000000000000000000000001"
+           and all(i[0] in "abcdef" for i in ids), f"each record has its own ID, the brute keeps its: {after}")
+    expect("(grunt (@id " in after and "(@desc \"the foes\")" in after, "written after the key; metadata is no record")
+    expect("(@id" not in (s.dir / "data" / "agent.dta").read_text(), "the overlay's record is not the declaring one")
+    code, out, err = s.run("format", "--baker-mint-ids", "foes", agent="")
+    expect(code == 0 and default.read_text() == after, "minted once, a second run changes nothing")
+    code, _, err = s.run("format", "--baker-mint-ids", "nosuch", agent="")
+    expect(code == 2 and "no layer of the stack has a table 'nosuch'" in err, "a table no layer has")
+    default.write_text(text)
+
+
 def shipping(s):
     """Under BAKER_SHIPPING, the commands that write refuse; the others run."""
-    for command in ("diff", "promote"):
-        code, _, err = s.run(command)
+    for command in ("diff", "promote", "rename"):
+        code, _, err = s.run(command, "a.b", "c")
         expect(code == 2 and "shipping" in err, f"shipping: {command} refuses")
 
 
@@ -250,7 +443,7 @@ def main():
         print(__doc__)
         return 2
     writes = shipping if sys.argv[3:] == ["shipping"] else diff_and_promote
-    for case in (check, reference, eval_json, writes, host_io, scenarios, command_line,
+    for case in (check, views, aliases, renames, mint_ids, rename, assets, tables, bake, reference, eval_json, writes, host_io, scenarios, command_line,
                  format_files):
         case(Stack(sys.argv[1], sys.argv[2]))
     print(f"{len(FAILURES)} failures" if FAILURES else "all passed")

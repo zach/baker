@@ -29,7 +29,9 @@ TEST_CASE("the kit reads its --baker- flags and leaves the game's alone") {
     CHECK(line->seed_last == 4);
     CHECK(line->step_hz == 60);  // --step-hz is the game's, not the kit's
     CHECK(line->json);
+    CHECK_FALSE(line->strict_views);
     CHECK(line->project == "data");
+    CHECK(parse({"check", "--baker-strict-views"})->strict_views);
     REQUIRE(line->commands.size() == 1);
     CHECK(line->commands[0] == "{+ 1 2}");
     CHECK(rest(*line) == std::vector<std::string>{"--seed", "9", "--step-hz", "30", "--json"});

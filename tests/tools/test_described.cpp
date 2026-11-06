@@ -381,3 +381,21 @@ TEST_CASE("a described curve tweak holds data to a curve, and its range to each 
     CHECK(findings("(falloff (0 1) (0 0.5))").size() == 1);  // x not ascending
     CHECK(findings("(falloff wobbly (0 1))").size() == 1);
 }
+
+TEST_CASE("a described tweak the data may leave out is not missing to the tool's check") {
+    if constexpr (kShipping) return;  // a shipping build keeps no flag
+    TweakRegistry tool;
+    DescribedTweaks described(tool);
+    REQUIRE(described.add({.path = "cards.fireball.cost",
+                           .type = "int32",
+                           .default_text = "3",
+                           .range = {0, 10},
+                           .optional = true}));
+    REQUIRE(described.add({.path = "world.gravity", .type = "float32", .default_text = "9.8"}));
+    const TweakFindings found = check_tweaks(*ok(read_string("(world)\n", "d.dta")), tool);
+    REQUIRE(found.warnings.size() == 1);
+    CHECK(std::string(found.warnings[0].message()).find("world.gravity") != std::string::npos);
+    const TweakFindings wrong = check_tweaks(
+        *ok(read_string("(cards (fireball (cost 11)))\n(world (gravity 9.8))\n", "d.dta")), tool);
+    CHECK(wrong.errors.size() == 1);  // a value it does supply is still held to the range
+}

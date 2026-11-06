@@ -45,7 +45,7 @@ TEST_CASE("check_layer reports the effect and changes nothing") {
     CHECK(r.ok());
     REQUIRE(r.effect.size() == 1);
     CHECK(r.effect[0].path == Symbol("shop.sword.price"));
-    CHECK(to_string(r.effect[0].value) == "8");
+    CHECK(to_string(r.effect[0].values) == "8");
     CHECK(to_string(*r.effect[0].below) == "10");
     CHECK(r.effect[0].source.layer == Symbol("balance"));
     CHECK(r.effect[0].below_source->layer == Symbol("default"));

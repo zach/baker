@@ -7,9 +7,11 @@
 // The kit's flags begin --baker-, so they never take a name the game's own flags use; any
 // other flag is the game's.
 //
-//   check                          baker.check/1.5 JSON; exit 1 on an error, a load
+//   check [--baker-strict-views]   baker.check/1.5 JSON; exit 1 on an error, a load
 //                                  problem, a shape error, or a call to an undefined
-//                                  function
+//                                  function; a view the game compiled against another
+//                                  layout of its shape is a shape warning, and with
+//                                  --baker-strict-views an error (CommandHooks::views)
 //   reference [--baker-json]       the script vocabulary, as Markdown; --baker-json:
 //                                  {"reference", "tweaks", "shapes"}, Baker's three documents
 //   diff [--baker-layer L] [--baker-rows]
@@ -65,6 +67,7 @@
 #include <baker/parse.hpp>
 #include <baker/project.hpp>
 #include <baker/script.hpp>
+#include <baker/view.hpp>
 
 #include <cstdint>
 #include <string_view>
@@ -78,6 +81,7 @@ inline constexpr int kCommandError = 2;
 struct CommandLine {
     std::string_view command;          // argv[1]
     std::string_view project;          // --baker-project PATH; the host may set it
+    bool strict_views = false;         // --baker-strict-views: a view's drift fails check
     std::string_view patch_root;       // a patch's names are relative to this directory;
                                        // empty: the project file's
     std::string_view layer = "agent";  // diff --baker-layer, promote --baker-from
@@ -94,6 +98,8 @@ struct CommandLine {
     bool write = false;                // promote --baker-write
     bool rows = false;                 // diff and promote --baker-rows: the change as rows
     bool check = false;                // format --baker-check: change nothing, list what would
+    std::string_view mint;             // format --baker-mint-ids TABLE: an ID for each record
+    std::string_view stack;            // bake --baker-stack FILE: the stack image to write
     List<std::string_view> commands;   // eval's {commands}
     List<std::string_view> rest;       // every argument the kit does not read, in order
 };
@@ -112,6 +118,13 @@ struct CommandHooks {
     Callback<void(Context&)> unbind{};
     // Reads the game's structured data, as Live's `changed`.
     Callback<void(const Config&)> changed{};
+    // The views the game compiled (the generated kViews): check compares each with
+    // the shape the project's contract layers declare, and reports one generated from
+    // another layout as a shape warning, or an error under --baker-strict-views.
+    std::span<const ViewInfo> views{};
+    // Registers the game's baked tables (the generated register_tables) with each
+    // command's Config before its load, so check reports a record a table cannot bake.
+    Callback<Expected<void>(Config&)> tables{};
     // Resets the game's state with a seed, before eval runs its commands and before each
     // run of a scenario.
     Callback<void(Context&, uint64_t seed)> reset{};
@@ -122,6 +135,9 @@ struct CommandHooks {
     // them reading, which check reports as a load problem. The project's scenarios and
     // objectives are checked without it.
     Callback<Expected<List<Ref<Array>>>(const Config&)> extra_trees{};
+    // How each command's Config is made: its caches, its stack image. The defaults
+    // read text.
+    ConfigOptions config = ConfigOptions{.tweaks = nullptr};
     // The stack when there is no project file, and how it opens: a check or a simulation
     // leaves out one person's own layer (`.skip = {"local"}`).
     const Project* built = nullptr;

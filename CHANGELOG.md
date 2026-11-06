@@ -3,6 +3,81 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.8.0 - 2026-11-06
+
+This release generates C++ from your shapes: structs and readers for your tables (views),
+tables baked from the merged data and read by index (baked tables), and record IDs that
+survive a rename. It also changes how the layer tools report a row's values, and replaces
+0.7.0's two migration tools with one (see **Breaking**).
+
+- **Breaking: `baker_migrate` replaces `baker_migrate_metadata` and
+  `baker_migrate_declarations`.** One tool runs both of 0.7.0's migrations in one pass, so
+  their order no longer matters: `baker_migrate --write $(git ls-files '*.dta')`. `--only
+  metadata` or `--only declarations` runs one, `--check` exits 1 if anything would change
+  (for CI or a pre-commit hook), and `--report`, `--cpp` and `--md` work as before. If you
+  ran the two 0.7.0 tools declarations first, a shape's metadata was left unmigrated: run
+  `baker_migrate` again.
+- **Breaking: a layer row's values come one node each.** `LayerEffectEntry::values` and
+  `below`, `ExplainEntry::values` and `DiffEntry::a` and `b` are a `RowValues` (`nodes()`,
+  `size()`, `[i]`, iteration) in place of one packed node, so `(aim (0 0))`, one value, and
+  `(aim 0 0)`, two, are told apart, and an appended record is one operand.
+  `to_string(RowValues)` in `<baker/std_interop.hpp>` prints them as a row writes them. The
+  console's `config.effect`, `config.explain` and `config.diff` write one child a value,
+  `(value (0 0))` against `(value 0 0)`; `config.get` is unchanged.
+- **New: views.** A shape marked `(@view)` generates a C++ struct, its reader and a digest
+  of its layout, so a table's layout is written once, in the data.
+  `baker_generate_views(target PROJECT baker-project.dta)` in CMake runs
+  `baker_bake --views` whenever a contract file changes; `read_view<T>(cfg, path)` reads a
+  record with located errors; and `check` reports a struct compiled against another
+  layout (`--baker-strict-views` fails on it). `(@view no)` keeps a field in the tree,
+  `(@cxx T)` picks a member's C++ type and `(@cxx_name N)` its name; the project file's
+  `(views (layers ...) (shapes ...) (namespace ...))` names the contract.
+- **New: baked tables.** `Table<T>` holds a viewed, keyed shape's records as plain structs,
+  rebuilt from the merged data at each change and read by index, key, path, record ID or
+  parent: a read by index is a load. `add_table<T>` registers one, or the generated
+  `register_tables` registers every table. A stack image (`bake --baker-stack` in the host
+  kit, `write_stack_image`, `ConfigOptions::stack_image`) ships the contract layers and the
+  tables in one file. Fields hold literals; a field that is not a literal reads as its
+  default, with an error.
+- **New: record identity.** `(@id ...)` gives a record an ID of 32 hex digits, minted by
+  `format --baker-mint-ids TABLE`; `Array::record_id()`, `find_by_id`, and `id_validator`
+  (two records, one ID). A renamed record keeps answering to its old key with
+  `(@aka old)`, in overlays and `key_of`, and `check` lists an alias nothing names. `rename
+  OLD NEW [--baker-write]` renames a key, its alias, its ID and every `key_of` naming it. A
+  shape field may say `(@renamed_from old)`, which `check` checks, views read and `format`
+  rewrites.
+- **New: assets.** An `(asset KIND)` shape field names a file; the project's `(assets
+  (texture ".png") ...)` says which kinds exist, `check` fails on a missing file, and the
+  host kit's `assets` command writes `baker.assets/1`.
+- **New: migrations as a call.** `tools::migrate_text(text, sink)` in
+  `<baker/tools/migrate.hpp>` returns each old form in Baker text with its location, a
+  warning worded as `check` words it, and the edits that rewrite it, which never overlap:
+  for an editor's quick fix, a CI step, or an agent writing from older examples.
+  `apply_findings` applies one finding or several. 2 MB takes about 25 ms.
+- **New: tweaks the data may leave out.** `TweakMeta::optional`: `check_tweaks` no longer
+  warns that the data lacks the tweak, and still holds a value the data supplies to its
+  type and range. For a host that binds its own content's values as tweaks so layers can
+  retune them by name. `baker.tweaks/1.6` carries it.
+- **New: a check of a layer that folds a list.** A layer over a list written as records
+  that repeat a tag, `(opening (build infantry) (build infantry) (build tank))`, merges
+  into the first record only, so the stack reads the old list. A layer check and `check`
+  now warn at the layer's row, naming the path and tag, and say to write the list as plain
+  values or extend it with `#append` and `#drop`. `LayerEffectEntry::folded` and
+  `DiffEntry::folded_a`/`folded_b` count the rows that folded. Merging is unchanged; the
+  check is compiled out of shipping builds.
+- **New: the list a verb changes.** Under `#append` or `#drop`, a layer row's `below` is
+  the list the verb changes, records included, with the source of the row that wrote it,
+  and a `(@was ...)` pin and the verbs' warnings are judged against it. It was empty for a
+  list of records.
+- **Changed:** `baker_bake` is built whenever the library is; `BAKER_BUILD_TOOLS` covers
+  the rest. Schemas: `baker.shapes/1.8` (`view`, `cxx`, `cxx_name`, `renamed_from`,
+  `asset`), `baker.format/1.1` (`rewrites`), `baker.tweaks/1.6` (`optional`), and the new
+  `baker.assets/1`. `CommandHooks::tables` and `CommandHooks::config` in the host kit.
+- **Faster.** A push checked by the shape validator costs what it did in 0.6.0 again (0.7.0
+  added about 16%); a layer check in a shipping build takes about 4% fewer instructions.
+- **Fixed.** On Windows, `baker_migrate` writes what it migrated byte for byte (a text-mode
+  stdout doubled a CRLF file's line ends).
+
 ## 0.7.0 - 2026-10-31
 
 This release changes how data spells metadata and declarations. Migrate your data with the

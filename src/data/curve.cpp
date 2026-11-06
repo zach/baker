@@ -2,6 +2,8 @@
 
 #include <baker/curve.hpp>
 
+#include "curve_access.hpp"
+
 #include <cmath>
 
 namespace baker {
@@ -40,18 +42,6 @@ double hermite(double x0, double y0, double m0, double x1, double y1, double m1,
 }
 
 }  // namespace
-
-// Its friend, so read_curve can set a curve's view of the nodes.
-struct CurveReader {
-    static void set(Curve& c, const Node* nodes, uint32_t size, CurveMode mode,
-                    CurveExtend extend) noexcept {
-        c = Curve();
-        c.nodes_ = nodes;
-        c.size_ = size;
-        c.mode_ = mode;
-        c.extend_ = extend;
-    }
-};
 
 CurveProblem read_curve(const Values& values, Curve& out) noexcept {
     const CurveNames& n = curve_names();

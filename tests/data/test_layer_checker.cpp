@@ -41,7 +41,7 @@ void no_free_items(const ValidatorStack& stack, const Callback<void(const Error&
 std::string summary(const LayerReport& r) {
     std::string out;
     for (const LayerEffectEntry& e : r.effect) {
-        out += std::string(e.path.str()) + " " + to_string(e.value);
+        out += std::string(e.path.str()) + " " + to_string(e.values);
         if (e.below) out += " below " + to_string(*e.below);
         if (e.below_source)
             out += " from " + std::string(e.below_source->layer.str()) + ":" +

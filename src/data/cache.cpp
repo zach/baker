@@ -709,10 +709,13 @@ Ref<Array> record_of(const LoadSession& s) {
                         s.drop_metadata ? without_notes(d.form) : Node(d.form)};
         shapes.push_back(list(entry));
     }
+    // (aliases N): how many arrays of the load carry an (@aka ...), which the merge reads;
+    // a replay parses nothing, so the record says it.
+    Vec<Node> aliases{Node(Symbol("aliases")), Node(int64_t{A::aliases(s)})};
     Vec<Node> meta{list(files),   list(before),      list(define),  list(undefine),
                    list(autorun), list(required),    list(require), list(levels),
                    list(packs),   list(macro_packs), list(origins), list(definitions),
-                   list(shapes)};
+                   list(shapes),  list(aliases)};
     return Array::make_from({meta.data(), meta.size()});
 }
 
@@ -778,6 +781,11 @@ bool fresh(const Array& meta, LoadSession& s) {
 // Leaves the session as the recorded load left it.
 void replay(const Array& meta, LoadSession& s) {
     const size_t packs_before = s.packs().size();
+    {  // a cache written before the count was recorded counts as having aliases
+        const Array* a = meta.try_find("aliases");
+        const auto n = a && a->size() == 2 ? (*a)[1].try_int() : std::nullopt;
+        SessionAccess::set_aliases(s, n && *n >= 0 ? static_cast<uint32_t>(*n) : 1);
+    }
     if (const Array* d = meta.try_find("define"))
         for (uint32_t i = 1; i + 1 < d->size(); i += 2) {
             const Symbol name = (*d)[i].try_sym().value_or(Symbol());

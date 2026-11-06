@@ -25,7 +25,7 @@ std::string show(const ExplainEntry& e) {
     if (const auto slash = file.find_last_of('/'); slash != std::string::npos)
         file = file.substr(slash + 1);
     return std::string(e.layer.str()) + " " + kStanding[int(e.standing)] + " " +
-           to_string(e.value) +
+           to_string(e.values) +
            (file.empty() ? "" : " " + file + ":" + std::to_string(e.source.line));
 }
 
@@ -64,8 +64,8 @@ TEST_CASE("explain lists every layer that sets a path, bottom to top") {
           Lines({"default shadowed 2 default.dta:2", "local wins 3 local.dta:2"}));
     CHECK(chain(cfg, "box.height") ==
           Lines({"default shadowed 1 default.dta:3", "platform wins 5 platform.dta:1"}));
-    // A value of several nodes is packed, as layer_effect packs it.
-    CHECK(chain(cfg, "phase") == Lines({"default wins (10 20 30) default.dta:5"}));
+    // Several values, one after another, as layer_effect gives them.
+    CHECK(chain(cfg, "phase") == Lines({"default wins 10 20 30 default.dta:5"}));
     // An element of it, by position.
     CHECK(chain(cfg, "phase.1") == Lines({"default wins 20 default.dta:5"}));
 }
@@ -77,10 +77,10 @@ TEST_CASE("the contributor that wins is the one source() names, for every leaf")
     REQUIRE(cfg.push_layer(
         "dlc", dir.write("dlc.dta", "(box (width 4) (depth 9))\n(cheats (noclip #remove))\n")));
     REQUIRE(cfg.push_layer("patch", dir.write("patch.dta", "(box (depth 7))\n(phase 1 2)\n")));
-    // Each leaf, and the value get() returns for it, packed as explain packs it.
+    // Each leaf, and the values get() returns for it.
     const std::pair<const char*, const char*> leaves[] = {
         {"box.width", "4"}, {"box.height", "1"}, {"box.depth", "7"}, {"cheats.god_mode", "1"},
-        {"phase", "(1 2)"}, {"phase.0", "1"},    {"phase.1", "2"}};
+        {"phase", "1 2"},   {"phase.0", "1"},    {"phase.1", "2"}};
     for (const auto& [p, value] : leaves) {
         CAPTURE(p);
         const auto entries = explain(cfg, p);
@@ -96,7 +96,7 @@ TEST_CASE("the contributor that wins is the one source() names, for every leaf")
         CHECK(winner->layer == s.layer);
         CHECK(winner->source.file == s.file);
         CHECK(winner->source.line == s.line);
-        CHECK(to_string(winner->value) == value);
+        CHECK(to_string(winner->values) == value);
     }
     CHECK(cfg.root()->get<int>("box.width") == 4);
     CHECK(cfg.root()->get<int>("phase.1") == 2);

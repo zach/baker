@@ -8,6 +8,7 @@
 #include <baker/tools/console.hpp>
 #include <baker/tools/std_tools.hpp>
 
+#include "dev_only.hpp"
 #include "temp_dir.hpp"
 
 #include <string>
@@ -64,6 +65,12 @@ TEST_CASE("the reading tools: get, source, explain, layers, effect, diff") {
               "\") (line 1) (shadowed 0)))");
     CHECK(eval(f.ctx, "{config.diff default local}").find("((path box.width) (a 2) (b 3))") !=
           std::string::npos);
+
+    // Values one child each: one array reads apart from two numbers.
+    REQUIRE(f.cfg.push_layer("pair", f.dir.write("pair.dta", "(pair (0 0))\n(two 0 0)\n")));
+    const std::string pair = eval(f.ctx, "{config.effect pair}");
+    CHECK(pair.find("((path pair) (value (0 0))") != std::string::npos);
+    CHECK(pair.find("((path two) (value 0 0)") != std::string::npos);
 
     // Failures are the Config's, located.
     CHECK_FALSE(f.ctx.eval("{config.get box.depth}", "test"));
@@ -182,4 +189,23 @@ TEST_CASE("curve.sample reads a path's curve and samples it") {
     CHECK(eval(f.ctx, "{curve.sample reward 9}") == "30.0");        // clamped
     CHECK_FALSE(f.ctx.eval("{curve.sample box.width 1}", "test"));  // not a curve
     CHECK_FALSE(f.ctx.eval("{curve.sample nosuch 1}", "test"));
+}
+
+BAKER_DEV_TEST_CASE("check warns of a layer that folds a list of same-tagged records") {
+    TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer(
+        "default", dir.write("default.dta", "(waves (wave (count 3)) (wave (count 5)))\n")));
+    REQUIRE(cfg.push_layer("mod", dir.write("mod.dta", "(waves (wave (count 9)))\n")));
+    Context ctx;
+    CheckReport report;
+    check(cfg, ctx, report);
+    REQUIRE(report.warnings.size() == 1);
+    CHECK(std::string(report.warnings[0].message()).find("'waves' below holds 2 (wave ...)") == 0);
+    CHECK(report.warnings[0].file() == Symbol(dir.path("mod.dta")));
+    // Without the layer, nothing folds and the check is quiet.
+    REQUIRE(cfg.remove_layer("mod"));
+    CheckReport alone;
+    check(cfg, ctx, alone);
+    CHECK(alone.warnings.empty());
 }

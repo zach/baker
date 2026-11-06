@@ -230,7 +230,7 @@ TEST_CASE("the check reports each verb, a stale pin, and operands that change no
     CHECK(fresh.warnings.empty());
     for (const LayerEffectEntry& e : fresh.effect) CHECK_FALSE(e.stale);
     CHECK(entry(fresh.effect, "menu.debug")->op == Symbol("#remove"));
-    CHECK(to_string(entry(fresh.effect, "cpu.easy.reaction")->value) == "26");
+    CHECK(to_string(entry(fresh.effect, "cpu.easy.reaction")->values) == "26");
 
     Config moved({.tweaks = nullptr});
     REQUIRE(moved.push_layer(
@@ -262,7 +262,7 @@ TEST_CASE("the check reports each verb, a stale pin, and operands that change no
     CHECK(r.effect[0].op == Symbol("#drop"));
     CHECK(r.effect[1].op == Symbol("#append"));
     CHECK(r.effect[1].path == Symbol("things"));
-    CHECK(to_string(r.effect[1].value) == "(lamp -2 4 0)");
+    CHECK(to_string(r.effect[1].values) == "(lamp -2 4 0)");
     CHECK(messages(r.warnings) ==
           std::vector<std::string>{"'items' has no z to drop",
                                    "'items' already has a; #append adds another"});

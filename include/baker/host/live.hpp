@@ -77,6 +77,9 @@ struct LiveOptions {
     Callback<void(const Config&)> changed{};
     // Warnings, validator findings, failed reloads and #autorun commands, as they happen.
     Callback<void(const Error&)> log{};
+    // Registers the game's baked tables with the Config before its load, the generated
+    // register_tables; a refusal fails the open.
+    Callback<Expected<void>(Config&)> tables{};
 };
 
 class Live {

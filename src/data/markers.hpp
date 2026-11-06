@@ -46,6 +46,15 @@ enum class Marker : uint8_t { None, Remove, Append, Drop };
     static const Symbol s("@was");
     return s;
 }
+// A record's identity, (@id ...), and the keys it still answers to, (@aka ...).
+[[nodiscard]] inline const Symbol& id_tag() {
+    static const Symbol s("@id");
+    return s;
+}
+[[nodiscard]] inline const Symbol& aka_tag() {
+    static const Symbol s("@aka");
+    return s;
+}
 
 // The verb of a layer row, in the form the parser takes: `#remove` as the one value, or
 // `#append`/`#drop` first with one or more operands, metadata after either. None for any

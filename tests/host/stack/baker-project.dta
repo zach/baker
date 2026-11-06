@@ -6,4 +6,6 @@
       (agent "data/agent.dta" optional))
    (tool "build/game")
    (scenarios "sim")
-   (objectives "metrics/objectives.dta"))
+   (objectives "metrics/objectives.dta")
+   (assets (mesh ".glb"))
+   (views (layers default) (namespace host_game)))

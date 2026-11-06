@@ -14,7 +14,7 @@ namespace {
 // first child array with the tag.
 class Finder {
 public:
-    explicit Finder(const Allocator& a) : wide_(a), keys_(a), found_(a) {}
+    explicit Finder(const Allocator& a) : wide_(a), keys_(a), found_(a), counts_(a), sorted_(a) {}
 
     [[nodiscard]] const Array* find(const Array& parent, Symbol tag) {
         if (parent.size() < kWide || tag.empty()) return parent.try_find(tag);
@@ -25,8 +25,56 @@ public:
             if (k == tag.id()) return found_[w.first + i];
         }
     }
+    // Whether two children of `parent` share a tag: the index's note past a short array, a
+    // scan of the tags of a short one. Most arrays repeat none, and need no count.
+    [[nodiscard]] bool repeats(const Array& parent) {
+        if (parent.size() >= kWide) {
+            for (const Wide& w : wide_)
+                if (w.array == &parent) return w.repeats;
+            // Not indexed yet, as a layer's own array is not: its tags sorted, which costs a
+            // fraction of an index it may never need.
+            sorted_.clear();
+            for (const Node& c : parent.nodes())
+                if (const Array* a = c.try_array(); a && !a->empty())
+                    if (const auto t = (*a)[0].try_sym()) sorted_.push_back(t->id());
+            std::sort(sorted_.begin(), sorted_.end());
+            return std::adjacent_find(sorted_.begin(), sorted_.end()) != sorted_.end();
+        }
+        Symbol seen[kWide];
+        size_t n = 0;
+        for (const Node& c : parent.nodes()) {
+            const Array* a = c.try_array();
+            if (!a || a->empty() || !(*a)[0].try_sym()) continue;
+            const Symbol t = *(*a)[0].try_sym();
+            for (size_t k = 0; k < n; ++k)
+                if (seen[k] == t) return true;
+            seen[n++] = t;
+        }
+        return false;
+    }
+    // How many children of `parent` are tagged `tag`, a row that composes or removes left
+    // out: through the index past a short array, which counts as it is built.
+    [[nodiscard]] uint32_t count(const Array& parent, Symbol tag) {
+        if (parent.size() < kWide || tag.empty()) {
+            uint32_t n = 0;
+            for (const Node& c : parent.nodes()) n += counts_as_row(c, tag) ? 1 : 0;
+            return n;
+        }
+        const Wide& w = index(parent);
+        for (uint32_t i = static_cast<uint32_t>(tag.hash()) & w.mask;; i = (i + 1) & w.mask) {
+            const void* k = keys_[w.first + i];
+            if (!k) return 0;
+            if (k == tag.id()) return counts_[w.first + i];
+        }
+    }
     // detail::resolve, through find().
+    const Array* merged = nullptr;  // the stack, for a renamed record's aliases
     [[nodiscard]] bool resolve(const Array& root, const Path& path, detail::Resolved& out) {
+        if (resolve_plain(root, path, out)) return true;
+        return merged &&
+               detail::resolve_in_layer(root, path, merged, out) == detail::ResolveStatus::Ok;
+    }
+    [[nodiscard]] bool resolve_plain(const Array& root, const Path& path, detail::Resolved& out) {
         if (!path.valid()) return false;
         Values v(root.nodes(), &root);
         const Array* arr = &root;
@@ -67,12 +115,22 @@ public:
             if (!is_tagged((*r.array)[i])) out.push_back((*r.array)[i]);
         return true;
     }
+    // list_nodes, through find(): the list a verb changes, records too.
+    bool list(const Array& root, const Path& path, Vec<Node>& out) {
+        out.clear();
+        detail::Resolved r;
+        if (path.empty() || last_is_index(path) || !resolve(root, path, r) || !r.array)
+            return false;
+        for (const Node& n : r.array->values()) out.push_back(n);
+        return true;
+    }
 
 private:
     static constexpr size_t kWide = 32;  // below this, the tag run's scan is as quick
     struct Wide {
         const Array* array;
         uint32_t first, mask;  // its slots in keys_ and found_
+        bool repeats;          // two children share a tag
     };
 
     const Wide& index(const Array& parent) {
@@ -80,15 +138,18 @@ private:
             if (w.array == &parent) return w;
         uint32_t cap = 64;
         while (cap < parent.size() * 2) cap *= 2;
-        const Wide w{&parent, static_cast<uint32_t>(keys_.size()), cap - 1};
+        Wide w{&parent, static_cast<uint32_t>(keys_.size()), cap - 1, false};
         keys_.resize(keys_.size() + cap, nullptr);
         found_.resize(found_.size() + cap, nullptr);
+        counts_.resize(counts_.size() + cap, 0);
         for (const Node& n : parent.nodes()) {
             const Array* child = n.try_array();
             const Symbol tag = child ? child->tag() : Symbol();
             if (tag.empty()) continue;
             uint32_t i = static_cast<uint32_t>(tag.hash()) & w.mask;
             while (keys_[w.first + i] && keys_[w.first + i] != tag.id()) i = (i + 1) & w.mask;
+            counts_[w.first + i] += counts_as_row(n, tag) ? 1 : 0;
+            w.repeats = w.repeats || keys_[w.first + i];
             if (keys_[w.first + i]) continue;  // the first child with the tag wins
             keys_[w.first + i] = tag.id();
             found_[w.first + i] = child;
@@ -97,9 +158,19 @@ private:
         return wide_.back();
     }
 
+    // A child tagged `tag` that merges by it: not metadata, not a row that composes or
+    // removes.
+    static bool counts_as_row(const Node& n, Symbol tag) {
+        const Array* c = n.try_array();
+        if (!c || !(*c)[0].is(tag) || tag.is_meta()) return false;
+        return !(c->has_marker() && (detail::composes(*c) || detail::is_removal(*c)));
+    }
+
     Vec<Wide> wide_;
     Vec<const void*> keys_;
     Vec<const Array*> found_;
+    Vec<uint32_t> counts_;
+    Vec<const void*> sorted_;  // repeats(): a scratch of tag ids
 };
 
 bool is_code(const Node& n) noexcept {
@@ -137,8 +208,8 @@ void find_code(const Array& a, Vec<Symbol>& tags, Vec<Error>& out) {
 
 // The metadata a data file's arrays carry, as Baker's readers spell them.
 bool known_metadata(Symbol tag) noexcept {
-    static const Symbol words[] = {"@range", "@step",  "@desc",   "@note",
-                                   "@kind",  "@group", "@one_of", "@was"};
+    static const Symbol words[] = {"@range", "@step",   "@desc", "@note", "@kind",
+                                   "@group", "@one_of", "@was",  "@id",   "@aka"};
     return std::find(std::begin(words), std::end(words), tag) != std::end(words);
 }
 
@@ -193,6 +264,10 @@ struct Basis {
     detail::MergeScratch& scratch;
     const Allocator& alloc;
 };
+
+// The layer's folds of a list of same-tagged records below it, defined below.
+void folds(Finder& finder, const Array& below, const Array& layer, size_t first, Vec<Symbol>& tags,
+           Vec<Error>& out);
 
 // The candidate `tree` (with a file layer's #autorun `commands`, read with `session`) on top
 // of the basis: its effect, the policy's refusals, and the validators' warnings,
@@ -263,14 +338,21 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
                                       m->file(), m->line()));
     const Array& stack = b.root;
     Finder finder(alloc);
+    // A list of same-tagged records the layer folds: for the tools, not a shipped game.
+    if constexpr (!kShipping) {
+        Vec<Symbol> tags(alloc);
+        folds(finder, stack, tree, 0, tags, warnings);
+    }
+    if (b.scratch.aliases) finder.merged = &stack;
     // supplier() and source_in(), through the finder: the enabled layer, from the top, whose
-    // own tree holds the value, and where.
-    auto below_source = [&](const Path& path) -> std::optional<Source> {
+    // own tree holds the value, and where. With `list`, the list a verb changes.
+    auto below_source = [&](const Path& path, bool list) -> std::optional<Source> {
         const bool index = last_is_index(path);
         for (size_t i = b.layers.size(); i-- > 0;) {
             detail::Resolved r;
             if (!finder.resolve(*b.layers[i], path, r)) continue;
-            if (!index && !(r.array && has_values(*r.array) && !detail::composes(*r.array)))
+            if (!index && !(r.array && (list ? !r.array->values().empty() : has_values(*r.array)) &&
+                            !detail::composes(*r.array)))
                 continue;
             const Array& holder = *r.values.source();
             Source s{b.names[i], holder.file(), holder.line()};
@@ -286,15 +368,18 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
     for (const Leaf& leaf : leaves_of(tree)) {
         const Path path(leaf.path);
         const bool removal = detail::is_removal(*leaf.holder);
-        const bool exists = finder.values(stack, path, below);
+        const bool verb = detail::composes(*leaf.holder);
+        const bool exists =
+            verb ? finder.list(stack, path, below) : finder.values(stack, path, below);
         LayerEffectEntry e{};
         e.path = Symbol(leaf.path);
-        e.value = pack(leaf.values);
+        e.values = RowValues({leaf.values.data(), leaf.values.size()});
+        e.folded = leaf.folded;
         e.op = op_of(*leaf.holder);
         e.source = Source{layer, leaf.holder->file(), leaf.holder->line()};
         if (exists) {
-            e.below = pack(below);
-            e.below_source = below_source(path);
+            e.below = RowValues({below.data(), below.size()});
+            e.below_source = below_source(path, verb);
         }
         if (leaf.holder->has_marker()) {  // a verb or a pin
             e.stale = stale(*leaf.holder, exists ? &below : nullptr);
@@ -335,13 +420,14 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
     for (const Declaration& d : decls) {
         LayerEffectEntry e{};
         e.path = d.name;
-        e.value = d.form;
+        e.values = RowValues({&d.form, 1});
         e.declares = d.directive;
         e.source = Source{layer, d.file, d.line};
         if (d.directive == Symbol("#shape"))
             for (const ShapeDecl& under : b.session.shapes())
                 if (under.form->tag() == d.name) {
-                    e.below = Node(under.form);
+                    const Node form(under.form);
+                    e.below = RowValues({&form, 1});
                     e.below_source = Source{Symbol(), under.file, under.line};
                 }
         effect.push_back(std::move(e));
@@ -509,6 +595,7 @@ struct LayerChecker::State {
     LoadSession session{alloc};
     Vec<Config::Validator> validators{alloc};  // the any_thread ones
     bool left_out = false;                     // and there were others
+    bool aliases = false;                      // some layer has an (@aka ...)
     std::atomic<uint32_t> refs{1};
 };
 
@@ -539,6 +626,7 @@ namespace {
 template <class F>
 auto on_state(const LayerChecker::State& st, F&& check) {
     detail::MergeScratch scratch(st.alloc);
+    scratch.aliases = st.aliases;
     Vec<const Config::Validator*> validators(st.alloc);
     for (const Config::Validator& v : st.validators) validators.push_back(&v);
     const Basis b{
@@ -591,6 +679,8 @@ LayerChecker Config::checker(const Allocator& allocator) const {
     st.generation = impl_->generation;
     st.root = root_;
     for (const LayerState& l : impl_->layers)
+        st.aliases = st.aliases || (l.options.enabled && l.aliases);
+    for (const LayerState& l : impl_->layers)
         if (l.options.enabled) {
             st.layers.push_back(l.root);
             st.names.emplace_back(l.name);
@@ -605,5 +695,78 @@ LayerChecker Config::checker(const Allocator& allocator) const {
     }
     return out;
 }
+
+namespace {
+
+// The children of `a` that are keys a layer merges by: tagged, not metadata, not a row that
+// composes or removes.
+bool merges_by_tag(const Node& n) {
+    const Array* c = n.try_array();
+    if (!c || c->tag().empty() || c->tag().is_meta()) return false;
+    return !(c->has_marker() && (detail::composes(*c) || detail::is_removal(*c)));
+}
+
+// `tags`: the keys down to `layer`, made a path only for a warning.
+void folds(Finder& finder, const Array& below, const Array& layer, size_t first, Vec<Symbol>& tags,
+           Vec<Error>& out) {
+    // Neither array repeating a tag, the usual case, each key needs only its record below.
+    // Asked at the first key: a leaf, (price 30), has none and costs nothing.
+    int8_t layer_repeats = -1, below_repeats = -1;
+    for (size_t i = first; i < layer.size(); ++i) {
+        if (!merges_by_tag(layer[i])) continue;
+        const Array& row = *layer[i].try_array();
+        const Symbol tag = row.tag();
+        if (layer_repeats < 0) {
+            layer_repeats = finder.repeats(layer) ? 1 : 0;
+            below_repeats = finder.repeats(below) ? 1 : 0;
+        }
+        if (layer_repeats == 1 && finder.find(layer, tag) != &row)
+            continue;  // counted at the first
+        const Array* under = finder.find(below, tag);
+        if (!under) continue;  // new to the stack: added whole
+        const uint32_t theirs = below_repeats == 1 ? finder.count(below, tag) : 1;
+        const uint32_t mine = layer_repeats == 1 ? finder.count(layer, tag) : 1;
+        bool values = false;  // a record of the layer's with values: folded, they overwrite
+        if (mine > 1 && theirs < 2)
+            for (size_t k = i; k < layer.size() && !values; ++k)
+                if (const Array* c = layer[k].try_array(); c && c->tag() == tag)
+                    values = has_values(*c);
+        tags.push_back(tag);
+        if (theirs > 1 || (mine > 1 && values)) {
+            Str path, at;
+            for (size_t k = 0; k < tags.size(); ++k) {
+                if (!at.empty()) at += '.';
+                detail::append_path_name(at, tags[k].str());
+                if (k + 2 == tags.size()) path = at;
+            }
+            const Str key = "(" + Str(tag.str()) + " ...)";
+            const Str where = path.empty() ? Str("the top level") : "'" + path + "'";
+            const Str why = theirs > 1
+                                ? where + " below holds " + detail::decimal(theirs) + " " + key +
+                                      ", and the layer's merges into the first of them"
+                                : "the layer writes " + detail::decimal(mine) + " " + key + " in " +
+                                      where + ", and each merges into the same record";
+            Error w = make_error(ErrorCode::Syntax,
+                                 why +
+                                     ": a list a layer changes is written as plain values, "
+                                     "restated whole, or extended with #append and #drop",
+                                 row.file(), row.line());
+            w.set_path(at.view());
+            out.push_back(std::move(w));
+        }
+        if (row.size() > 1 && under->size() > 1) folds(finder, *under, row, 1, tags, out);
+        tags.pop_back();
+    }
+}
+
+}  // namespace
+
+namespace config_internal {
+void fold_warnings(const Array& below, const Array& layer, Vec<Error>& out) {
+    Finder finder(default_allocator(MemoryKind::Config));
+    Vec<Symbol> tags;
+    folds(finder, below, layer, 0, tags, out);
+}
+}  // namespace config_internal
 
 }  // namespace baker

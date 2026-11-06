@@ -557,7 +557,7 @@ void layers_panel(baker::Config& cfg, LayersState& state) {
                         ImGui::Text("%s%s: %s -> %s", e.shadowed ? "(shadowed) " : "",
                                     e.path.c_str(),
                                     e.below ? baker::to_string(*e.below).c_str() : "(none)",
-                                    baker::to_string(e.value).c_str());
+                                    baker::to_string(e.values).c_str());
                         hover_provenance(cfg, e.path.str());
                     }
                 } else {

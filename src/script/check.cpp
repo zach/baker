@@ -5,6 +5,7 @@
 #include <baker/write.hpp>
 
 #include "common/containers.hpp"
+#include "data/config_impl.hpp"
 #include "internal.hpp"
 
 #include <algorithm>
@@ -331,6 +332,22 @@ void check(const Config& cfg, const Context& ctx, CheckReport& report, const Che
     CheckOptions o = options;
     if (!o.packs) o.packs = &cfg.read_session();
     check(std::span<const Array* const>(trees.data(), trees.size()), ctx, report, o);
+    // Each enabled layer over the ones below it: a list of same-tagged records it folds into
+    // one. A merge a layer, as the Config's root is built; for the tools, not a
+    // shipped game.
+    if constexpr (!kShipping) {
+        Vec<Error> folds(report.warnings.begin(), report.warnings.end());
+        const size_t before = folds.size();
+        Ref<Array> stack = Array::make(0);
+        for (const Symbol name : cfg.layers()) {
+            if (!cfg.layer_enabled(name.str())) continue;
+            const Ref<Array> layer = cfg.layer_root(name.str());
+            if (!layer) continue;
+            config_internal::fold_warnings(*stack, *layer, folds);
+            stack = merge(*stack, *layer);
+        }
+        if (folds.size() != before) report.warnings = List<Error>(folds);
+    }
     // The data against the tweaks the Config binds: what the game declares tunable.
     if (const TweakRegistry* tweaks = cfg.tweak_registry()) {
         TweakFindings f = check_tweaks(*cfg.root(), *tweaks);

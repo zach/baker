@@ -7,6 +7,7 @@
 #include <baker/config.hpp>
 #include <baker/object.hpp>
 #include <baker/script.hpp>
+#include <baker/table.hpp>
 #include <baker/task.hpp>
 #include <baker/tools/console.hpp>
 #include <baker/tools/layers.hpp>
@@ -14,6 +15,7 @@
 
 #include "alloc_counter.hpp"
 #include "dev_only.hpp"
+#include "move_read.hpp"  // a golden view, for a baked table
 
 #include <atomic>
 #include <cstdio>
@@ -149,6 +151,42 @@ TEST_CASE("a Config allocates through its allocator, and nothing through operato
     CHECK(mine.allocs == mine.frees);
     CHECK(mine.live_bytes == 0);
     MESSAGE("Config: " << mine.allocs << " allocations through its allocator");
+}
+
+TEST_CASE(
+    "a baked table is one block from the Config's allocator, and nothing through operator new") {
+    Counting mine;
+    const baker::Allocator alloc = mine.allocator();
+    size_t global = 0, unowned = 0;
+    bool ok = false;
+    {
+        const baker::test::AllocationScope scope;
+        const size_t unowned_before = g_default_allocations.load();
+        {
+            baker::Config config({.tweaks = nullptr}, alloc);
+            ok = baker::add_table<views_test::Move>(config).has_value();
+            ok =
+                ok && config
+                          .push_layer_text("base",
+                                           "(fighters (kestrel (moves (jab (startup 4) (damage 3.5)"
+                                           " (name \"Jab\") (cancel_into heavy kick)"
+                                           " (points (p (x 1) (y 2)))))))")
+                          .has_value();
+            const baker::Table<views_test::Move> moves = baker::table<views_test::Move>(config);
+            ok = ok && moves.size() == 1 && moves[0].name == "Jab" && moves[0].points[0].y == 2.0f;
+            ok = ok &&
+                 config.push_layer_text("over", "(fighters (kestrel (moves (jab (damage 4)))))")
+                     .has_value();
+            ok = ok && baker::table<views_test::Move>(config)[0].damage == 4.0f;
+        }
+        unowned = g_default_allocations.load() - unowned_before;
+        global = scope.count();
+    }
+    CHECK(ok);
+    MESSAGE("tables: " << unowned << " allocations through the default allocator");
+    if (baker::test::counting_allocations()) CHECK(global == 0);
+    CHECK(mine.allocs == mine.frees);
+    CHECK(mine.live_bytes == 0);
 }
 
 TEST_CASE("a LayerChecker keeps its state on its allocator, and nothing through operator new") {

@@ -7,6 +7,7 @@
 
 #include "common/containers.hpp"
 
+#include "markers.hpp"
 #include "text.hpp"
 
 #include <algorithm>
@@ -324,6 +325,55 @@ Expected<bool> evaluate_values(const Values& in, Evaluated& out) {
     }
     out.values = Values(out.nodes.nodes(), in.source());
     return true;
+}
+
+ResolveStatus resolve_in_layer(const Array& layer, const Path& path, const Array* merged,
+                               Resolved& out, Path* spelled) {
+    const ResolveStatus plain = resolve(layer, path, out);
+    if (plain != ResolveStatus::Missing || !merged) {
+        if (spelled && plain == ResolveStatus::Ok) *spelled = path;
+        return plain;
+    }
+    // Respell the path as the layer writes it: a segment the layer lacks may be an alias of
+    // the merged record there.
+    Str text;
+    const Array* lay = &layer;
+    const Array* mer = merged;
+    bool respelled = false;
+    for (size_t i = 0; i < path.size(); ++i) {
+        const Path::Segment& seg = path[i];
+        if (!text.empty()) text += '.';
+        if (seg.is_index) {
+            text += decimal(static_cast<int64_t>(seg.index));
+            lay = nullptr;  // an index selects a value: no key below to retry
+            mer = nullptr;
+            continue;
+        }
+        Symbol name = seg.name;
+        const Array* next = lay ? lay->try_find(name) : nullptr;
+        const Array* mer_rec = mer ? mer->try_find(name) : nullptr;
+        if (!next && lay && mer_rec && mer_rec->meta_first())
+            if (const Array* aka = mer_rec->meta(aka_tag()))
+                for (const Node& old : aka->values()) {
+                    const auto s = old.try_sym();
+                    if (!s) continue;
+                    next = lay->try_find(*s);
+                    if (next) {
+                        name = *s;
+                        respelled = true;
+                        break;
+                    }
+                }
+        if (!next) return ResolveStatus::Missing;
+        text += is_bare_symbol(name.str()) ? Str(name.str()) : "'" + Str(name.str()) + "'";
+        lay = next;
+        mer = mer_rec;
+    }
+    if (!respelled) return ResolveStatus::Missing;
+    const Path as_spelled(text.view());
+    const ResolveStatus status = resolve(layer, as_spelled, out);
+    if (spelled && status == ResolveStatus::Ok) *spelled = as_spelled;
+    return status;
 }
 
 ResolveStatus resolve(const Array& root, const Path& path, Resolved& out) noexcept {

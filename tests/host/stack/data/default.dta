@@ -1,9 +1,13 @@
 ; The test game's data.
-#shape (player
+#shape (player (@view)
    (speed float (@range 0 10))
-   (lives int))
-(player
+   (lives int)
+   (model (asset mesh)))
+(player (@aka hero)
    (speed 3.5)   ; how fast
-   (lives 3))
+   (lives 3)
+   (model "assets/hero.glb"))
+#shape (pet (@at pets) (@keyed) (@view) (hp int))
+(pets (dog (hp 4)))
 (loot coin gem)
 (waves {spawn grunt 3})

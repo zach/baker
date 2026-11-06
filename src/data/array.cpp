@@ -172,8 +172,10 @@ Node without_metadata(const Node& n) {
     bool changed = false;
     for (uint32_t i = 0; i < a->size(); ++i) {
         const Node& c = (*a)[i];
-        // From the boundary on, a field may follow metadata: only '@' tags go.
-        if (first && i >= first && c.type() == Type::Array && c.array()->tag().is_meta()) {
+        // From the boundary on, a field may follow metadata: only '@' tags go. A
+        // record's identity stays: shipped overlays resolve by it.
+        if (first && i >= first && c.type() == Type::Array && c.array()->tag().is_meta() &&
+            c.array()->tag() != detail::id_tag() && c.array()->tag() != detail::aka_tag()) {
             changed = true;
             continue;
         }

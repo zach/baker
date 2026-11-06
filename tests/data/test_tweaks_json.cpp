@@ -1,4 +1,4 @@
-// The tweaks as JSON, baker.tweaks/1.5, and the data held to them.
+// The tweaks as JSON, baker.tweaks/1.6, and the data held to them.
 #include <doctest.h>
 #include <baker/config.hpp>
 #include <baker/parse.hpp>
@@ -52,12 +52,12 @@ TEST_CASE("the tweaks as JSON: type, default, value, metadata, and source") {
     write_json(reg, string_out(json));
     CHECK(
         json ==
-        "{\n  \"schema\": \"baker.tweaks/1.5\",\n  \"tweaks\": [\n"
+        "{\n  \"schema\": \"baker.tweaks/1.6\",\n  \"tweaks\": [\n"
         R"j(    {"path": "player.lives", "type": "int32", "values": ["int32"], "count": "exact", )j"
         R"j("element": null, "length": null, "default": "3", )j"
         R"j("value": "3", )j"
         R"j("bound": false, "range": null, "step": 0.0, "desc": "", "kind": "", )j"
-        R"j("group": "player", "dev_only": true, "one_of": [], "choices": [], "source": null},)j"
+        R"j("group": "player", "dev_only": true, "optional": false, "one_of": [], "choices": [], "source": null},)j"
         "\n"
         R"j(    {"path": "player.speed", "type": "float32", "values": ["float32"], "count": "exact", )j"
         R"j("element": null, "length": null, "default": "4.0", "value": "6.0", )j"
@@ -65,7 +65,7 @@ TEST_CASE("the tweaks as JSON: type, default, value, metadata, and source") {
             std::string(kShipping ? R"j("step": 0.0, "desc": "", )j"
                                   : R"j("step": 0.5, "desc": "Run speed", )j") +
             R"j()j"
-            R"j("kind": "", "group": "player", "dev_only": false, "one_of": [], "choices": [], )j"
+            R"j("kind": "", "group": "player", "dev_only": false, "optional": false, "one_of": [], "choices": [], )j"
             R"j("source": {"layer": "default", "file": "d.dta", "line": 1}})j"
             "\n  ]\n}\n");
 }
@@ -233,4 +233,42 @@ TEST_CASE(
     CHECK(forward.second[0].find("'b.mass'") != std::string::npos);  // missing: no place
     CHECK(forward.second[1].find("'cuont'") != std::string::npos);   // read by no tweak
     CHECK(forward.second[2].find("'sise'") != std::string::npos);
+}
+
+TEST_CASE(
+    "a tweak the data may leave out: no warning that it is missing, every other check kept "
+    "") {
+    if constexpr (kShipping) return;  // a shipping build keeps no flag: its check warns as ever
+    TweakRegistry reg;
+    // Values a content file supplies: the data overrides a few.
+    Tweak<int> cost{"cards.fireball.cost", 3, {.range = {0, 10}, .optional = true}, reg};
+    Tweak<int> damage{"cards.fireball.damage", 6, {.optional = true}, reg};
+    // A constant the data must carry: its absence is still worth a warning.
+    Tweak<float> gravity{"world.gravity", 9.8f, {}, reg};
+    auto messages = [](const List<Error>& list) {
+        std::vector<std::string> out;
+        for (const Error& e : list) out.emplace_back(e.message());
+        return out;
+    };
+    // Nothing supplied: only the unmarked tweak warns.
+    auto found = check_tweaks(*ok(read_string("(cards (fireball))", "d.dta")), reg);
+    CHECK(found.errors.empty());
+    CHECK(messages(found.warnings) ==
+          std::vector<std::string>{"the data has no 'world.gravity': the tweak keeps its default"});
+    // A value supplied is held to the tweak as ever, and a misspelt sibling still warns.
+    found = check_tweaks(
+        *ok(read_string("(cards (fireball (cost 12) (damgae 7)))\n(world (gravity 9.8))", "d.dta")),
+        reg);
+    REQUIRE(found.errors.size() == 1);
+    CHECK(std::string(found.errors[0].message()).find("12") != std::string::npos);
+    REQUIRE(found.warnings.size() == 1);
+    CHECK(std::string(found.warnings[0].message()).find("damgae") != std::string::npos);
+    // The reference names the mark.
+    std::string json;
+    write_json(reg, string_out(json));
+    CHECK(json.find(R"j("path": "cards.fireball.cost")j") != std::string::npos);
+    const size_t cost_at = json.find(R"j("path": "cards.fireball.cost")j");
+    const size_t gravity_at = json.find(R"j("path": "world.gravity")j");
+    CHECK(json.find(R"j("optional": true)j", cost_at) < json.find("\n", cost_at));
+    CHECK(json.find(R"j("optional": false)j", gravity_at) < json.find("\n", gravity_at));
 }

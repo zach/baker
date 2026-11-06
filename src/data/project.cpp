@@ -131,6 +131,7 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
     Project p;
     p.file = Symbol(path);
     bool has_layers = false;
+    const Array* views_part = nullptr;
     for (size_t i = 1; i < root->size(); ++i) {
         const Array* part = (*root)[i].try_array();
         if (!part || part->empty())
@@ -190,6 +191,65 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
                 return Unexpected(places.at(*part, "the build directory is (build \"path\")"));
             p.build = joined(dir, where);
             p.build_at = places.of(*part, 1);
+        } else if (key == Symbol("views")) {
+            views_part = part;
+            p.views.at = places.of(*part, 0);
+            Vec<Symbol> view_layers, view_shapes;
+            for (size_t k = 1; k < part->size(); ++k) {
+                const Array* v = (*part)[k].try_array();
+                const Symbol vk = v ? v->tag() : Symbol();
+                if (vk == Symbol("layers") || vk == Symbol("shapes")) {
+                    for (size_t m = 1; m < v->size(); ++m) {
+                        const auto name = (*v)[m].try_sym();
+                        if (!name)
+                            return Unexpected(places.at(
+                                *v, "(views (layers NAME...)) and (shapes NAME...) hold names"));
+                        (vk == Symbol("layers") ? view_layers : view_shapes).push_back(*name);
+                    }
+                } else if (vk == Symbol("namespace")) {
+                    std::string_view ns;
+                    if (v->size() != 2 || !text_of((*v)[1], ns) || ns.empty())
+                        return Unexpected(places.at(*v, "the namespace is (namespace NAME)"));
+                    p.views.ns = Symbol(ns);
+                } else {
+                    return Unexpected(places.at(v ? *v : *part,
+                                                "views are (views (layers NAME...) [(shapes "
+                                                "NAME...)] [(namespace NAME)])"));
+                }
+            }
+            if (view_layers.empty())
+                return Unexpected(
+                    places.at(*part, "(views ...) names its contract layers: (layers NAME...)"));
+            p.views.layers =
+                List<Symbol>(std::span<const Symbol>(view_layers.data(), view_layers.size()));
+            p.views.shapes =
+                List<Symbol>(std::span<const Symbol>(view_shapes.data(), view_shapes.size()));
+        } else if (key == Symbol("assets")) {
+            Vec<ProjectAssetKind> kinds;
+            for (size_t k = 1; k < part->size(); ++k) {
+                const Array* kind = (*part)[k].try_array();
+                const Symbol name = kind ? kind->tag() : Symbol();
+                if (name.empty() || name.is_meta())
+                    return Unexpected(places.at(
+                        kind ? *kind : *part,
+                        "assets are (assets (KIND \".ext\" ...) ...), each kind a symbol"));
+                for (const ProjectAssetKind& seen : kinds)
+                    if (seen.name == name)
+                        return Unexpected(places.at(
+                            *kind, "asset kind '" + Str(name.str()) + "' is declared twice"));
+                Vec<Symbol> extensions;
+                for (size_t m = 1; m < kind->size(); ++m) {
+                    const auto ext = (*kind)[m].try_str();
+                    if (!ext || ext->size() < 2 || ext->front() != '.')
+                        return Unexpected(places.at(
+                            *kind, "asset kind '" + Str(name.str()) +
+                                       "' lists its extensions as strings, each with its dot"));
+                    extensions.emplace_back(*ext);
+                }
+                kinds.push_back({name, List<Symbol>({extensions.data(), extensions.size()}),
+                                 places.of(*kind, 0)});
+            }
+            p.assets = List<ProjectAssetKind>({kinds.data(), kinds.size()});
         } else if (key == Symbol("reference")) {
             std::string_view file;
             if (part->size() != 2 || !text_of((*part)[1], file))
@@ -247,10 +307,26 @@ Expected<Project> read_project(std::string_view path, const LoadSession::Reader&
                 places.at(*part, "a project has no '" + Str(key.str()) +
                                      "': it holds pack_levels, include_dirs, "
                                      "defines, reference, tool, build, console, step_name, format, "
-                                     "scenarios, objectives, and layers"));
+                                     "scenarios, objectives, views, and layers"));
         }
     }
     if (!has_layers) return Unexpected(places.at(*root, "a project needs (layers ...)"));
+    // A contract layer is one of the project's, and one that every build has: a
+    // view's shape set is one per build.
+    for (const Symbol name : p.views.layers) {
+        const ProjectLayer* layer = nullptr;
+        for (const ProjectLayer& l : p.layers)
+            if (l.name == name) layer = &l;
+        if (!layer)
+            return Unexpected(places.at(*views_part, "(views (layers ...)) names '" +
+                                                         Str(name.str()) +
+                                                         "', which (layers ...) does not have"));
+        if (layer->dev_only || !layer->when.empty())
+            return Unexpected(places.at(
+                *views_part, "(views (layers ...)) names '" + Str(name.str()) +
+                                 "', which is dev_only or under (when COND): a view's shapes "
+                                 "are the same in every build"));
+    }
     return p;
 }
 
@@ -284,7 +360,15 @@ Expected<List<ProjectProblem>> open_project(Config& cfg, const Project& project,
     for (const ProjectEntry& e : project.defines) session.define(e.value, DefineFrom::Project);
     for (const std::string_view d : options.defines) session.define(Symbol(d), DefineFrom::Host);
     Vec<ProjectProblem> problems;  // allocates only for a problem
-    for (const ProjectLayer& l : project.layers) {
+    // A stack image: the leading layers it holds come from it, the rest as today.
+    size_t from_image = 0;
+    if (!cfg.stack_image().empty()) {
+        auto taken = cfg.push_image_layers(project.layers.items());
+        if (!taken) return Unexpected(std::move(taken).error());
+        from_image = *taken;
+    }
+    for (size_t i = from_image; i < project.layers.size(); ++i) {
+        const ProjectLayer& l = project.layers[i];
         if (options.skip.contains(l.name.str())) continue;
         // A development layer never reaches a shipping build, whatever its file says.
         if (l.dev_only && (kShipping || options.skip_dev_only)) continue;

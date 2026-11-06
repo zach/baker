@@ -353,6 +353,7 @@ TweakFindings check_tweaks(const Array& root, const TweakRegistry& tweaks) {
         detail::Resolved r;
         const auto status = detail::resolve(root, t.parsed(), r);
         if (status == detail::ResolveStatus::Missing) {
+            if (t.optional()) return;  // the data may leave it out: its default is the value
             add(warnings, make_error(ErrorCode::NotFound, "the data has no '" + Str(path) +
                                                               "': the tweak keeps its default"));
             return;
@@ -478,7 +479,7 @@ TweakFindings check_tweaks(const Array& root, const TweakRegistry& tweaks) {
             List<Error>({warnings.data(), warnings.size()})};
 }
 
-// --- As JSON (baker.tweaks/1.5) ---
+// --- As JSON (baker.tweaks/1.6) ---
 
 namespace {
 // The tweak's values as one text: a single value bare, several in parentheses.
@@ -500,7 +501,7 @@ void write_json(const TweakRegistry& tweaks, TextSink text) {
     tweaks.each([&](const TweakBase& t) { ts.push_back(&t); });
     std::sort(ts.begin(), ts.end(),
               [](const TweakBase* a, const TweakBase* b) { return a->path() < b->path(); });
-    Str out = "{\n  \"schema\": \"baker.tweaks/1.5\",\n  \"tweaks\": [";
+    Str out = "{\n  \"schema\": \"baker.tweaks/1.6\",\n  \"tweaks\": [";
     for (size_t i = 0; i < ts.size(); ++i) {
         const TweakBase& t = *ts[i];
         ValueList def, cur;
@@ -547,6 +548,7 @@ void write_json(const TweakRegistry& tweaks, TextSink text) {
         out += ", \"group\": ";
         detail::json_string(out, t.group());
         out += Str(", \"dev_only\": ") + (t.dev_only() ? "true" : "false");
+        out += Str(", \"optional\": ") + (t.optional() ? "true" : "false");
         out += ", \"one_of\": ";
         const List<Symbol> one_of = t.one_of();
         detail::json_names(out, one_of.items());

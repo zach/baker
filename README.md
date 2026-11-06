@@ -94,7 +94,7 @@ restarted.
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.7.0)
+FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.8.0)
 FetchContent_MakeAvailable(baker)
 target_link_libraries(game PRIVATE baker::baker)
 ```
@@ -132,6 +132,19 @@ save, see it.
 - **Packs and levels.** `#require` reads a shared file once per session; a pack declares
   its level (`engine`, `game`, `task`), and a harder pack using a softer one's macro or
   function is warned about. [Language guide](docs/language.md#packs-and-levels).
+- **Views.** A shape marked `(@view)` generates a C++ struct, its reader and a digest of
+  its layout; `baker_generate_views` keeps them current in the build, and `check` reports
+  a struct compiled against another layout.
+  [Language guide](docs/language.md#views-a-c-struct-from-a-shape),
+  [`examples/content-tables`](examples/content-tables).
+- **Baked tables.** `Table<T>` holds a viewed table's records as plain structs, rebuilt
+  from the merged data at each change and read by index (one load), key, path, record ID
+  or parent; a stack image ships the contract layers and the tables in one file.
+  [Language guide](docs/language.md#tables-a-keyed-shapes-records-packed).
+- **Record identity and renames.** `(@id ...)` gives a record an ID that survives a rename;
+  `(@aka old)` keeps an old key answering in overlays; `rename` moves a key and everything
+  that names it; `(asset KIND)` fields are checked against the files on disk.
+  [Cookbook](docs/cookbook.md#renaming-a-record-a-field-and-naming-a-file).
 - **Shapes.** `#shape (boss_phase (enter_at float (@range 0 1)) ...)` declares what data
   should look like; a Config validator reports violations at load, located.
   [Language guide](docs/language.md#shapes).
@@ -147,6 +160,10 @@ save, see it.
   generated files, a repetition report, and `check` output as versioned JSON.
   [Cookbook](docs/cookbook.md#reload-callbacks-migrate-or-punt),
   [language guide](docs/language.md#checking-before-running).
+- **Upgrading data.** `baker_migrate` rewrites data written for an older Baker, in `.dta`
+  files, C++ string literals and Markdown; `tools::migrate_text` gives each old form with
+  its fix, for an editor or a CI step. A layer check warns when a layer would fold a list
+  of same-tagged records into one. [Baker and your tools](docs/tools.md).
 
 Public headers include no standard containers or strings (an engine that bans the STL can
 use them); text comes out through a `TextSink`. `<baker/std_interop.hpp>`,
@@ -171,6 +188,8 @@ in `bench/` (`-DBAKER_BUILD_BENCH=ON`).
 | A 6.2 MB tree from the binary cache | 2.3–2.5 ms | one allocation |
 | An 18 MB layer from text into a Config | 45 ms | |
 | Checking 50,000 shaped instances | 6.5 ms | |
+| A baked table's row by index, one field | ~0.7 ns | a load |
+| A baked table's row by record ID | ~7 ns | |
 
 ## Building
 
@@ -180,12 +199,12 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Targets: `baker::data` (data, lookup, config, tweaks, the cache; usable alone),
-`baker::script` (evaluation, objects, tasks), `baker::shape` (shapes), and `baker::baker`
-(all of them). `baker::tools` holds what only tools call (the reference, the layer tools,
-the console's commands, checking without the game), and `baker::host`, the host kit, is a
-separate library over them: the file watcher, the remote console, the edit-to-see loop,
-and the tool commands a game runs from its `main`
+Targets: `baker::data` (data, lookup, config, tweaks, the cache, baked tables; usable
+alone), `baker::script` (evaluation, objects, tasks), `baker::shape` (shapes, and the views
+they generate), and `baker::baker` (all of them). `baker::tools` holds what only tools call
+(the reference, the layer tools, the console's commands, checking without the game), and
+`baker::host`, the host kit, is a separate library over them: the file watcher, the
+remote console, the edit-to-see loop, and the tool commands a game runs from its `main`
 ([Baker and your tools](docs/tools.md#the-host-kit)).
 
 | Option | Default | Effect |
@@ -196,7 +215,7 @@ and the tool commands a game runs from its `main`
 | `BAKER_BUILD_TESTS` | `ON` when top-level | The test suite |
 | `BAKER_BUILD_EXAMPLES` | `ON` when top-level | `examples/`, each run by CTest |
 | `BAKER_BUILD_HARNESS` | `OFF` | `examples/harness-imgui`; fetches Dear ImGui and GLFW |
-| `BAKER_BUILD_TOOLS` | `ON` when top-level | `baker_parse_corpus`, `baker_bake` |
+| `BAKER_BUILD_TOOLS` | `ON` when top-level | `baker_parse_corpus`, `baker_migrate`; `baker_bake` is always built |
 | `BAKER_BUILD_BENCH` | `OFF` | `bench/` |
 | `BAKER_BUILD_FUZZERS` | `OFF` | libFuzzer targets (Clang) |
 | `BAKER_ATOMIC_REFCOUNT` | `ON` | `OFF` for single-threaded programs |
@@ -218,6 +237,8 @@ Android: CMake builds get C++20 from the targets; with `ndk-build`, add
 - [`docs/reply-json.md`](docs/reply-json.md): one-line JSON replies for tools and consoles.
 - [`docs/reference-json.md`](docs/reference-json.md): the vocabulary, tweaks and shapes as JSON.
 - [`docs/sim-json.md`](docs/sim-json.md): scenarios, objectives, and their results as JSON.
+- [`docs/check-json.md`](docs/check-json.md): the `check` report as JSON.
+- [`docs/assets-json.md`](docs/assets-json.md): the assets the data names, as JSON.
 - [`CHANGELOG.md`](CHANGELOG.md): what each release changed.
 
 ## License

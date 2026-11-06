@@ -130,6 +130,10 @@ struct ConfigOptions {
     // Config whose directory ships to a build that reads no metadata. A tree it reads
     // from such a cache has none either.
     bool cache_drop_metadata = false;
+    // A stack image (<baker/image.hpp>): open_project takes the layers the image holds
+    // from it, in place of their files, and the registered tables it holds in place of
+    // building them. Copied by the Config; empty: none.
+    std::string_view stack_image = {};
 };
 
 // What a layer may change (Config::check_layer, LayerOptions::policy). Each rule is off by
@@ -146,6 +150,16 @@ struct LayerPolicy {
 };
 
 struct LayerReport;
+struct ProjectLayer;  // project.hpp
+struct TableSpec;     // table.hpp
+class BakedTable;
+
+// Identity (<baker/record_id.hpp>). find_by_id: the array below `root` whose (@id ...)
+// is `id`, with its dotted path in `path` if given; null for none. A walk of the tree: for
+// tools, not a frame. id_validator: for Config::add_validator, reports two records that
+// share an ID (located at the second, naming both) and a malformed (@id ...), as errors to
+// the warning handler; the kit's check runs it. A Config pays nothing unless it adds it.
+[[nodiscard]] const Array* find_by_id(const Array& root, RecordId id, Path* path = nullptr);
 
 // What a validator judges (Config::add_validator): the merged tree, the trees it was merged
 // from, and what their files declared. Valid for the call only.
@@ -259,18 +273,52 @@ struct StackFile {
     bool directory = false;
 };
 
+// A row's values, one node each, held as one node so that a single value costs nothing more:
+// (aim 0 0) is two values, (aim (0 0)) one, an array. What a layer tool reports for a row
+// (LayerEffectEntry, explain, diff).
+class RowValues {
+public:
+    RowValues() noexcept = default;
+    explicit RowValues(std::span<const Node> values)
+        : node_(values.size() == 1 ? values[0] : Node(Array::make_copy(values))),
+          one_(values.size() == 1) {}
+    [[nodiscard]] std::span<const Node> nodes() const noexcept {
+        if (one_) return {&node_, 1};
+        const Array* a = node_.array();
+        return a ? a->nodes() : std::span<const Node>();
+    }
+    [[nodiscard]] size_t size() const noexcept { return nodes().size(); }
+    [[nodiscard]] bool empty() const noexcept { return nodes().empty(); }
+    [[nodiscard]] const Node& operator[](size_t i) const noexcept { return nodes()[i]; }
+    [[nodiscard]] const Node* begin() const noexcept { return nodes().data(); }
+    [[nodiscard]] const Node* end() const noexcept { return nodes().data() + nodes().size(); }
+
+private:
+    Node node_;         // the one value, or an array of the values
+    bool one_ = false;  // node_ is the value itself
+};
+
 struct LayerEffectEntry {
-    Symbol path;                // dotted, as get<T>() takes it
-    Node value;                 // this layer's value; a verb's operands; #remove
-    std::optional<Node> below;  // the stack's value without this layer, if any
-    Source source;              // provenance, as source() returns it
+    Symbol path;  // dotted, as get<T>() takes it
+    // This layer's values, one node each: (aim (0 0)) is one, an array; (aim 0 0) is two. A
+    // verb's operands, a record one operand; a removal's #remove.
+    RowValues values;
+    // The stack's values without this layer, if it has the path. Under a verb, the list the
+    // verb changes: every element, records too, (moves (jab ...) (heavy ...)) two.
+    std::optional<RowValues> below;
+    Source source;  // provenance, as source() returns it
+    // Where `below` was written: under a verb, the row of the list it changes.
     std::optional<Source> below_source;
     bool shadowed = false;  // a higher enabled layer (or scratch) overrides this path
     Symbol op;              // the row's verb: #append, #drop or #remove; empty for a value
     bool stale = false;     // the row's (@was ...) pin is not `below`
+    // The layer's children after this row, in its array, with its tag: each merges into this
+    // row's record rather than adding to a list, and a check warns. 0 for a key written
+    // once.
+    uint32_t folded = 0;
     // A declaration the layer's read made, not a value: #shape, #pack or #origin. `path` is
-    // then the shape's or pack's name, or the file an origin describes; `value` its form;
-    // `below` the same declaration from a layer below, if any.
+    // then the shape's or pack's name, or the file an origin describes; `values` its form,
+    // alone; `below` the same declaration from a layer below, if any.
     Symbol declares;
 };
 
@@ -376,6 +424,11 @@ private:
 
 namespace detail {
 struct ToolsAccess;  // baker::tools' way to the internals (src/tools/access.hpp)
+struct TableSlot;    // a registered table (src/data/table_build.hpp)
+}  // namespace detail
+class Config;
+namespace detail {
+[[nodiscard]] std::span<const TableSlot> table_slots(const Config& cfg);  // the image writer's
 }
 
 class Config {
@@ -581,6 +634,23 @@ public:
     using ValidatorId = uint32_t;
     ValidatorId add_validator(Validator validator, ValidatorOptions options = {});
     void remove_validator(ValidatorId id);
+    // Baked tables (<baker/table.hpp>): add_table<T>(cfg) registers one, built from
+    // the merged tree now and at every change that touches its records; table<T>(cfg) reads
+    // it. Refused: a spec registered twice (by digest), or one whose records' place has no
+    // `*`-free keyed parent to find.
+    Expected<void> add_table(const TableSpec& spec);
+    [[nodiscard]] Ref<const BakedTable> table_block(uint64_t digest) const noexcept;
+    // The errors the last build of each table reported (a field that is not a literal, a
+    // wrong type), located, as the warning handler saw them: for a tool's report.
+    [[nodiscard]] List<Error> table_errors() const;
+    // ConfigOptions::stack_image, as copied. open_project calls push_image_layers with the
+    // project's layers when it is set: the leading layers the image holds are pushed from
+    // it, bottom to top, each with its project options, and the tables the image holds
+    // are installed for the registered specs they match (a mismatch is a warning, and that
+    // table is built from the tree). Returns how many layers were taken from the image.
+    [[nodiscard]] std::string_view stack_image() const noexcept;
+    [[nodiscard]] Expected<uint32_t> push_image_layers(std::span<const ProjectLayer> layers);
+    friend std::span<const detail::TableSlot> detail::table_slots(const Config& cfg);
     void freeze() noexcept { frozen_ = true; }
     [[nodiscard]] bool frozen() const noexcept { return frozen_; }
 
@@ -691,5 +761,7 @@ private:
     bool visible_pending_ = false;  // a reload waits for mark_visible
     Impl* impl_;
 };
+
+[[nodiscard]] Config::Validator id_validator();
 
 }  // namespace baker

@@ -28,6 +28,7 @@ struct TweakDescription {
     std::string_view kind{};
     std::string_view group{};
     bool dev_only = false;
+    bool optional = false;  // the reference's "optional": the data may leave it out
     std::span<const std::string_view> one_of{};
     std::span<const TweakChoice> choices{};
 };

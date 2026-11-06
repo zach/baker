@@ -1,0 +1,3 @@
+; A mod: it may add to a contract shape, and the struct never sees the field.
+#shape (boss (armor int (@optional)))
+(bosses (dragon (armor 3)))

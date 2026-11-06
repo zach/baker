@@ -2,7 +2,10 @@
 // edit journal, and snapshots. Write-back and the layer tools are in config_write.cpp, the
 // reload history and loop statistics in config_loop.cpp.
 
+#include <baker/project.hpp>
+
 #include "config_impl.hpp"
+#include "image.hpp"
 
 #include <algorithm>
 
@@ -81,6 +84,16 @@ bool value_nodes(const Array& root, const Path& path, Vec<Node>& out) {
     }
     for (const Node& n : *r.array)  // the root has no tag
         if (!is_tagged(n)) out.push_back(n);
+    return true;
+}
+
+bool list_nodes(const Array& root, const Path& path, Vec<Node>& out) {
+    out.clear();
+    detail::Resolved r;
+    if (path.empty() || last_is_index(path) ||
+        detail::resolve(root, path, r) != detail::ResolveStatus::Ok || !r.array)
+        return false;
+    for (const Node& n : r.array->values()) out.push_back(n);
     return true;
 }
 
@@ -262,6 +275,7 @@ Expected<void> Config::Impl::read(LayerState& layer, const LoadSession& before, 
     layer.tested.assign(tested.data() + from, tested.data() + tested.size());  // EASTL: pointers
     layer.tested_known =
         detail::SessionAccess::parses(*session) > detail::SessionAccess::parses(before);
+    layer.aliases = detail::SessionAccess::aliases(*session) > 0;  // this read's, or replayed
     layer.after = session;
     return {};
 }
@@ -531,6 +545,9 @@ void Config::Impl::put(Config& c, const Path& target, std::span<const Node> valu
 
 Ref<Array> Config::Impl::merged() const {
     Ref<Array> r = Array::make(0);
+    merge_scratch.aliases = false;
+    for (const LayerState& l : layers)
+        merge_scratch.aliases = merge_scratch.aliases || (l.options.enabled && l.aliases);
     for (const LayerState& l : layers)
         if (l.options.enabled)
             r = detail::merge(*r, *l.root, MergePolicy::Overwrite, merge_scratch);
@@ -556,8 +573,10 @@ void Config::Impl::commit(Config& c, ReloadRecord& rec, uint64_t& t) {
     ++generation;
     const Ref<Array> before = std::move(c.root_);
     c.root_ = merged();
+    merged_root = c.root_;
     c.scratch_dirty_ = false;
     refresh_read();
+    if (!tables.empty() && !hold_tables) build_tables(*c.root_, false);
     if (!validators.empty()) {
         const ValidatorStack stack{*c.root_, stack_layers(), as_read};
         for (const Check& v : validators) v.fn(stack, warn);
@@ -612,6 +631,8 @@ Config::Config(ConfigOptions options, const Allocator& allocator)
     impl_->options = options;
     impl_->cache_dir.assign(options.cache_dir);
     impl_->options.cache_dir = impl_->cache_dir;
+    impl_->stack_image.assign(options.stack_image);
+    impl_->options.stack_image = impl_->stack_image;
     if (TweakRegistry* reg = options.tweaks) {
         reg->config_ = this;
         ReloadRecord unused;
@@ -791,7 +812,8 @@ Expected<void> Config::Impl::push_read(Config& c, LayerState&& layer, LayerOptio
             Vec<Error> found(alloc);
             for (const Leaf& leaf : leaves_of(*layer.root))
                 row_warnings(*leaf.holder, leaf.path,
-                             value_nodes(*stack, Path(leaf.path), v) ? &v : nullptr, *stack, found);
+                             below_nodes(*stack, Path(leaf.path), *leaf.holder, v) ? &v : nullptr,
+                             *stack, found);
             for (const Error& w : found) warn(w);
         }
     }
@@ -1123,7 +1145,112 @@ Ref<Array> Config::with_edits() const {
 void Config::apply_edits() {
     if (!scratch_dirty_) return;
     root_ = impl_->merged();
+    impl_->merged_root = root_;
     scratch_dirty_ = false;
+    if (!impl_->tables.empty() && !impl_->hold_tables) impl_->build_tables(*root_, false);
+}
+
+std::string_view Config::stack_image() const noexcept {
+    return impl_->stack_image.view();
+}
+
+Expected<uint32_t> Config::push_image_layers(std::span<const ProjectLayer> layers) {
+    auto image = detail::read_image(impl_->stack_image.view(), impl_->base, impl_->alloc);
+    if (!image) return Unexpected(std::move(image).error());
+    const auto section_named = [&](detail::ImageSection::Kind kind,
+                                   std::string_view name) -> const detail::ImageSection* {
+        for (const detail::ImageSection& s : image->sections)
+            if (s.kind == kind && s.name == name) return &s;
+        return nullptr;
+    };
+    // The leading layers the image holds, pushed from it.
+    impl_->hold_tables = true;
+    uint32_t taken = 0;
+    for (const ProjectLayer& l : layers) {
+        const detail::ImageSection* s =
+            section_named(detail::ImageSection::Kind::Layer, l.name.str());
+        if (!s) break;
+        auto tree = read_cache_bytes(s->bytes, l.name.str(), impl_->base);
+        if (!tree) {
+            impl_->hold_tables = false;
+            return Unexpected(std::move(tree).error());
+        }
+        const LayerOptions o{.optional = l.optional, .enabled = l.enabled, .when = l.when.str()};
+        if (auto r = push_layer(l.name.str(), std::move(*tree), o); !r) {
+            impl_->hold_tables = false;
+            return Unexpected(std::move(r).error());
+        }
+        ++taken;
+    }
+    impl_->hold_tables = false;
+    // The tables: the image's block where it matches the registered view, else built.
+    for (detail::TableSlot& slot : impl_->tables) {
+        Ref<const BakedTable> block;
+        Error why;
+        for (const detail::ImageSection& s : image->sections) {
+            if (s.kind != detail::ImageSection::Kind::Table) continue;
+            block = detail::read_table(s.bytes, slot.spec, impl_->alloc, why);
+            if (block) break;
+        }
+        if (block) {
+            slot.built = block;
+            slot.errors.clear();
+            detail::record_table_sources(slot, *root_, impl_->alloc);
+        } else {
+            if (impl_->warn)
+                impl_->warn(make_error(
+                    ErrorCode::Refused,
+                    "the stack image has no table for " +
+                        Str(slot.spec.name.empty() ? std::string_view("a view") : slot.spec.name) +
+                        " as this build compiles it (" + Str(why.message()) +
+                        "); it is built from the tree"));
+            slot.built = detail::build_table(slot, *root_, impl_->alloc, impl_->warn);
+        }
+    }
+    return taken;
+}
+
+namespace detail {
+std::span<const TableSlot> table_slots(const Config& cfg) {
+    return {cfg.impl_->tables.data(), cfg.impl_->tables.size()};
+}
+}  // namespace detail
+
+// --- Baked tables ---
+
+void Config::Impl::build_tables(const Array& root, bool all) {
+    for (detail::TableSlot& slot : tables) {
+        if (!all && slot.built && detail::table_sources_unchanged(slot, root, alloc)) continue;
+        slot.built = detail::build_table(slot, root, alloc, warn);
+    }
+}
+
+Expected<void> Config::add_table(const TableSpec& spec) {
+    for (const detail::TableSlot& s : impl_->tables)
+        if (s.spec.digest == spec.digest)
+            return Unexpected(refused("a table of shape " +
+                                      Str(spec.name.empty() ? "?" : spec.name) +
+                                      " is registered already"));
+    detail::TableSlot slot(impl_->alloc);
+    slot.spec = spec;
+    if (auto r = detail::parse_table_at(spec, slot); !r) return r;
+    impl_->tables.push_back(std::move(slot));
+    impl_->tables.back().built =
+        detail::build_table(impl_->tables.back(), *root_, impl_->alloc, impl_->warn);
+    return {};
+}
+
+List<Error> Config::table_errors() const {
+    Vec<Error> all;
+    for (const detail::TableSlot& s : impl_->tables)
+        for (const Error& e : s.errors) all.push_back(e);
+    return List<Error>({all.data(), all.size()});
+}
+
+Ref<const BakedTable> Config::table_block(uint64_t digest) const noexcept {
+    for (const detail::TableSlot& s : impl_->tables)
+        if (s.spec.digest == digest) return s.built;
+    return nullptr;
 }
 
 Config::ScratchHit Config::scratch_values(const Path& path, Values& out) const noexcept {
@@ -1157,7 +1284,8 @@ Expected<Source> Config::source(const Path& path) const {
         for (size_t i = impl_->layers.size(); i-- > 0 && !at;) {
             detail::Resolved r;
             if (impl_->layers[i].options.enabled &&
-                detail::resolve(*impl_->layers[i].root, path, r) == detail::ResolveStatus::Ok)
+                detail::resolve_in_layer(*impl_->layers[i].root, path, impl_->alias_root(), r) ==
+                    detail::ResolveStatus::Ok)
                 at = i;
         }
     }

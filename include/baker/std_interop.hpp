@@ -60,6 +60,18 @@ inline std::string to_string(const Array& array) {
     return out;
 }
 
+// Values one after another, as a row writes them: (aim 0 0)'s "0 0", (aim (0 0))'s "(0 0)";
+// "()" for none. For a layer tool's LayerEffectEntry::values and below.
+inline std::string to_string(const RowValues& values) {
+    if (values.empty()) return "()";
+    std::string out;
+    for (const Node& v : values) {
+        if (!out.empty()) out += ' ';
+        write(v, string_out(out));
+    }
+    return out;
+}
+
 // The file form of a root array (write_dta).
 inline std::string to_dta(const Array& root, const WriteOptions& options = {}) {
     std::string out;

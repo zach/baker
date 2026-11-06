@@ -121,6 +121,15 @@ struct ShapeDecl {
     Symbol root;  // the file the top-level read began with: the layer that declared it
 };
 
+// A #shape inside an #ifdef branch the read skipped: where, and the file the read began
+// with. Not read, so it has no form. A view's shape set is one per build, so generating
+// views refuses a contract layer that holds one (shape::contract_set).
+struct SkippedShape {
+    Symbol file;
+    int32_t line = 0;
+    Symbol root;
+};
+
 // Where a load defined a name: a macro (`#define NAME`, `#define NAME (body)`, a top-level
 // `[NAME ...]`), or a script function its #autorun commands define
 // (tools::script_functions, <baker/tools/reference.hpp>). For a tool's completion,
@@ -226,6 +235,8 @@ public:
     [[nodiscard]] const Origin* origin_of(Symbol file) const noexcept;  // null: none
     // The shapes the session's reads declared with #shape, in the order read.
     [[nodiscard]] std::span<const ShapeDecl> shapes() const noexcept;
+    // Every #shape the reads passed inside a skipped #ifdef branch, in the order passed.
+    [[nodiscard]] std::span<const SkippedShape> skipped_shapes() const noexcept;
     // Warnings from the files read, in order (the one-way rule), until cleared.
     [[nodiscard]] std::span<const Error> warnings() const noexcept;
     void clear_warnings();
