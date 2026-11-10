@@ -30,7 +30,7 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 - `{*= $variable number}` → value
 
-*Native.* `{*= $x n}`: multiplies, stores and returns the new value.
+*Native.* `{*= $x n}`, or in a method `{*= [property] n}`: multiplies, stores and returns the new value.
 
 ### `+`
 
@@ -54,7 +54,7 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 - `{-= $variable number}` → value
 
-*Native.* `{-= $x n}`: subtracts, stores and returns the new value.
+*Native.* `{-= $x n}`, or in a method `{-= [property] n}`: subtracts, stores and returns the new value.
 
 ### `/`
 
@@ -66,7 +66,7 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 - `{/= $variable number}` → value
 
-*Native.* `{/= $x n}`: divides (a float), stores and returns it.
+*Native.* `{/= $x n}`, or in a method `{/= [property] n}`: divides (a float), stores and returns it.
 
 ### `<`
 
@@ -106,43 +106,182 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 ### `class`
 
-- `{class values...}` → value
+- `{class Name (method ($params...) body...)...}` → value
 
 *Native.* `{class Name (method ($params...) body...) ...}`: script handlers. If `Name` is a bound C++ type, they apply to its objects and are tried before its C++ methods; otherwise `Name` is a script class for `new`. In a handler, `$this` is the object and `[name]` its property or parameter.
 
+### `config.clear_scratch`
+
+- `{config.clear_scratch path}` → value
+
+*Native.* Drops a path's live edit, so its value is the files' again, and the journal records it reverted; returns 1 if there was an edit to drop, 0 if not.
+
+### `config.diff`
+
+- `{config.diff layer_a layer_b}` → value
+
+*Native.* The paths two layers set differently, with each one's values, one child each (absent: not set), verb (op_a, op_b), and the children each folds into its record (folded_a, folded_b).
+
+### `config.digest`
+
+- `{config.digest}` → value
+
+*Native.* The digest of the data as the game reads it, live edits included, as 16 hex digits: the same on every machine with the same data.
+
+### `config.effect`
+
+- `{config.effect layer}` → value
+
+*Native.* What a layer changes: each path, its values (value v...), one child each, its verb (op) if it composes or removes, the values below it (under a verb, the list it changes), its file and line, whether a layer above shadows it, and (stale 1) when its (@was ...) pin no longer names the values below, and (folded N) when N more of the layer's children with the row's tag merge into its record.
+
+### `config.epoch`
+
+- `{config.epoch}` → value
+
+*Native.* A number that moves on every reload, layer change and live edit: a tool asks for it, and for the values again only when it moved.
+
+### `config.explain`
+
+- `{config.explain path}` → value
+
+*Native.* Every contributor to a path's value, bottom to top: each entry's layer, values (one child each), standing (wins, shadowed, removes, composes, disabled), op (#append, #drop, #remove), file, and line.
+
+### `config.get`
+
+- `{config.get path}` → value
+
+*Native.* The value at a path, as get() reads it: several values come as one array.
+
+### `config.journal`
+
+- `{config.journal [since_ns]}` → value
+
+*Native.* The live edits of this session, oldest first, each with its old and new values, where the old one came from, and its fate; [since_ns] keeps the later ones.
+
+### `config.layers`
+
+- `{config.layers}` → value
+
+*Native.* The layers bottom to top, ending with scratch, each with whether it is enabled.
+
+### `config.loop`
+
+- `{config.loop}` → value
+
+*Native.* Edit-to-see and reload times, per file and per layer.
+
+### `config.promote`
+
+- `{config.promote from to}` → value
+
+*Native.* Writes everything a layer changes into another layer's file, or nothing; returns the lines written and any refusals.
+
+### `config.redo`
+
+- `{config.redo}` → value
+
+*Native.* Applies the latest undone transaction again.
+
+### `config.reload`
+
+- `{config.reload}` → value
+
+*Native.* Re-reads changed files now; returns 1 if anything changed.
+
+### `config.restore`
+
+- `{config.restore name}` → value
+
+*Native.* Returns to a named snapshot.
+
+### `config.set`
+
+- `{config.set path value...}` → value
+
+*Native.* Tunes a path live, in the scratch layer; returns the value set.
+
+### `config.set_change_history`
+
+- `{config.set_change_history capacity}` → value
+
+*Native.* Keeps the last N transactions of change records, for config.undo and config.redo; 0 turns the log off.
+
+### `config.snapshot`
+
+- `{config.snapshot name}` → value
+
+*Native.* Captures the whole state (layers, toggles, scratch) under a name.
+
+### `config.source`
+
+- `{config.source path}` → value
+
+*Native.* Where a path's value comes from: (source (layer L) (file F) (line N)), with (origin O) (tool T) when a tool generated the file.
+
+### `config.toggle`
+
+- `{config.toggle layer}` → value
+
+*Native.* Turns a layer (or scratch) off or on; returns 1 if it is now enabled.
+
+### `config.undo`
+
+- `{config.undo}` → value
+
+*Native.* Returns to before the latest transaction of the change log (config.set_change_history turns it on): a command, a drag, a promotion as one step. The files a promotion wrote stay written.
+
+### `config.unsaved`
+
+- `{config.unsaved}` → value
+
+*Native.* The paths tuned live and not yet written back.
+
+### `config.write_back`
+
+- `{config.write_back path}` → value
+
+*Native.* Writes a live-tuned value back to the line it came from; returns the lines written and any refusals.
+
+### `curve.sample`
+
+- `{curve.sample path x}` → float
+
+*Native.* A curve's value at x: the path's values read as a curve (points (x y), with an optional interpolation and extension).
+
 ### `delete`
 
-- `{delete value}` → value
+- `{delete object}` → value
 
 *Native.* `{delete object}`: removes the object (or the object of that name) when the host's eval returns, or at the end of a tick; one `new` created is destroyed. Its handles go stale.
 
 ### `do`
 
-- `{do values...}` → value
+- `{do ($var ($var value)...) body...}` → value
+- `{do body...}` → value
 
 *Native.* `{do ($a ($b 1)) body...}`: binds the variables (unset, or to a value) for the duration of the body, restores them after, and returns the body's last value. Without the list, just runs the body.
 
 ### `extend`
 
-- `{extend values...}` → value
+- `{extend Name (method ($params...) body...)...}` → value
 
 *Native.* `{extend Name (method ($params...) body...) ...}`: adds script handlers to a class, replacing only those of the same name, so another file (a task pack) can add one. `Name` is a `{class}` or a bound C++ type. Run it after the `{class}`: a redefinition replaces every handler.
 
 ### `func`
 
-- `{func values...}` → value
+- `{func name ($params...) [(@status ...)] [(@doc "...")] body...}` → value
 
 *Native.* `{func name ($params...) body...}`: defines a script function. `(@status stub)`, `(@status provisional)`, `(@status deprecated replacement)` and `(@doc "...")` may follow the parameters.
 
 ### `if`
 
-- `{if bool unevaluated [unevaluated]}` → value
+- `{if cond then [else]}` → value
 
 *Native.* `{if cond then [else]}`: evaluates `then` if `cond` is true, else `else` if given (else 0). Only the branch taken is evaluated.
 
 ### `new`
 
-- `{new values...}` → value
+- `{new Class [name] (param value)...}` → value
 
 *Native.* `{new Class [name] (param value)...}`: creates an object of a script class or of a default-constructible bound type, owned by the Context, and returns it.
 
@@ -160,7 +299,7 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 ### `override`
 
-- `{override values...}` → value
+- `{override name ($params...) [(@status ...)] [(@doc "...")] body...}` → value
 
 *Native.* As `func`, but may replace a native function, which it logs.
 
@@ -172,21 +311,21 @@ A parameter in [brackets] is optional, `unevaluated` is passed as written, and
 
 ### `wait`
 
-- `{wait values...}` → value
+- `{wait cond}` → value
 
-*Native.* Suspends a `{scheduler thread_task ...}`; only as one of its commands.
+*Native.* `{wait cond}`: suspends a `{scheduler thread_task ...}` until `cond` is a nonzero number, testing it once a tick; only as one of its commands.
 
 ### `wait_for`
 
-- `{wait_for values...}` → value
+- `{wait_for seconds}` → value
 
-*Native.* Suspends a `{scheduler thread_task ...}`; only as one of its commands.
+*Native.* `{wait_for seconds}`: suspends a `{scheduler thread_task ...}` for that many units of the Scheduler's time; only as one of its commands.
 
 ### `wait_tick`
 
-- `{wait_tick values...}` → value
+- `{wait_tick}` → value
 
-*Native.* Suspends a `{scheduler thread_task ...}`; only as one of its commands.
+*Native.* `{wait_tick}`: suspends a `{scheduler thread_task ...}` until the next tick; only as one of its commands.
 
 ## Types
 

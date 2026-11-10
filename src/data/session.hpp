@@ -68,6 +68,10 @@ struct SessionAccess {
     // what its record says, or 1 for a cache written before that was recorded.
     [[nodiscard]] static uint32_t aliases(const LoadSession& s) noexcept;
     static void set_aliases(LoadSession& s, uint32_t count) noexcept;
+    // Marks the session as having recorded a read, so write_cache keeps a record of it:
+    // for a tree written without a read (a stack image's section), whose record is
+    // empty but for the counts set here.
+    static void set_recorded(LoadSession& s, bool recorded) noexcept;
     [[nodiscard]] static uint64_t parses(const LoadSession& s) noexcept;
     // The #autorun commands the last top-level read added.
     [[nodiscard]] static std::span<const Node> new_autorun(const LoadSession& s) noexcept;

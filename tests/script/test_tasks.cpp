@@ -167,6 +167,29 @@ TEST_CASE("a frame over the budget fails at spawn, naming the task and both size
     CHECK(sum != 0);
 }
 
+TEST_CASE("a frame takes the smallest block that holds it, and goes back to its size") {
+    Context ctx;
+    Scheduler s(ctx, {.frame_bytes = 16384, .chunk = 4});
+    int destroyed = 0, sum = 0;
+    // A small frame takes a block of the smallest class that fits it: one chunk of four.
+    const TaskHandle small = ok(s.spawn(forever(s, &destroyed)));
+    CHECK(s.stats().blocks == 4);
+    const size_t small_bytes = s.stats().pool_bytes;
+    CHECK(small_bytes <= 4 * 256);
+    // An 8 KB frame takes the budget's class: another chunk, of blocks past 8 KB each.
+    ok(s.spawn(big(s, &sum)));
+    CHECK(s.stats().blocks == 8);
+    CHECK(s.stats().pool_bytes - small_bytes >= 4 * 8192);
+    s.tick(0);
+    s.tick(0);  // big finishes and gives its block back to its own class
+    s.cancel(small);
+    s.tick(0);
+    // Three more small and one big again: no chunk is added for either.
+    for (int i = 0; i < 3; ++i) ok(s.spawn(forever(s, &destroyed)));
+    ok(s.spawn(big(s, &sum)));
+    CHECK(s.stats().blocks == 8);
+}
+
 TEST_CASE("max_tasks caps live tasks; a task made for another Scheduler is refused") {
     Context ctx;
     Scheduler capped(ctx, {.max_tasks = 1});

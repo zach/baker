@@ -210,9 +210,12 @@ case baker::host::SimRun::Wants::Done:          // run.status() is the exit stat
 - `changed` lists each scenario and seed whose pass moved. For an objective judged by its
   median, it lists each scenario whose median verdict moved, with `"over": "median"` in
   place of the seed.
+- `before` and `after` are the objective's tallies in each set of results, as in `summary`;
+  `null` where it was absent. `median_change` is the after median minus the before, or
+  `null` when either is missing.
 - `broke` and `fixed` count objectives. The exit code is 1 when `broke` is above 0.
 
 ## Stability
 
-Versioning follows `check`'s (`check-json.md`): a field is added only with a new minor
+Versioning follows [`check`'s](check-json.md#stability): a field is added only with a new minor
 version, and removed, renamed or changed only with a new major version.

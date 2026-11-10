@@ -165,7 +165,11 @@ TEST_CASE("check over the corpus's scripts, with their functions registered by a
 }
 
 TEST_CASE("docs/script-reference.md matches the code") {
+    // With the console's config.* commands, write ones included, which a game binds for its
+    // tools (bind_config_tools): a tool author finds them here too.
+    Config cfg({.tweaks = nullptr});
     Context ctx;
+    REQUIRE(tools::bind_config_tools(ctx, cfg, {.allow_write = true}));
     const std::string generated = reference(ctx);
     const std::string path = BAKER_SOURCE_DIR "/docs/script-reference.md";
     if (std::getenv("BAKER_UPDATE_REFERENCE")) REQUIRE(write_reference(ctx, path));

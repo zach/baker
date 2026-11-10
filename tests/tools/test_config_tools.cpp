@@ -126,6 +126,29 @@ TEST_CASE("the live tools: set, unsaved, journal, toggle, snapshot, restore, rel
     CHECK(eval(f.ctx, "{config.loop}").rfind("((reloads 2) (unchanged 1) (failures 0)", 0) == 0);
 }
 
+TEST_CASE("config.undo and config.redo step over the console's commands as transactions") {
+    Fixture f;
+    CHECK(eval(f.ctx, "{config.set_change_history 8}") == "8");
+    CHECK(eval(f.ctx, "{config.toggle local}") == "0");
+    CHECK(eval(f.ctx, "{config.set box.width 4.5}") == "4.5");
+    CHECK(eval(f.ctx, "{config.set phase 1 2}") == "(1 2)");
+    REQUIRE(f.cfg.transaction_count() == 3);
+    CHECK(f.cfg.transaction_at(0).name == Symbol("config.toggle"));
+    CHECK(f.cfg.transaction_at(1).name == Symbol("config.set"));
+    CHECK(eval(f.ctx, "{config.undo}") == "1");
+    CHECK(eval(f.ctx, "{config.undo}") == "1");
+    CHECK(f.cfg.get<int>("box.width") == 2);  // local is off, the edit undone
+    CHECK(f.cfg.get<int>("phase.0") == 10);
+    CHECK(eval(f.ctx, "{config.redo}") == "1");
+    CHECK(f.cfg.get<float>("box.width") == 4.5f);
+    CHECK(eval(f.ctx, "{config.undo}") == "1");
+    CHECK(eval(f.ctx, "{config.undo}") == "1");
+    CHECK(f.cfg.get<int>("box.width") == 3);  // local is on again
+    CHECK_FALSE(f.ctx.eval("{config.undo}", "test"));
+    CHECK(eval(f.ctx, "{config.set_change_history 0}") == "0");
+    CHECK_FALSE(f.ctx.eval("{config.redo}", "test"));
+}
+
 TEST_CASE("config.clear_scratch drops one path's live edit, and says whether there was one") {
     Fixture f;
     REQUIRE(f.ctx.eval("{config.set box.width 4.5}", "test"));

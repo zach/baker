@@ -555,10 +555,10 @@ void layers_panel(baker::Config& cfg, LayersState& state) {
                     if (effect->empty()) ImGui::TextDisabled("changes nothing");
                     for (const baker::LayerEffectEntry& e : *effect) {
                         ImGui::Text("%s%s: %s -> %s", e.shadowed ? "(shadowed) " : "",
-                                    e.path.c_str(),
+                                    e.path->data(),
                                     e.below ? baker::to_string(*e.below).c_str() : "(none)",
                                     baker::to_string(e.values).c_str());
-                        hover_provenance(cfg, e.path.str());
+                        hover_provenance(cfg, e.path->view());
                     }
                 } else {
                     ImGui::TextWrapped("%s", error_text(effect.error()).c_str());

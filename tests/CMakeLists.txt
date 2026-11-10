@@ -15,6 +15,7 @@ add_executable(baker_data_tests
   data/test_arena.cpp
   data/test_cache.cpp
   data/test_config.cpp
+  data/test_config_costs.cpp
   data/test_core.cpp
   data/test_curve.cpp
   data/test_corpus.cpp
@@ -25,6 +26,7 @@ add_executable(baker_data_tests
   data/test_layer_dir.cpp
   data/test_include_dir.cpp
   data/test_table.cpp
+  data/test_changes.cpp
   data/test_received_layers.cpp
   data/test_symbol_collision.cpp
   data/test_symbol_hash.cpp
@@ -67,6 +69,7 @@ if(BAKER_BUILD_SCRIPT)
     script/test_fatal.cpp
     script/test_messages.cpp
     script/test_object.cpp
+    script/test_script_costs.cpp
     script/test_script_tasks.cpp
     script/test_stats.cpp
     script/test_tasks.cpp

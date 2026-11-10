@@ -13,20 +13,22 @@
 namespace views_test {
 
 struct Move {
-    uint16_t startup = 0;
-    float damage = 0;
     std::string_view name;
     baker::Symbol button;
-    bool armored = false;
     baker::ListView<baker::Symbol> cancel_into;
-    views_test::Vec2 hitbox;
     baker::ListView<views_test::Vec2> points;
     baker::Curve ramp;
+    float damage = 0;
+    views_test::Vec2 hitbox;
+    uint16_t startup = 0;
+    bool armored = false;
 
     static constexpr std::string_view kShapeName = baker::view_text("move");
-    static constexpr uint64_t kShapeDigest = 0x85dacdec6bf14a7eull;
+    static constexpr uint64_t kShapeDigest = 0x3a4a69f353315891ull;
     static constexpr std::string_view kAt = "fighters * moves";
     static constexpr bool kKeyed = true;
+    // (@view by_id): the table keeps each record's ID, for index_of(RecordId).
+    static constexpr bool kById = true;
     // The members a baked table relocates: defined in move_read.hpp.
     static constexpr std::span<const baker::ViewFixup> fixups() noexcept;
 };

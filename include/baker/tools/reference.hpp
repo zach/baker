@@ -18,7 +18,7 @@ namespace baker::tools {
 void reference(const Context& ctx, TextSink out, const LoadSession* packs = nullptr);
 [[nodiscard]] Expected<void> write_reference(const Context& ctx, std::string_view path,
                                              const LoadSession* packs = nullptr);
-// The same as JSON (schema baker.reference/1.1, docs/reference-json.md), for tools and
+// The same as JSON (schema baker.reference/1.6, docs/reference-json.md), for tools and
 // agents: every function with its overloads' parameter types, status, documentation, and,
 // for a script function, its file and line; every type's methods, properties, and script
 // handlers; script-only classes; documented globals; the objects added under a name, with
@@ -26,10 +26,10 @@ void reference(const Context& ctx, TextSink out, const LoadSession* packs = null
 // origins. Sorted by name, so the same Context gives the same bytes.
 void write_reference_json(const Context& ctx, TextSink out, const LoadSession* packs = nullptr);
 
-// Writes the report as one JSON object, schema "baker.check/1" (docs/check-json.md): the
+// Writes the report as one JSON object, schema "baker.check/1.5" (docs/check-json.md): the
 // same data as write(), every list in an order that depends only on the data, so two runs
 // over the same files give the same bytes. Given the session, it lists its packs and their
-// harness metadata too. <baker/std_script.hpp> has to_json(report).
+// harness metadata too. <baker/tools/std_tools.hpp> has to_json(report).
 void write_json(const CheckReport& report, TextSink out, const LoadSession* packs = nullptr);
 
 // The script functions that #autorun commands define with {func NAME ...}, each where it is

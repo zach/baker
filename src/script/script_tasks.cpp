@@ -26,7 +26,9 @@ struct ScriptTask {
     Symbol var;  // interp_task's variable
     Node self;   // $this when the task was made: the task ends with that object
     uint32_t count = 0;
-    Symbol names[kMaxCaptures];
+    // Each capture's cell, and the task's value of it. Cells stay where they are for the
+    // Context's life, and are distinct, one to a name.
+    Node* cells[kMaxCaptures] = {};
     Node values[kMaxCaptures];
 };
 
@@ -39,17 +41,22 @@ bool capture(const Node& n, Context::Impl& impl, ScriptTask& t) {
         return true;
     }
     const Symbol name = n.var_name();
-    if (name.empty() || name == sym_this() || name == t.var) return true;
-    if (std::find(t.names, t.names + t.count, name) != t.names + t.count) return true;
-    if (std::any_of(impl.globals.begin(), impl.globals.end(),
-                    [&](const Global& g) { return g.name == name; }))
-        return true;
-    const Node* cell = impl.cell_if(name);
+    if (name.empty() || name == sym_this() || name == t.var || impl.is_global(name)) return true;
+    // Bound, so its page is there: cell_if finds it without making one.
+    Node* cell = const_cast<Node*>(impl.cell_if(name));
     if (!cell || is_unset(*cell)) return true;
+    if (std::find(t.cells, t.cells + t.count, cell) != t.cells + t.count) return true;
     if (t.count == kMaxCaptures) return false;
-    t.names[t.count] = name;
+    t.cells[t.count] = cell;
     t.values[t.count++] = *cell;
     return true;
+}
+
+// Swaps the task's values with what its captures' cells hold: in before a step, so the
+// step sees them, and out after it, so the caller's values are back and the task keeps
+// what its own {set}s left. Moves, with no count touched and nothing for Rebind to save.
+void swap_captures(ScriptTask& t) noexcept {
+    for (uint32_t i = 0; i < t.count; ++i) std::swap(*t.cells[i], t.values[i]);
 }
 
 // Runs `nodes` with the task's captures bound, then keeps their values, so the task's own
@@ -59,10 +66,10 @@ Expected<Node> step(Context& ctx, ScriptTask& t, std::span<const Node> nodes,
     Context::Impl& impl = ctx.impl();
     Rebind rebind(impl);
     if (t.self.type() == Type::Object) impl.bind(sym_this(), t.self);
-    for (uint32_t i = 0; i < t.count; ++i) impl.bind(t.names[i], t.values[i]);
+    swap_captures(t);
     if (interp) impl.bind(t.var, *interp);
     auto r = ctx.run(nodes);
-    for (uint32_t i = 0; i < t.count; ++i) t.values[i] = *impl.cell(t.names[i]);
+    swap_captures(t);
     return r;
 }
 
@@ -231,14 +238,31 @@ void Scheduler::bind(Binder<Scheduler>& b) {
 
 void register_task_builtins(Context& ctx) {
     // The waits are thread_task's own forms; anywhere else they are an error.
-    for (const char* name : {"wait", "wait_for", "wait_tick"}) {
-        auto r = ctx.func(name, [](Args a) -> Expected<Node> {
+    struct Wait {
+        const char* name;
+        const char* usage;
+        const char* doc;
+    };
+    const Wait waits[] = {
+        {"wait", "{wait cond}",
+         "`{wait cond}`: suspends a `{scheduler thread_task ...}` until `cond` is a nonzero "
+         "number, testing it once a tick; only as one of its commands."},
+        {"wait_for", "{wait_for seconds}",
+         "`{wait_for seconds}`: suspends a `{scheduler thread_task ...}` for that many units "
+         "of the Scheduler's time; only as one of its commands."},
+        {"wait_tick", "{wait_tick}",
+         "`{wait_tick}`: suspends a `{scheduler thread_task ...}` until the next tick; only as "
+         "one of its commands."},
+    };
+    for (const Wait& w : waits) {
+        auto r = ctx.func(w.name, [](Args a) -> Expected<Node> {
             return Unexpected(
                 a.error("{" + Str(a.name().str()) +
                             "} works only as a command of {scheduler thread_task ...}",
                         ErrorCode::Refused));
         });
-        if (r) r->doc("Suspends a `{scheduler thread_task ...}`; only as one of its commands.");
+        if (!r) continue;
+        r->doc(w.doc).usage(w.usage);
     }
 }
 

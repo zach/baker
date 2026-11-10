@@ -78,10 +78,10 @@ Scheduler& task_home(First& first, [[maybe_unused]] Rest&... rest) noexcept {
         return task_home(rest...);
 }
 
-// The pool (task.cpp): a block of the Scheduler's frame budget, or null if `size` exceeds
-// it (the size is recorded for spawn's error).
+// The pool (task.cpp): the smallest block that holds `size`, or null if `size` exceeds the
+// Scheduler's frame budget (the size is recorded for spawn's error). `size` frees it again.
 [[nodiscard]] void* task_frame(Scheduler& s, size_t size) noexcept;
-void free_task_frame(void* frame) noexcept;
+void free_task_frame(void* frame, size_t size) noexcept;
 
 // What every task promise holds: its Scheduler, and its slot once spawned.
 struct TaskPromiseBase {
@@ -110,8 +110,8 @@ public:
         static void* operator new(size_t size, A&... a) noexcept {
             return detail::task_frame(detail::task_home(a...), size);
         }
-        static void operator delete(void* frame, size_t) noexcept {
-            detail::free_task_frame(frame);
+        static void operator delete(void* frame, size_t size) noexcept {
+            detail::free_task_frame(frame, size);
         }
         static Task get_return_object_on_allocation_failure() noexcept { return Task(); }
 
@@ -189,9 +189,12 @@ struct NextTick {
 }
 
 struct SchedulerOptions {
-    uint32_t frame_bytes = 4096;  // the frame budget: the largest task frame
-    uint32_t chunk = 64;          // blocks taken from the Context's allocator at a time
-    uint32_t max_tasks = 0;       // live tasks allowed at once; 0: no limit
+    // The frame budget: the largest task frame. A frame takes the smallest of the
+    // pool's blocks that holds it, each twice the last from 128 bytes, so the budget bounds a
+    // frame without setting what each task costs.
+    uint32_t frame_bytes = 4096;
+    uint32_t chunk = 64;     // blocks of one size taken from the Context's allocator at a time
+    uint32_t max_tasks = 0;  // live tasks allowed at once; 0: no limit
 };
 
 struct SchedulerStats {
@@ -199,6 +202,7 @@ struct SchedulerStats {
     uint32_t peak = 0;           // the most live at once
     uint32_t resumed = 0;        // tasks the last tick resumed
     uint32_t blocks = 0;         // frame blocks the pool holds, in use or free
+    size_t pool_bytes = 0;       // the bytes those blocks take
     uint32_t largest_frame = 0;  // the largest frame asked for, in bytes
 };
 

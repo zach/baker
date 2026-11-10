@@ -107,7 +107,7 @@ TEST_CASE("readiness loop: edit, see, tune, save, experiment, and return") {
     const auto effect = layer_effect(cfg, "experiment");
     REQUIRE(effect);
     REQUIRE(effect->size() == 1);
-    CHECK((*effect)[0].path == "warden.cadence");
+    CHECK((*effect)[0].path->view() == "warden.cadence");
     CHECK((*effect)[0].values[0].try_float() == 0.9);
     CHECK((*(*effect)[0].below)[0].try_float() == 1.25);
     CHECK((*effect)[0].below_source->layer == "default");

@@ -45,7 +45,8 @@ bool later(const Due& a, const Due& b) noexcept {
 struct Scheduler::Impl {
     Impl(Scheduler& s, Context& c, SchedulerOptions o)
         : self(s), ctx(c), alloc(with_kind(c.impl().alloc, MemoryKind::Tasks)), options(o) {
-        if (options.chunk == 0) options.chunk = 1;  // the size grow() and ~Scheduler agree on
+        if (options.chunk == 0) options.chunk = 1;
+        make_classes();
     }
 
     Scheduler& self;
@@ -66,38 +67,69 @@ struct Scheduler::Impl {
     Vec<Due> ready{alloc};  // this tick's batch; reused
     Vec<uint32_t> cancels{alloc};
 
-    // The pool: chunks from the Context's allocator, and a free list of blocks.
-    Vec<void*> chunks{alloc};
-    BlockHeader* free_blocks = nullptr;
+    // The pool: size classes of blocks, each twice the last from kSmallest, the last
+    // the frame budget's; each class takes chunks of `chunk` blocks from the Context's
+    // allocator and keeps a free list. A frame takes the smallest block it fits, so a task
+    // costs about its frame, not the budget.
+    static constexpr size_t kSmallest = 128;  // header and frame
+    static constexpr size_t kMaxClasses = 24;
+    struct Chunk {
+        void* mem;
+        size_t bytes;
+    };
+    Vec<Chunk> chunks{alloc};
+    BlockHeader* free_blocks[kMaxClasses] = {};
+    size_t class_bytes[kMaxClasses] = {};
+    uint32_t classes = 0;
     uint32_t refused = 0;  // the last frame size the pool refused, for spawn's error
     SchedulerStats stats;
 
-    [[nodiscard]] size_t block_bytes() const noexcept {
+    // The block sizes: doubling from kSmallest, aligned as operator new aligns, and the
+    // budget's block last.
+    void make_classes() noexcept {
         const size_t a = __STDCPP_DEFAULT_NEW_ALIGNMENT__;
-        return (kHeader + options.frame_bytes + a - 1) / a * a;
+        const size_t last = (kHeader + options.frame_bytes + a - 1) / a * a;
+        for (size_t b = kSmallest; b < last && classes + 1 < kMaxClasses; b *= 2)
+            class_bytes[classes++] = b;
+        class_bytes[classes++] = last;
+    }
+    // The class whose blocks hold a frame of `size`; `classes` if none does.
+    [[nodiscard]] uint32_t class_of(size_t size) const noexcept {
+        const size_t need = kHeader + size;
+        uint32_t k = 0;
+        while (k < classes && class_bytes[k] < need) ++k;
+        return k;
     }
 
     void* frame(size_t size) noexcept {
         if (size > stats.largest_frame) stats.largest_frame = static_cast<uint32_t>(size);
-        if (size > options.frame_bytes) {
+        const uint32_t k = size > options.frame_bytes ? classes : class_of(size);
+        if (k == classes) {
             refused = static_cast<uint32_t>(size);
             return nullptr;
         }
-        if (!free_blocks) grow();
-        BlockHeader* b = free_blocks;
-        free_blocks = b->next_free;
+        if (!free_blocks[k]) grow(k);
+        BlockHeader* b = free_blocks[k];
+        free_blocks[k] = b->next_free;
         return reinterpret_cast<char*>(b) + kHeader;
     }
-    void grow() {
-        const size_t n = options.chunk;
+    void release(void* frame, size_t size) noexcept {
+        auto* b = reinterpret_cast<BlockHeader*>(static_cast<char*>(frame) - kHeader);
+        const uint32_t k = class_of(size);
+        b->next_free = free_blocks[k];
+        free_blocks[k] = b;
+    }
+    void grow(uint32_t k) {
+        const size_t n = options.chunk, block = class_bytes[k];
         auto* mem = static_cast<char*>(
-            detail::allocate(alloc, n * block_bytes(), __STDCPP_DEFAULT_NEW_ALIGNMENT__));
-        chunks.push_back(mem);
+            detail::allocate(alloc, n * block, __STDCPP_DEFAULT_NEW_ALIGNMENT__));
+        chunks.push_back({mem, n * block});
         for (size_t i = n; i-- > 0;) {
-            auto* b = ::new (mem + i * block_bytes()) BlockHeader{this, free_blocks};
-            free_blocks = b;
+            auto* b = ::new (mem + i * block) BlockHeader{this, free_blocks[k]};
+            free_blocks[k] = b;
         }
         stats.blocks += static_cast<uint32_t>(n);
+        stats.pool_bytes += n * block;
     }
 
     [[nodiscard]] TaskSlot* slot(TaskHandle t) noexcept {
@@ -151,10 +183,8 @@ void* task_frame(Scheduler& s, size_t size) noexcept {
     return s.impl().frame(size);
 }
 
-void free_task_frame(void* frame) noexcept {
-    auto* b = reinterpret_cast<BlockHeader*>(static_cast<char*>(frame) - kHeader);
-    b->next_free = b->pool->free_blocks;
-    b->pool->free_blocks = b;
+void free_task_frame(void* frame, size_t size) noexcept {
+    reinterpret_cast<BlockHeader*>(static_cast<char*>(frame) - kHeader)->pool->release(frame, size);
 }
 
 namespace {
@@ -200,8 +230,7 @@ Scheduler::~Scheduler() {
     for (uint32_t i = 0; i < impl_->slots.size(); ++i)
         if (impl_->slots[i].wait != Wait::Free) impl_->slots[i].h.destroy();
     const Allocator alloc = impl_->alloc;  // a copy: impl_ goes first
-    const size_t bytes = impl_->options.chunk * impl_->block_bytes();
-    for (void* c : impl_->chunks) detail::deallocate(alloc, c, bytes);
+    for (const Impl::Chunk& c : impl_->chunks) detail::deallocate(alloc, c.mem, c.bytes);
     detail::destroy(alloc, impl_);
 }
 

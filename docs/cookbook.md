@@ -2,6 +2,8 @@
 
 Patterns for using Baker well. The [language guide](language.md) says what each piece is;
 this says how they fit a studio's day. Each pattern links the example that runs it.
+Snippets leave out the handling of the `[[nodiscard]]` `Expected` results most calls return;
+the examples handle each one.
 
 - [Group parameters under the code that owns them](#group-parameters-under-the-code-that-owns-them)
 - [Tweaks in practice](#tweaks-in-practice)
@@ -12,10 +14,16 @@ this says how they fit a studio's day. Each pattern links the example that runs 
 - [Live ops](#live-ops)
 - [The binary cache in a build step](#the-binary-cache-in-a-build-step)
 - [Views in the build](#views-in-the-build)
+- [Renaming a record, a field, and naming a file](#renaming-a-record-a-field-and-naming-a-file)
+- [Content packages: patches, DLC, and mods](#content-packages-patches-dlc-and-mods)
+- [Budgets for script you did not write](#budgets-for-script-you-did-not-write)
 - [Linking a shipped game](#linking-a-shipped-game)
+- [Memory budgets](#memory-budgets)
 - [Harness packs](#harness-packs)
 - [A developer console over `eval`](#a-developer-console-over-eval)
 - [Threads](#threads)
+- [Agreeing on the data: lockstep, replays, saves](#agreeing-on-the-data-lockstep-replays-saves)
+- [Stable IDs for names](#stable-ids-for-names)
 - [Repro scripts](#repro-scripts)
 
 ## Group parameters under the code that owns them
@@ -78,7 +86,8 @@ static baker::Tweak<float> kJumpHeight{"player.jump.height", 1.2f,
 - **Tests** give a tweak its own `TweakRegistry` and Config, so they do not share the
   global one.
 
-`examples/one_line_tweak` and the [README's five-minute path](../README.md) run them.
+`examples/one_line_tweak` and the
+[README's five-minute path](../README.md#five-minutes-to-a-working-tweak) run them.
 
 ## Reload callbacks: migrate or punt
 
@@ -102,10 +111,11 @@ cfg.on_reload(
 - Punt first. Migrate only where a rebuild loses state someone is looking at (a playing
   sound, a camera mid-move), and let migration decline when the change is too large.
 - A reload that fails to parse changes nothing: no callback fires, and the old tree stays.
-- `cfg.on_reload_complete(...)` sees each change's `ReloadRecord`: six timed stages (scan,
-  read, parse, merge, bind, notify), the files reloaded, the tweaks changed, and how many
-  callbacks migrated or punted. Give it `ReloadRequest{.origin_ns = saved_at}` from a file
-  watcher, and the record measures edit to effect.
+- `cfg.on_reload_complete(...)` sees each change's `ReloadRecord`: seven timed stages (scan,
+  write-back's write, read, parse, merge, bind, notify), how many files reloaded and tweaks
+  changed, and how many callbacks migrated or punted. Give it
+  `ReloadRequest{.origin_ns = saved_at}` from a file watcher, and the record measures edit
+  to effect.
 - Call `cfg.mark_visible()` once a frame, when it presents: it costs one branch when
   nothing is waiting. `cfg.loop_stats()` then gives, per file and per layer, the median and
   worst time from a saved edit to the frame that showed it, over the last 32 edits, with
@@ -166,7 +176,8 @@ if (auto r = baker::open_project(cfg, *project); !r) return report(r.error());
   in the stack, skipped by the merge, for a panel to toggle; `dev_only` marks a layer for
   development only (one person's tuning, an agent's proposal awaiting review), which a
   shipping build never pushes even when its file is present. A `(dir "path")` entry is a
-  directory of layers, one for each file or folder in it (see Content packages below); its
+  directory of layers, one for each file or folder in it (see
+  [Content packages](#content-packages-patches-dlc-and-mods)); its
   flags apply to every layer it finds.
 - **A condition:** `(when COND)` keeps a layer in the merge only while the session's
   defines say so: a platform's differences, a demo build's store, an experiment for one
@@ -192,9 +203,10 @@ if (auto r = baker::open_project(cfg, *project); !r) return report(r.error());
   layer that reads and returns a `ProjectProblem` (the layer's name and its error) for each
   one that does not. A layer that does not read is left out, and the layers above it read
   over the ones below. Without `go_on`, as a game opens it, the first error stops it.
-- **The reference** names where the game's build writes `tools::write_reference_json`, for tools
-  that check data without the game. `read_project` returns the path in `Project::reference`
-  and does not ask that it exist; a game ignores it.
+- **The reference** names the file the game's build writes with
+  `tools::write_reference_json`, for tools that check data without the game.
+  `read_project` returns the path in `Project::reference` and does not ask that it exist;
+  a game ignores it.
 - **Finding the project:** `find_project(path)` returns the nearest `baker-project.dta`
   in `path` or a directory above it, or nothing, so an editor opened on a folder holding
   several games finds each file's project. Give it a reader to look through the editor's
@@ -218,6 +230,9 @@ cfg.push_layer("patch-2026-10-11", overlay);   // live patches go above local
 ```
 
 - Push it above the shared layers and below live patches.
+  [Experiment layers](#experiments-and-ab-comparison) sit below the live overlays too, so a
+  developer reproducing a live problem sees what players see, with their own tuning on top
+  only if they enable it.
 - `{.optional = true}` makes a missing file an empty layer. The next `reload()` picks the
   file up once it exists, and `write_back_to(path, "local")` creates it.
 - Keep the directory out of version control:
@@ -229,20 +244,38 @@ cfg.push_layer("patch-2026-10-11", overlay);   // live patches go above local
 - To keep a value for yourself, tune it, then `write_back_to(path, "local")`. To share an
   experiment, `promote("local", "default")` writes its entries into the shared file as one
   reviewable diff, or nothing if any entry cannot be written.
-- Before quitting, check what was tuned and not kept: `cfg.unsaved()` lists the paths, and
-  `cfg.journal(fn)` every live edit of the session (up to the last 256) with its old and
-  new values, where the old one came from, and whether it was written, reverted, or
-  superseded. A harness can warn at exit, and the journal's counts say how much
-  tuning was kept.
 
 `examples/config` writes a value into a `local` layer that did not exist;
 `examples/harness-imgui` pushes `local/<user>.dta` this way.
+
+### Before quitting
+
+Check what was tuned and not kept.
+
+- **`cfg.unsaved()`** lists the paths.
+- **The change history.** `cfg.set_change_history(n)` keeps the last `n` transactions of
+  change records, each with its whole old and new values, the record's ID, the layer
+  written and the old value's source. It is off unless asked for: with it on, a live edit
+  allocates its values' trees and the merged tree is rebuilt at once.
+- **What it records.** A layer pushed, removed or reloaded, a restore, a write-back and a
+  promotion each record what changed in the merged tree: keyed records added, removed or
+  renamed (by ID or alias), values set, lists appended to or dropped from, children
+  reordered, and the lines a promotion wrote.
+- **Transactions.** `begin_transaction`/`end_transaction` make a drag or a command one step.
+- **Undo and redo.** `cfg.undo()` returns to before the latest transaction, in memory, as
+  `restore` does, and `cfg.redo()` applies it again. A promotion is one step, and the files
+  it wrote stay written, named in its transaction.
+- **The journal.** `cfg.journal(fn)` visits every live edit of the session (up to the last
+  256) with its old and new values, where the old one came from, and whether it was
+  written, reverted, or superseded. A harness can warn at exit, and the journal's
+  counts say how much tuning was kept.
 
 ## Experiments and A/B comparison
 
 Put a variant in its own layer and flip it:
 
 ```cpp
+cfg.push_layer("boss-slower", "config/experiments/boss-slower.dta");
 cfg.push_layer("boss-faster", "config/experiments/boss-faster.dta");
 cfg.toggle_layer("boss-faster");               // A
 cfg.toggle_layer("boss-faster");               // B
@@ -254,8 +287,8 @@ A disabled layer keeps its place and is skipped by merging, provenance, and writ
 Live tuning goes to the `scratch` layer, so "my tuning versus the files" is also a toggle:
 `cfg.toggle_layer("scratch")`.
 
-`source()` names the layer a value comes from; `tools::explain(cfg, path)` names every layer that
-has a say, bottom to top. Each entry gives the layer, its values (one node each, so
+`source()` names the layer a value comes from; `tools::explain(cfg, path)` names every layer
+that has a say, bottom to top. Each entry gives the layer, its values (one node each, so
 `(aim 0 0)` is two and `(aim (0 0))` one), its file and line, and how it stands:
 
 - `Wins`: it supplies the value `get` returns.
@@ -282,7 +315,8 @@ comparison of two tuned states one call each.
 A shipped game changes its data without a new build by taking **overlays**: small files of
 only what changes, each pushed as a layer of its own above everything shipped. A layer is
 the whole mechanism: merging applies it, provenance names it, `layer_effect` says what it
-changes, and removing it takes it back. `examples/live-ops` runs each step below.
+changes, and removing it takes it back. An overlay's life is a flow: check it, stage it,
+apply it at a boundary, and roll it back. `examples/live-ops` runs each step below.
 
 ### Environment boundaries
 
@@ -303,11 +337,12 @@ overlays/live/...            pushed to players, after QA
   changes: `Config({.live_layers = true})` is the one door overlays come through. Under
   `BAKER_SHIPPING`, reload, toggles, `set()`, write-back, and `promote()` are inert
   whatever the options say, and `dev_only` tweaks keep their defaults.
-- An overlay arrives as text from the studio's server; read it with
-  `read_string(text, "patch-2026-10-17.dta")`, whose name labels its errors and its
-  provenance, and push the tree: `cfg.push_layer("patch-2026-10-17", tree)`.
+- An overlay arrives as text from the studio's server; push it with
+  `cfg.push_layer_text("patch-2026-10-17", text)`, whose name labels its errors and its
+  provenance, and which reads it as text only, refusing an `#include`
+  ([Applying](#applying)).
 - Do not push a QA overlay to live by copying it into the live directory by hand; promote
-  it through the same review a code change gets (below).
+  it through the same review a code change gets ([Version history](#version-history)).
 
 ### Version history
 
@@ -321,36 +356,53 @@ overlays/live/...            pushed to players, after QA
   it; restoring the snapshot gives back the exact values, overlays included, without
   reading files that may have changed since.
 
-### Rollback
+### An overlay is a pack
 
-```cpp
-cfg.remove_layer("2026-10-17-double-xp");
+An overlay that leaves the studio is a file with a name, a version, and the base it was made
+for. The shipped data declares itself a pack too, so an overlay can say which base it
+needs:
+
+```dta
+; data/default.dta
+#pack (game_data (level game) (version "1.0"))
+
+; overlays/2026-10-17-double-xp.dta
+#pack (double_xp_1017 (level live) (version 1) (requires (game_data "1.0")))
+#origin ("liveops console, ticket 4412" (tool baker-publish))
+(event (xp_multiplier 2) (banner "Double XP all weekend!"))
 ```
 
-The values below the overlay return, the tweaks rebind, and reload callbacks fire, as for
-any layer change. Rollback leaves no trace because an overlay never modified anything: the
-shipped trees are immutable, and the merged tree is recomputed without it. That is why
-overlays are layers and not edits to a shipped file. Keep overlays independent (each
-setting only its own values) so that removing one never needs another removed first.
+- With the pack levels set (`cfg.session().set_pack_levels({"game", "live"})`), an overlay
+  made for game data `"1.1"` is warned about against `"1.0"`. Under `warnings_refuse` it is
+  refused.
+- `#origin` carries into provenance. `source("event.xp_multiplier")` names the
+  overlay's layer, the ticket, and the publishing tool, so an operator can see what is live
+  and why.
+- The pack's `requires` and its `origin` are read with the text. A tree read separately
+  and pushed directly carries neither.
 
-### Tests before an overlay ships
+### Checking an overlay
+
+A shipped game should take an overlay only after checking it, and only within bounds it
+declares. The same checks run in CI, before the overlay reaches the server.
 
 - **Shapes.** Declare, in the shipped data, the shapes of everything an overlay may set,
   with ranges: `(event (drop_rate float (@range 0 1)))`. With
   `cfg.add_validator(baker::shape::validator(), {.any_thread = true})`, the shapes judge
   every push and every check of an overlay before it is pushed: `examples/live-ops` refuses
-  an overlay that sets a 15% drop rate as `15`.
-- **`check`.** An overlay that carries script (`(on_event {grant_xp 2})`) gets
+  an overlay that sets a 15% drop rate as `15`. They judge only the records the overlay
+  names, and those that name a record it removes, so a warning that stands in the shipped
+  data does not refuse every overlay under `warnings_refuse`.
+- **Script.** An overlay that carries script (`(on_event {grant_xp 2})`) gets
   `baker::check` against a Context with the game's functions bound: a wrong call is an
   error before a player runs it. `cfg.add_validator(baker::check_validator(ctx))` checks
   every push in a development build.
+- **Checks only, in shipping.** A validator only warns after a merge, so a shipping game
+  that judges overlays can add it with `{.checks_only = true}`: it runs in every check and
+  every push with a policy, where it can refuse, and never after a change, where its
+  whole-tree walk would cost a frame for nothing. `baker::host::Live` does this in shipping.
 - **In CI**, run both over every file under `overlays/`, stacked on the shipped data, on
   every change. An overlay that fails never reaches the server.
-
-### Bounding what an overlay may change
-
-A shipped game should take an overlay only after checking it, and only within bounds it
-declares.
 
 **The policy.** A `LayerPolicy` states the bounds:
 
@@ -375,11 +427,7 @@ outside, changing nothing:
 - it runs the validators over the stack with the overlay;
 - it reports the overlay's effect, refusals and warnings.
 
-**The push.** `push_layer_text(name, text, {.policy = &policy})` reads the text as the
-check does, runs the same check, and refuses, changing nothing, if the policy refuses. The
-layer is read as a file layer is, so its pack and `origin` are recorded, and the Config
-keeps the text to read again when a layer below it changes. `push_layer` takes a policy too,
-by path or with a tree.
+`cfg.check_layer(name, tree, policy)` does the same for a tree.
 
 ```cpp
 const baker::Path tunable[] = {baker::Path("economy"), baker::Path("events")};
@@ -387,69 +435,71 @@ const baker::LayerPolicy hotfix{.data_only = true, .scalars_only = true,
                                 .existing_only = true, .warnings_refuse = true,
                                 .allow = tunable};
 auto report = cfg.check_layer_text("hotfix_0412", downloaded, hotfix);  // show it, log it
-cfg.push_layer_text("hotfix_0412", downloaded, {.policy = &hotfix});  // refused: nothing changed
 ```
 
-### Published overlays
-
-An overlay that leaves the studio is a file with a name, a version, and the base it was made
-for. `examples/live-ops` runs each step below.
-
-**The overlay is a pack.** The shipped data declares itself one too, so an overlay can say
-which base it needs:
-
-```dta
-; data/default.dta
-#pack (game_data (level game) (version "1.0"))
-
-; overlays/2026-10-17-double-xp.dta
-#pack (double_xp_1017 (level live) (version 1) (requires (game_data "1.0")))
-#origin ("liveops console, ticket 4412" (tool baker-publish))
-(event (xp_multiplier 2) (banner "Double XP all weekend!"))
-```
-
-- With the pack levels set (`cfg.session().set_pack_levels({"game", "live"})`), an overlay
-  made for game data `"1.1"` is warned about against `"1.0"`. Under `warnings_refuse` it is
-  refused.
-- This guards rollbacks too. An overlay checked against the base it lands on cannot meet
-  data whose shape has moved since it was made.
-- `#origin` carries into provenance. `source("event.xp_multiplier")` names the
-  overlay's layer, the ticket, and the publishing tool, so an operator can see what is live
-  and why.
-
-**Its life in the game:**
+### Staging
 
 1. **Fetch and verify.** The host's transport fetches the overlay's text and verifies it,
    with a content hash and a signature checked before Baker sees any bytes. Baker's
    `Cipher` hides a cache's contents; it is not a signature.
-2. **Stage.** `cfg.check_layer_text(name, text, policy)` checks it at once, changing
-   nothing; log or show the report, and keep it.
-   - To keep the check off the frame, take `cfg.checker()` on the game's thread, which
-     costs well under a microsecond, and call its `check_text` on a worker.
-   - The checker shares the stack's trees and never touches the Config again.
-   - It runs the validators added with `{.any_thread = true}`, such as
-     `shape::validator()`. The push runs the rest on the game's thread.
-3. **Apply at a boundary.** Push it at a moment the game chooses: a session's start, a
-   lobby, never mid-match. Push it with `push_layer_text`, the same policy, and the
-   staged report: `{.policy = &policy, .checked = &report}`.
-   - If nothing in the Config changed since the stage, the push takes the report's verdict
-     and costs what an unchecked push costs.
-   - If the stack moved, the push checks again, and refuses, changing nothing, if the
-     policy does. A stale report is never used.
-   - The pack's `requires` and its `origin` are read with the text. A tree read separately
-     and pushed directly carries neither.
-   - Dedicated servers apply the same overlay at the same boundary, so a client and its
-     server never disagree.
-4. **Keep the last good one.** Store each applied overlay's text, and re-stage it at the
-   next start. If the store is unreachable, the game starts on what it last ran. If the
-   stored overlay no longer passes against a patched base, it starts on the base.
-5. **Roll back** with `remove_layer`, as above.
+2. **Check it at once,** with `check_layer_text` and the policy, changing nothing; log or
+   show the report, and keep it.
 
-**Retire it into source.** An overlay that sticks belongs in the shipped data. Load the
-base checkout with the overlay as a layer and `promote` it into `default`: a
-reviewed change, one line per value. Then stop publishing the overlay for builds that
-contain it. Otherwise the next patch silently drops values players have been playing
-with.
+To keep the check off the frame, take `cfg.checker()` on the game's thread, which costs
+well under a microsecond, and call the `LayerChecker`'s `check_text` on a worker.
+
+- The checker shares the stack's trees and never touches the Config again.
+- It runs the validators added with `{.any_thread = true}`, such as
+  `shape::validator()`. The push runs the rest on the game's thread, and, while the report
+  holds, does not run the checker's again after the merge.
+
+### Applying
+
+Push the overlay at a moment the game chooses: a session's start, a lobby, never
+mid-match. `push_layer_text(name, text, {.policy = &policy})` reads the text as the check
+does, runs the same check, and refuses, changing nothing, if the policy refuses. The layer
+is read as a file layer is, so its pack and `origin` are recorded, and the Config keeps the
+text to read again when a layer below it changes. `push_layer` takes a policy too, by path
+or with a tree.
+
+Give the push the staged report too, under the same policy:
+
+```cpp
+cfg.push_layer_text("hotfix_0412", downloaded,
+                    {.policy = &hotfix, .checked = &*report});  // refused: nothing changed
+```
+
+- If nothing in the Config changed since the stage, the push takes the report's verdict
+  and costs what an unchecked push costs.
+- If the stack moved, the push checks again, and refuses, changing nothing, if the
+  policy does. A stale report is never used.
+- Dedicated servers apply the same overlay at the same boundary, so a client and its
+  server never disagree.
+- **Keep the last good one.** Store each applied overlay's text, and re-stage it at the
+  next start. If the store is unreachable, the game starts on what it last ran. If the
+  stored overlay no longer passes against a patched base, it starts on the base.
+
+### Rollback
+
+```cpp
+cfg.remove_layer("2026-10-17-double-xp");
+```
+
+The values below the overlay return, the tweaks rebind, and reload callbacks fire, as for
+any layer change. Rollback leaves no trace because an overlay never modified anything: the
+shipped trees are immutable, and the merged tree is recomputed without it. That is why
+overlays are layers and not edits to a shipped file. Keep overlays independent (each
+setting only its own values) so that removing one never needs another removed first.
+
+The pack's `requires` guards rollbacks too. An overlay checked against the base it lands
+on cannot meet data whose shape has moved since it was made.
+
+### Retiring an overlay into source
+
+An overlay that sticks belongs in the shipped data. Load the base checkout with the overlay
+as a layer and `promote` it into `default`: a reviewed change, one line per value. Then
+stop publishing the overlay for builds that contain it. Otherwise the next patch silently
+drops values players have been playing with.
 
 ### A layer a server sends its clients
 
@@ -487,13 +537,6 @@ have_lobby = have_lobby || taken.has_value();
 
 The text is the layer's tree, not its file: promotion and write-back are how a change goes
 back into source.
-
-### Personal and experiment layers
-
-Developers tune in their own [`local` layer](#personal-layers-local), and variants live in
-[experiment layers](#experiments-and-ab-comparison). Both sit below the live overlays, so
-a developer reproducing a live problem sees what players see, with their own tuning on
-top only if they enable it.
 
 ## The binary cache in a build step
 
@@ -538,8 +581,9 @@ and one allocation each: a 6.2 MB tree in 2.3–2.5 ms.
 
 ## Views in the build
 
-A shape marked `(@view)` becomes a C++ struct (`docs/language.md`, Views). The build makes
-it, and keeps it current:
+A shape marked `(@view)` becomes a C++ struct
+([Views](cpp.md#views-a-c-struct-from-a-shape) in Baker from C++). The build makes it, and
+keeps it current:
 
 ```dta
 ; baker-project.dta
@@ -552,11 +596,12 @@ it, and keeps it current:
 baker_generate_views(my_game PROJECT ${CMAKE_SOURCE_DIR}/data/baker-project.dta)
 ```
 
-- **What it writes,** under the build tree and on `my_game`'s include path: `move.hpp` (the
-  struct and its digest, reaching only `<baker/view.hpp>`), `move_read.hpp` (its reader,
-  reaching `<baker/view_read.hpp>`, for the files that read), `views.hpp` (every view,
-  and `game::kViews` for the drift check), and `tables.hpp` (`game::register_tables(cfg)`,
-  which adds a baked table for every keyed view; include it where the Config is opened).
+- **What it writes,** under the build tree and on `my_game`'s include path: for a shape
+  `move`, `move.hpp` (the struct and its digest, reaching only `<baker/view.hpp>`),
+  `move_read.hpp` (its reader, reaching `<baker/view_read.hpp>`, for the files that read),
+  `views.hpp` (every view, and `game::kViews` for the drift check), and `tables.hpp`
+  (`game::register_tables(cfg)`, which adds a baked table for every keyed view; include it
+  where the Config is opened).
   Name a struct in many files and read it in one.
 - **The contract** is the layers `(views (layers ...))` names: a mod, an overlay or a
   personal layer may add fields, which stay in the tree. `(shapes ...)` adds views for
@@ -583,8 +628,8 @@ baker_generate_views(my_game PROJECT ${CMAKE_SOURCE_DIR}/data/baker-project.dta)
 
 ## Renaming a record, a field, and naming a file
 
-Content changes its names. Baker keeps the old ones answering (`docs/language.md`,
-Identity), and the host kit's commands do the rewriting:
+Content changes its names. Baker keeps the old ones answering (the language guide's
+[Identity](language.md#identity)), and the host kit's commands do the rewriting:
 
 - **A record.** `game rename fighters.kestrel.moves.heavy slam --baker-write` gives the
   record its new key in the layer that declares it, keeps `(@aka heavy)` in it, mints an
@@ -609,30 +654,46 @@ Identity), and the host kit's commands do the rewriting:
 jab names its icon, and the output shows each. It also registers its moves as a baked
 table, finds `slam` by path and by its old key, and, given a file name, writes the contract
 layers and the table as a stack image and opens a second Config from it, as a shipped
-build does (`docs/language.md`, Tables).
+build does ([Tables](cpp.md#tables-a-keyed-shapes-records-packed) in Baker from C++).
 
 ## Content packages: patches, DLC, and mods
 
-How a game delivers content after it ships:
+How a game delivers content after it ships.
+
+### Ordering packages
 
 - **Each package is a layer:** the base game, then each DLC, then title updates, then live
   ops. A package installed later still goes in its place: `push_layer("pack3", path,
   {.below = "tu1"})` puts a new DLC under the title updates, so their fixes to it win.
-  A DLC that may be absent is pushed with `LayerOptions::optional`. Code that reads
-  its content takes a fallback (`get(path, fallback)`), so a save that names an
-  uninstalled DLC's content still loads.
+- **A DLC that may be absent** is pushed with `LayerOptions::optional`. Code that reads its
+  content takes a fallback (`get(path, fallback)`), so a save that names an uninstalled
+  DLC's content still loads.
+- **Declare what a package requires**, and at which version: `#pack (expansion (level dlc)
+  (version "1.0") (requires (base_game "1.2") season_pass))`. A requirement that is not
+  loaded once the pack's file is read is a located warning, forwarded to the Config's
+  warning handler.
+- **Run autorun with `Context::run_autorun(cfg.autorun().items())`** after every stack
+  change. Script an uninstalled DLC defined goes with it, and what it replaced comes back.
+
+### Mod directories
+
 - **A directory of mods needs no list of them.** `push_layer_dir("mods", "mods")`, or
   `(mods (dir "mods"))` in the project's layers, makes a layer of each `*.dta` file in
   `mods/` and of each folder there that holds a `layer.dta` (a mod of several files, whose
-  `layer.dta` `#include`s the rest). They stand in the order `mods/order.dta` lists,
-  `(order base_fixes hard_mode)`, then the rest by name; a listed name that is missing is
-  a located warning. Every `reload()` lists the directory again, so a mod dropped in, or
-  deleted, or reordered in `order.dta` takes effect, and the kit's `Live` watches the
-  directory. A mod menu turns one off with `set_layer_enabled`, which holds across a
-  rescan, and `set_layer_enabled("mods", false)` turns them all off. A mod that does not
-  parse is an empty layer, its error located and passed to the warning handler, until it is
-  fixed; the rest stand. A host with an archive or a virtual root lists the directory with
-  `LoadSession::set_lister`, as it reads with `set_reader`.
+  `layer.dta` `#include`s the rest).
+- **Order.** They stand in the order `mods/order.dta` lists, `(order base_fixes
+  hard_mode)`, then the rest by name; a listed name that is missing is a located warning.
+- **Rescans.** Every `reload()` lists the directory again, so a mod dropped in, or deleted,
+  or reordered in `order.dta` takes effect, and the kit's `Live` watches the directory.
+- **A mod menu** turns one off with `set_layer_enabled`, which holds across a rescan, and
+  `set_layer_enabled("mods", false)` turns them all off.
+- **A broken mod.** A mod that does not parse is an empty layer, its error located and
+  passed to the warning handler, until it is fixed; the rest stand.
+- **Archives and virtual roots.** A host with an archive or a virtual root lists the
+  directory with `LoadSession::set_lister`, as it reads with `set_reader`.
+
+### Composing lists
+
 - **Key what packages retune by name; mark what they extend in order.** Two layers that set
   one value list leave the top one's list, because Overwrite replaces values. Keyed
   children merge, so every package's entries survive, and each can retune one by its name.
@@ -645,49 +706,81 @@ How a game delivers content after it ships:
   ; merged: (songs (song_a ...) (song_b ...) (song_c ...))
   ```
 
-  A list whose entries have no names of their own, items, a move's cancels, a room's
-  furniture with two beds, takes `#append` and `#drop`: `(items #append rope)` adds
-  to the list below without restating it, so packages compose in their stack order, and a
-  title update drops one entry without reverting the rest. A list that one package owns
-  stays a plain value list. `layer_effect` shows a layer that replaces another's list, and
-  names each verb.
+- **`#append` and `#drop`.** A list whose entries have no names of their own (items, a
+  move's cancels, a room's furniture with two beds) takes `#append` and `#drop`:
+  `(items #append rope)` adds to the list below without restating it, so packages compose
+  in their stack order, and a title update drops one entry without reverting the rest. A
+  list that one package owns stays a plain value list. `layer_effect` shows a layer that
+  replaces another's list, and names each verb.
 - **A mod directory is a stack of packages**: each mod that extends a list appends to
   it, and `order.dta` decides the order their entries take.
 - **An overlay pins what it was written against.** A live-ops overlay or an agent's layer
   written with `write_back_to(path, layer, true)` carries `(@was v...)`, the value below it
   then. When a title update moves that value, checking the overlay warns at the row
   instead of silently reverting the update, and `warnings_refuse` refuses it.
+
+### Title updates
+
 - **A title update removes with `(key #remove)`**, a debug menu or an exploit's entry, and
   the key stays gone until the layer is removed.
 - **A title update changes values, not the macros below it.** A layer reads with the macros
   of the layers below it. A macro a title update redefines reaches only the layers above
   it, never the base that already expanded it.
-- **Run autorun with `Context::run_autorun(cfg.autorun().items())`** after every stack
-  change. Script an uninstalled DLC defined goes with it, and what it replaced comes back.
-- **Declare what a package requires**, and at which version: `#pack (expansion (level dlc)
-  (version "1.0") (requires (base_game "1.2") season_pass))`. A requirement that is not
-  loaded once the pack's file is read is a located warning, forwarded to the Config's
-  warning handler.
 - **A cache patches about as small as its text**. It is laid out in source order,
   with no absolute offsets, so an edit changes the cache's bytes near the edit and a binary
   diff or a chunked store sends little more than the edit: inserting a section into a
   10 MB cache is a 352-byte xdelta patch. Bake an update under the same path as the base
   bake, since every array names its file.
+
+### Untrusted content
+
 - **Mods and user files are text, never caches.** A cache is a memory image that a forged
   file can point anywhere. A loader of content from outside the game's own packages sets
   `LoadSession::text_only`, which refuses every cache and parses the text, which no input
   can make crash the reader. The game's own packages are signed by their platform.
-  Content that arrives as text, such as a live overlay, also sets
+- **No includes.** Content that arrives as text, such as a live overlay, also sets
   `LoadSession::refuse_includes`, so it cannot `#include` the game's files;
   `Config::push_layer_text` sets both.
 - **Bound the names outside text adds.** Symbols live until the program ends, so overlays
-  read all session, mods, or a console that use unique IDs as symbols add to them with every
-  read. `ParseLimits::max_new_symbols` (on the session's `limits`) caps the names a read
-  may add that the program had not seen: past it the read fails with `ErrorCode::Limit`.
-  The default, 1,048,576, suits the game's own data; set it far lower for text you do not
-  trust: at the default, one read can keep about 74 MB of names for the rest of the
-  session (about 74 bytes a name). A name already interned costs nothing, so reading the
-  same overlay again counts none.
+  read all session long, mods, or a console that uses unique IDs as symbols add to them with
+  every read. `ParseLimits::max_new_symbols` (on the session's `limits`) caps the names a
+  read may add that the program had not seen: past it the read fails with
+  `ErrorCode::Limit`. The default, 1,048,576, suits the game's own data; set it far lower
+  for text you do not trust: at the default, one read can keep about 74 MB of names for the
+  rest of the session (about 74 bytes a name). A name already interned costs nothing, so
+  reading the same overlay again counts none.
+- **Bound what macros expand to.** A macro that uses a macro multiplies, so ten lines can
+  ask for ten billion nodes. `ParseLimits::max_macro_nodes` caps the nodes a read takes
+  from macros, each use counting all of its body, arrays and what they hold included, so
+  the read fails with `ErrorCode::Limit` before it builds them. The default, 1,048,576,
+  refuses such a text in about 20 ms and 20 MB; a project's colors and constants take a
+  few thousand. For text you do not trust, lower it and `max_nodes` both.
+- **Bound the script it runs** with the
+  [budgets for script you did not write](#budgets-for-script-you-did-not-write).
+
+## Budgets for script you did not write
+
+A script from a mod, a live overlay or a console can recurse too deep or run too long. Two
+budgets on the Context bound it, on one thread or many.
+
+- **Depth.** `Context::set_stack_budget(bytes)` bounds how deep a script may nest before it
+  gets a Limit error instead of a stack overflow. The default, 256 KB, suits a desktop or
+  console thread; on a thread with a smaller stack (a handheld's worker, a fiber of a job
+  system) set it to well under that thread's stack size.
+- **Steps.** Depth bounds recursion, not work: a doubly recursive `{func}` in a mod or a
+  live overlay can stay shallow and still hang a frame. `Context::set_step_budget(n)` gives
+  the Context n steps; every call spends one, so a script spends the same on every run, as
+  a replay or a headless simulation needs.
+- **When the steps run out** the call fails with a Limit error, and so does every call
+  after it until the budget is set again: set it once a frame, or before each console
+  command. A Scheduler's tick stops at that point, so a runaway task ends with the error
+  and the tasks after it wait for the next tick rather than fail with it.
+- **The step hook.** `set_step_hook(fn, user)` is asked first and may grant more, for a
+  time limit (grant 10,000 steps and check the clock each time it is asked) or a sampling
+  profiler (read `top_frame()` in it).
+- **Cost.** The default step budget is unlimited; the check costs five instructions a call.
+  A game that runs only its own script can build with `-DBAKER_STEP_BUDGET=OFF`,
+  which compiles the check out.
 
 ## Linking a shipped game
 
@@ -722,6 +815,8 @@ the copy, and a `Tweak<float>` is 128 bytes, not 184. Metadata in the data still
 So does doc text: under `BAKER_SHIPPING`, `.doc(...)` on a function or a method,
 a property's and a global's doc, and the built-ins' docs are dropped where they are
 written, and a cache baked with `--drop-metadata` keeps no shape's notes.
+
+## Memory budgets
 
 Baker's memory comes from the allocators you give it: one to each `Config` and `Context`,
 and the default (`set_default_allocator`, before Baker first allocates) for what has no
@@ -795,7 +890,7 @@ people. Two calls give it what it needs:
 
 - **`baker::eval_request(ctx, line, sink)`** answers a request, `(ID {command})`, with one
   line of JSON. The JSON holds the ID, the result's text, a JSON projection of the result,
-  or the error with its script stack (`docs/reply-json.md`). `baker::host::Console`
+  or the error with its script stack ([reply-json.md](reply-json.md)). `baker::host::Console`
   answers lines that begin with `(` this way and every other line as before. Every reply,
   JSON or not, is its lines, then an empty line.
 - **`baker::tools::bind_config_tools(ctx, cfg)`** registers the Config's tooling as script
@@ -806,6 +901,8 @@ people. Two calls give it what it needs:
   - `{config.clear_scratch player.speed}`: drops that one live edit, so the value is the files'
     again. It returns 1 if there was an edit, 0 if not;
   - `{config.journal}` and `{config.unsaved}`: what was tuned, and what was not kept;
+  - `{config.set_change_history 64}`, then `{config.undo}` and `{config.redo}`: each
+    command that changes the data is one transaction of the change log, undone as one;
   - `{config.epoch}`: a number that moves on every reload, layer change and live edit. A
     tool showing the game's values asks for it, and for the values again only when it
     moved.
@@ -833,6 +930,13 @@ frames. Other threads may read, on these terms:
   line. Measured on one machine: 11.6 ns a copy on one thread, 85 ns per thread with two
   threads, 158 ns with four. Copy what a worker needs before handing it over, then let it
   read by reference.
+- **A reload's reading can run on a worker.** `cfg.begin_reload()` on the game's thread
+  makes a `ReloadJob`; `job.run()` on any thread finds the files that changed, reads them
+  and parses them, touching nothing of the Config's; `cfg.finish_reload(std::move(job))`
+  back on the game's thread merges the result, or says `Refused` if the stack changed
+  meanwhile, and you begin again. The game's thread then pays the merge alone: 1.7 ms of a
+  3 MB reload's 54 ms, measured on one machine. `baker::host::Live` does this when given
+  `run_async`.
 - **A reload is the frame's swap point.** It replaces the trees, on the game's thread. A
   thread holding a raw `const Array&` across it reads a tree that has been freed; one
   holding the `Ref<Array>` from `cfg.root()` keeps the old tree alive and reads it whole.
@@ -849,8 +953,7 @@ frames. Other threads may read, on these terms:
   structs); a `std::string` or `std::vector` tweak is read on the game's thread only. The
   reader must only read, since it may run twice. It costs two loads and a fence when nothing
   changed, and a change costs the game's thread nothing it measurably did not before.
-- **Checks off the game's thread** take `cfg.checker()` (see
-  [Live ops](#tests-before-an-overlay-ships)).
+- **Checks off the game's thread** take `cfg.checker()` (see [Staging](#staging)).
 - **Symbols** may be made from any thread; the symbol table's reads take no lock.
 - **No fiber switch inside a Baker call.** A Context's current call, the symbol table's
   intern site and a few tools keep thread-local state, which a compiler may read once and
@@ -858,23 +961,10 @@ frames. Other threads may read, on these terms:
   must not switch fibers, or resume on another thread, before it returns to Baker. A
   fiber-based job system waits outside the call: the native starts the job and returns,
   and the script picks up the result later (a task, or the next frame).
-- **Script on a small stack.** `Context::set_stack_budget(bytes)` bounds how deep a script
-  may nest before it gets a Limit error instead of a stack overflow. The default, 256 KB,
-  suits a desktop or console thread; on a thread with a smaller stack (a handheld's worker,
-  a fiber of a job system) set it to well under that thread's stack size.
-- **A budget for script you did not write.** Depth bounds recursion, not work: a doubly
-  recursive `{func}` in a mod or a live overlay can stay shallow and still hang a frame.
-  `Context::set_step_budget(n)` gives the Context n steps; every call spends one, so a
-  script spends the same on every run, as a replay or a headless simulation needs. When
-  they run out the call fails with a Limit error, and so does every call after it until
-  the budget is set again: set it once a frame, or before each console command. A
-  Scheduler's tick stops at that point, so a runaway task ends with the error and the tasks
-  after it wait for the next tick rather than fail with it. A hook,
-  `set_step_hook(fn, user)`, is asked first and may grant more, for a time limit (grant
-  10,000 steps and check the clock each time it is asked) or a sampling profiler (read
-  `top_frame()` in it). The default budget is unlimited; the check costs five
-  instructions a call. A game that runs only its own script can build with
-  `-DBAKER_STEP_BUDGET=OFF`, which compiles the check out.
+- **Script on a small stack.** On a thread with a smaller stack than a desktop's (a
+  handheld's worker, a fiber of a job system), set the Context's stack budget to well under
+  that thread's stack size ([Budgets for script you did not
+  write](#budgets-for-script-you-did-not-write)).
 
 ## Agreeing on the data: lockstep, replays, saves
 

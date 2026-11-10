@@ -11,16 +11,18 @@
 namespace views_test {
 
 struct Scalars {
-    uint16_t startup = 0;
-    float damage = 0;
     std::string_view name;
     baker::Symbol button;
+    float damage = 0;
+    uint16_t startup = 0;
     bool armored = false;
 
     static constexpr std::string_view kShapeName = baker::view_text("scalars");
-    static constexpr uint64_t kShapeDigest = 0x044b1126b1d7bfbcull;
+    static constexpr uint64_t kShapeDigest = 0x707e0ec3e961d778ull;
     static constexpr std::string_view kAt = "";
     static constexpr bool kKeyed = false;
+    // (@view by_id): the table keeps each record's ID, for index_of(RecordId).
+    static constexpr bool kById = false;
     // The members a baked table relocates: defined in scalars_read.hpp.
     static constexpr std::span<const baker::ViewFixup> fixups() noexcept;
 };

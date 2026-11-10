@@ -94,7 +94,7 @@ restarted.
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.8.0)
+FetchContent_Declare(baker GIT_REPOSITORY https://github.com/zach/baker.git GIT_TAG v0.9.0)
 FetchContent_MakeAvailable(baker)
 target_link_libraries(game PRIVATE baker::baker)
 ```
@@ -103,6 +103,8 @@ Call `cfg.reload()` once a frame, or when a file watcher fires. That is the loop
 save, see it.
 
 ## What else is there
+
+### Data and layers
 
 - **Lookup.** `find_float("price")`, `get<int>("menu.eggs.price")`, and `Convert<T>` for
   your own types; every failure says what, where, and how it got there:
@@ -115,6 +117,28 @@ save, see it.
 - **Live ops.** Overlays pushed into a shipped build, frozen except for what
   `live_layers` allows, rolled back with one call. [Cookbook: live ops](docs/cookbook.md#live-ops),
   [`examples/live-ops`](examples/live-ops).
+- **Shapes.** `#shape (boss_phase (enter_at float (@range 0 1)) ...)` declares what data
+  should look like; a Config validator reports violations at load, located.
+  [Language guide](docs/language.md#shapes).
+- **Record identity and renames.** `(@id ...)` gives a record an ID that survives a rename;
+  `(@aka old)` keeps an old key answering in overlays; `rename` moves a key and everything
+  that names it; `(asset KIND)` fields are checked against the files on disk.
+  [Cookbook](docs/cookbook.md#renaming-a-record-a-field-and-naming-a-file).
+- **Views.** A shape marked `(@view)` generates a C++ struct, its reader and a digest of
+  its layout; `baker_generate_views` keeps them current in the build, and `check` reports
+  a struct compiled against another layout.
+  [Baker from C++](docs/cpp.md#views-a-c-struct-from-a-shape),
+  [`examples/content-tables`](examples/content-tables).
+- **Baked tables.** `Table<T>` holds a viewed table's records as plain structs, rebuilt
+  from the merged data at each change and read by index (one load), key, path, record ID
+  or parent; a stack image ships the contract layers and the tables in one file.
+  [Baker from C++](docs/cpp.md#tables-a-keyed-shapes-records-packed).
+- **The binary cache.** A tree written as it lies in memory and loaded in one read; a
+  Config with `cache_dir` keeps one per layer, and `baker_bake` makes them in a build step.
+  [Cookbook](docs/cookbook.md#the-binary-cache-in-a-build-step).
+
+### Script
+
 - **Script.** Commands like `{* $x 2}` evaluate lazily, so `if` is an ordinary function.
   Native functions bind in one line with types deduced; `{func}` defines script ones;
   `check` finds bad calls before anything runs; `eval` serves consoles.
@@ -126,37 +150,24 @@ save, see it.
 - **Tasks.** C++20 coroutines (`co_await delay(t)`) whose frames come from a pool, and
   script tasks (`delay_task`, `interp_task`, `thread_task`); the host calls `tick(dt)`.
   [`examples/tasks`](examples/tasks).
-- **The binary cache.** A tree written as it lies in memory and loaded in one read; a
-  Config with `cache_dir` keeps one per layer, and `baker_bake` makes them in a build step.
-  [Cookbook](docs/cookbook.md#the-binary-cache-in-a-build-step).
 - **Packs and levels.** `#require` reads a shared file once per session; a pack declares
   its level (`engine`, `game`, `task`), and a harder pack using a softer one's macro or
   function is warned about. [Language guide](docs/language.md#packs-and-levels).
-- **Views.** A shape marked `(@view)` generates a C++ struct, its reader and a digest of
-  its layout; `baker_generate_views` keeps them current in the build, and `check` reports
-  a struct compiled against another layout.
-  [Language guide](docs/language.md#views-a-c-struct-from-a-shape),
-  [`examples/content-tables`](examples/content-tables).
-- **Baked tables.** `Table<T>` holds a viewed table's records as plain structs, rebuilt
-  from the merged data at each change and read by index (one load), key, path, record ID
-  or parent; a stack image ships the contract layers and the tables in one file.
-  [Language guide](docs/language.md#tables-a-keyed-shapes-records-packed).
-- **Record identity and renames.** `(@id ...)` gives a record an ID that survives a rename;
-  `(@aka old)` keeps an old key answering in overlays; `rename` moves a key and everything
-  that names it; `(asset KIND)` fields are checked against the files on disk.
-  [Cookbook](docs/cookbook.md#renaming-a-record-a-field-and-naming-a-file).
-- **Shapes.** `#shape (boss_phase (enter_at float (@range 0 1)) ...)` declares what data
-  should look like; a Config validator reports violations at load, located.
-  [Language guide](docs/language.md#shapes).
+
+### Tools and the pipeline
+
 - **The host kit.** `baker::host` gives a game the loop every host writes the same way:
-  it watches the stack's files and reloads on a save, serves a remote console on loopback,
-  and runs `check`, `reference`, `eval`, `diff` and `promote` from the game's own binary.
+  it watches the stack's files and reloads on a save (reading and parsing on the game's job
+  system if it has one), serves a remote console on loopback within a per-frame budget,
+  and runs `check`, `reference`, `eval`, `diff`, `promote` and the other tool commands from
+  the game's own binary.
   [Baker and your tools](docs/tools.md#the-host-kit), [`examples/host`](examples/host).
 - **A tuning harness.** Dear ImGui panels generated from the tweaks and shapes, an `eval`
   console, provenance on hover, write-back, and reload telemetry.
   [`examples/harness-imgui`](examples/harness-imgui).
 - **Harness instrumentation.** Edit-to-see time per file and per layer (`loop_stats`), a
-  journal of every live edit and whether it was kept, pack owners and stages, `origin` for
+  journal of every live edit and whether it was kept, a change log with undo and redo,
+  pack owners and stages, `origin` for
   generated files, a repetition report, and `check` output as versioned JSON.
   [Cookbook](docs/cookbook.md#reload-callbacks-migrate-or-punt),
   [language guide](docs/language.md#checking-before-running).
@@ -232,6 +243,7 @@ Android: CMake builds get C++20 from the targets; with `ndk-build`, add
 
 - [`docs/language.md`](docs/language.md): the language, from data to script.
 - [`docs/cookbook.md`](docs/cookbook.md): patterns, live ops among them.
+- [`docs/cpp.md`](docs/cpp.md): Baker from C++: views, tables and the stack image.
 - [`docs/tools.md`](docs/tools.md): what Baker gives tools, and what it leaves to your game.
 - [`docs/script-reference.md`](docs/script-reference.md): every built-in, generated.
 - [`docs/reply-json.md`](docs/reply-json.md): one-line JSON replies for tools and consoles.
@@ -239,6 +251,8 @@ Android: CMake builds get C++20 from the targets; with `ndk-build`, add
 - [`docs/sim-json.md`](docs/sim-json.md): scenarios, objectives, and their results as JSON.
 - [`docs/check-json.md`](docs/check-json.md): the `check` report as JSON.
 - [`docs/assets-json.md`](docs/assets-json.md): the assets the data names, as JSON.
+- [`docs/changes-json.md`](docs/changes-json.md): the change log and a promotion's changes as JSON.
+- [`docs/format-json.md`](docs/format-json.md): `format`'s edits to each file, as JSON.
 - [`CHANGELOG.md`](CHANGELOG.md): what each release changed.
 
 ## License

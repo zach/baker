@@ -587,7 +587,7 @@ public:
     // The metadata child tagged `tag` ("@range"), or null: a scan of the tag run from the
     // first metadata child, as try_find scans from the start.
     [[nodiscard]] const Array* meta(Symbol tag) const noexcept {
-        const uint32_t want = key_of(tag);
+        const uint32_t want = flags_ & kSortedForLookup ? sorted_key(tag) : key_of(tag);
         const uint32_t* tags = tag_run();
         for (uint32_t i = meta_first(); i != 0 && i < size_; ++i)
             if (tags[i] == want) {
@@ -687,11 +687,12 @@ public:
     // Reorders the children so find() can binary-search: children that are not tagged
     // arrays move to the front in their original order (so a tag in slot 0 stays there),
     // and tagged arrays follow, sorted by tag hash and then text (an order that does not
-    // depend on the run); the metadata children follow those, sorted alike, so the values
+    // depend on the process); the metadata children follow those, sorted alike, so the values
     // and the metadata boundary survive the sort. Duplicate tags keep their order, so find()
-    // still returns the first. Opt-in and never automatic: it changes at(i) and printing order, and
-    // every array sharing this one (through a macro) sees the change. set() turns it off;
-    // re-tagging a child in place is not detected, so sort again after doing that.
+    // still returns the first. The search reads the tag run, which holds hash bits in that order,
+    // and loads only the child it finds. Opt-in and never automatic: it changes at(i) and
+    // printing order, and every array sharing this one (through a macro) sees the change. set()
+    // turns it off; re-tagging a child in place is not detected, so sort again after doing that.
     void sort_for_lookup();
     [[nodiscard]] bool sorted_for_lookup() const noexcept {
         return (flags_ & kSortedForLookup) != 0;
@@ -756,6 +757,7 @@ private:
     friend void detail::free_owner(detail::Owner&) noexcept;
     friend class detail::Arena;
     friend struct detail::CacheLayout;
+    friend struct detail::ArrayFill;
     // Sets the height and the tag run from the nodes: every way of building an array ends
     // here. `verb`: whether slot 1 holds a layer verb, when the caller knows (the parser
     // does); -1 tests it.
@@ -778,6 +780,22 @@ private:
         const auto tag = a ? a->data()[0].try_sym() : std::nullopt;
         return tag && !tag->empty() ? key_of(*tag) : kNoTag;  // '' is no tag
     }
+    // A sorted array's run holds keys in the sort's own order instead: the metadata
+    // bit, then the top 30 bits of the tag's hash, then 1, so the run ascends as the
+    // children do (untagged 0, then the other tags, then metadata's) and a binary search
+    // reads only the run. Equal keys are confirmed by the child's tag, as a scan's are.
+    [[nodiscard]] static uint32_t sorted_key(Symbol s) noexcept {
+        return (s.is_meta() ? 0x80000000u : 0u) | static_cast<uint32_t>(s.hash() >> 34) << 1 | 1u;
+    }
+    // The key `n` has in this array's run, as the array is now: sorted or not.
+    [[nodiscard]] uint32_t run_key(const Node& n) const noexcept {
+        if (!(flags_ & kSortedForLookup)) return tag_key(n);
+        const Array* a = n.try_array();
+        const auto tag = a ? a->data()[0].try_sym() : std::nullopt;
+        return tag && !tag->empty() ? sorted_key(*tag) : kNoTag;
+    }
+    // Sorted mode off: the run back to identity keys, for set().
+    void unsort() noexcept;
     // The run follows the header, so a scan needs no load to find it and shares the
     // header's cache line; the nodes follow the run.
     [[nodiscard]] const uint32_t* tag_run() const noexcept {

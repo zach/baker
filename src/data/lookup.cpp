@@ -264,21 +264,32 @@ void Array::sort_for_lookup() {
         }
         std::move(buf.begin(), buf.end(), d);
     }
-    finish();  // the tag run follows the nodes
+    finish();  // the boundary and the marker; the run, in identity keys
     flags_ = static_cast<uint16_t>(flags_ | kSortedForLookup);
+    uint32_t* tags = tag_run();
+    for (uint32_t i = 0; i < size_; ++i) tags[i] = run_key(d[i]);  // in the sort's order
 }
 
 const Array* Array::find_sorted(Symbol tag) const noexcept {
     if (tag.empty()) return nullptr;  // '' is no tag
-    // The sort's order: untagged, then the other tags, then metadata's. Not from the
-    // boundary: in an untagged array, slot 0 may be metadata's tag, which the boundary never
-    // names.
-    const bool meta = tag.is_meta();
-    const Node* it = std::partition_point(begin(), end(), [tag, meta](const Node& n) {
-        const Symbol t = detail::tag_of(n);
-        return t.empty() || (t.is_meta() == meta ? tag_less(t, tag) : !t.is_meta());
-    });
-    return it != end() && detail::tag_of(*it) == tag ? it->try_array() : nullptr;
+    // The run ascends in the sort's order (sorted_key), so the search reads only the run and
+    // loads a child only where its key matches: the first such child with the tag is the
+    // first of its duplicates. Branchless, so a warm search does not mispredict.
+    const uint32_t want = sorted_key(tag);
+    const uint32_t* run = tag_run();
+    const uint32_t* const end = run + size_;
+    const uint32_t* at = run;
+    for (uint32_t n = size_; n > 1;) {
+        const uint32_t half = n / 2;
+        at = at[half] < want ? at + half : at;
+        n -= half;
+    }
+    at += at != end && *at < want;
+    for (; at != end && *at == want; ++at) {
+        const auto* a = static_cast<const Array*>(data()[at - run].array());
+        if (a->data()[0].is(tag)) return a;
+    }
+    return nullptr;
 }
 
 namespace detail {
@@ -352,7 +363,7 @@ ResolveStatus resolve_in_layer(const Array& layer, const Path& path, const Array
         Symbol name = seg.name;
         const Array* next = lay ? lay->try_find(name) : nullptr;
         const Array* mer_rec = mer ? mer->try_find(name) : nullptr;
-        if (!next && lay && mer_rec && mer_rec->meta_first())
+        if (!next && lay && mer_rec && mer_rec->meta_first()) {
             if (const Array* aka = mer_rec->meta(aka_tag()))
                 for (const Node& old : aka->values()) {
                     const auto s = old.try_sym();
@@ -364,6 +375,15 @@ ResolveStatus resolve_in_layer(const Array& layer, const Path& path, const Array
                         break;
                     }
                 }
+            // Or the layer names the record by its ID.
+            if (const Symbol id = id_symbol(*mer_rec); !next && !id.empty()) {
+                next = lay->try_find(id);
+                if (next) {
+                    name = id;
+                    respelled = true;
+                }
+            }
+        }
         if (!next) return ResolveStatus::Missing;
         text += is_bare_symbol(name.str()) ? Str(name.str()) : "'" + Str(name.str()) + "'";
         lay = next;

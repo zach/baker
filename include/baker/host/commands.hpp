@@ -8,20 +8,26 @@
 // other flag is the game's.
 //
 //   check [--baker-strict-views]   baker.check/1.5 JSON; exit 1 on an error, a load
-//                                  problem, a shape error, or a call to an undefined
-//                                  function; a view the game compiled against another
+//                                  problem, a shape error, a missing asset, or a call to an
+//                                  undefined function; a view the game compiled against another
 //                                  layout of its shape is a shape warning, and with
 //                                  --baker-strict-views an error (CommandHooks::views)
+//   assets                         every asset the stack names, as baker.assets/1; exit 1
+//                                  when one is not there
+//   bake --baker-stack FILE        the contract layers and the baked tables as one stack
+//                                  image, for a shipped build to open
 //   reference [--baker-json]       the script vocabulary, as Markdown; --baker-json:
 //                                  {"reference", "tweaks", "shapes"}, Baker's three documents
 //   diff [--baker-layer L] [--baker-rows]
 //                                  what layer L (default agent) changes, value by value;
 //                                  --baker-rows: each as a row, (/a.b 1), a layer file holds
 //   promote [--baker-from L] [--baker-to T] [--baker-write | --baker-patch FILE]
-//           [--baker-rows]         layer L into T (default default): what it would write;
+//           [--baker-rows] [--baker-json]
+//                                  layer L into T (default default): what it would write;
 //                                  --baker-write writes; --baker-patch writes the change as a
 //                                  unified diff against the files, and nothing else;
-//                                  --baker-rows: what it would write, as rows
+//                                  --baker-rows: what it would write, as rows;
+//                                  --baker-json: the transaction as baker.changes/1
 //   eval [--baker-seed N] [--baker-json] "{command}"...
 //                                  each command's result on the game reset with seed N
 //                                  (default 1); --baker-json: one baker.reply/1.2 line each
@@ -36,13 +42,19 @@
 //   compare --baker-before DIR --baker-after DIR
 //                                  which objectives moved between two --baker-results
 //                                  directories: baker.compare/1; exit 1 if one broke
-//   format [--baker-check] [--baker-json] [FILE...]
+//   rename OLD NEW [--baker-write] the record at path OLD keyed NEW where it is declared,
+//                                  (@aka OLD) kept, an (@id ...) minted, every key_of
+//                                  naming it rewritten; --baker-write writes, else the
+//                                  edits are listed
+//   format [--baker-check] [--baker-json] [--baker-mint-ids TABLE] [FILE...]
 //                                  lays out each file as Baker writes it, keeping its
 //                                  comments (tools::format_text), with the project's
 //                                  (format ...); no FILE: the files the stack reads under
 //                                  the project's directory. --baker-check writes nothing
 //                                  and exits 1 if a file would change, listing it;
-//                                  --baker-json: baker.format/1, each file's edits
+//                                  --baker-json: baker.format/1.1, each file's edits;
+//                                  --baker-mint-ids: an (@id ...) for each record of TABLE
+//                                  without one
 //   every command: --baker-project PATH
 //                                  the stack: the nearest baker-project.dta from PATH
 //                  --baker-output FILE

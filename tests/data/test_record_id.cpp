@@ -3,7 +3,9 @@
 #include <doctest.h>
 #include <baker/cache.hpp>
 #include <baker/config.hpp>
+#include <baker/image.hpp>
 #include <baker/parse.hpp>
+#include <baker/project.hpp>
 #include <baker/record_id.hpp>
 #include <baker/std_interop.hpp>
 
@@ -19,6 +21,11 @@ using namespace baker;
 using baker::test::ok;
 
 namespace {
+Ref<Array> parse(const char* text) {
+    auto r = read_string(text, "overlay.dta");
+    REQUIRE(r);
+    return *r;
+}
 
 const char* const kWeapons =
     "(weapons\n"
@@ -234,4 +241,120 @@ TEST_CASE("provenance follows the alias: source() names the layer that wrote the
     const Source s = ok(cfg.source("weapons.plasma.damage"));
     CHECK(s.layer == Symbol("overlay"));
     CHECK(ok(cfg.source("weapons.plasma.range")).layer == Symbol("base"));
+}
+
+TEST_CASE("a layer names a record by its ID, which merges into it and keeps its key") {
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(
+        cfg.push_layer_text("base",
+                            "(weapons (plasma (@id a7d2c41e9b06f58a3c1d2e4f60718293) (@aka laser)"
+                            "                 (damage 3) (range 9))"
+                            "         (cannon (@id b000000000000000000000000000000f) (damage 9))"
+                            "         (bow (damage 2)))"));
+    // By ID, by alias and by key, together.
+    REQUIRE(cfg.push_layer_text("overlay",
+                                "(weapons (a7d2c41e9b06f58a3c1d2e4f60718293 (damage 5))"
+                                "         (b000000000000000000000000000000f (damage 10))"
+                                "         (bow (damage 4)))"));
+    CHECK(ok(cfg.get<int>("weapons.plasma.damage")) == 5);
+    CHECK(ok(cfg.get<int>("weapons.plasma.range")) == 9);
+    CHECK(ok(cfg.get<int>("weapons.cannon.damage")) == 10);
+    CHECK(ok(cfg.get<int>("weapons.bow.damage")) == 4);
+    CHECK_FALSE(cfg.root()->try_get("weapons.a7d2c41e9b06f58a3c1d2e4f60718293"));
+    REQUIRE(cfg.push_layer_text("again", "(weapons (laser (damage 6)))"));
+    CHECK(ok(cfg.get<int>("weapons.plasma.damage")) == 6);
+    // Provenance follows the ID: the overlay's line answers for the merged path.
+    CHECK(ok(cfg.source("weapons.cannon.damage")).layer == Symbol("overlay"));
+    CHECK(ok(cfg.source("weapons.plasma.damage")).layer == Symbol("again"));
+    CHECK(ok(cfg.source("weapons.plasma.range")).layer == Symbol("base"));
+    // A tag that spells an ID no record carries is a new record, as any key is.
+    REQUIRE(cfg.push_layer_text("new", "(weapons (c000000000000000000000000000000c (damage 1)))"));
+    CHECK(ok(cfg.get<int>("weapons.c000000000000000000000000000000c.damage")) == 1);
+    // The check sees the merged tree: a shape over the records is checked as named.
+    const LayerReport r =
+        ok(cfg.check_layer_text("next", "(weapons (a7d2c41e9b06f58a3c1d2e4f60718293 (damage 8)))"));
+    CHECK(r.refusals.empty());
+    CHECK(r.ok());
+}
+
+TEST_CASE("a record by ID resolves through the indexed path too: a wide table") {
+    std::string base = "(items";
+    for (int i = 0; i < 40; ++i)
+        base += " (item" + std::to_string(i) + " (@id a00000000000000000000000000000" +
+                (i < 10 ? "0" : "") + std::to_string(i) + ") (cost " + std::to_string(i) + "))";
+    base += ")";
+    std::string over = "(items";
+    for (int i = 0; i < 40; ++i)
+        over += " (a00000000000000000000000000000" + std::string(i < 10 ? "0" : "") +
+                std::to_string(i) + " (cost " + std::to_string(i + 1) + "))";
+    over += ")";
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer_text("base", base));
+    REQUIRE(cfg.push_layer_text("over", over));
+    CHECK(ok(cfg.get<int>("items.item39.cost")) == 40);
+    CHECK(ok(cfg.get<int>("items.item0.cost")) == 1);
+    CHECK(cfg.root()->try_find("items")->size() == 41);  // nothing added
+}
+
+TEST_CASE("a change set that names a record by ID or alias promotes into the record") {
+    if constexpr (kShipping) return;
+    test::TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(
+        cfg.push_layer("core", dir.write("core.dta",
+                                         "(weapons (plasma (@id a7d2c41e9b06f58a3c1d2e4f60718293) "
+                                         "(@aka laser) (damage 3) (range 9)))\n")));
+    REQUIRE(
+        cfg.push_layer("content", dir.write("content.dta", "(weapons (laser (hint \"x\")))\n")));
+    REQUIRE(
+        cfg.push_layer_text("agent", "(weapons (a7d2c41e9b06f58a3c1d2e4f60718293 (damage 5)))"));
+    CHECK(ok(cfg.get<int>("weapons.plasma.damage")) == 5);
+    // Into the layer that spells the record by its alias: the value lands in that record.
+    const WriteReport r = ok(cfg.promote("agent", "content"));
+    CHECK(r.ok());
+    CHECK(dir.read("content.dta") == "(weapons (laser (hint \"x\") (damage 5)))\n");
+    REQUIRE(r.written.size() == 1);
+    CHECK(r.written[0].line == 1);
+    CHECK(cfg.root()->try_find("weapons")->size() == 2);  // plasma alone
+    // Into the layer that spells it by its key, from a change set spelled by the alias.
+    REQUIRE(cfg.push_layer_text("agent2", "(weapons (laser (range 12)))"));
+    REQUIRE(ok(cfg.promote("agent2", "core")).ok());
+    CHECK(dir.read("core.dta").find("(range 12)") != std::string::npos);
+    CHECK(dir.read("core.dta").find("(laser") == std::string::npos);
+    CHECK(ok(cfg.get<int>("weapons.plasma.range")) == 12);
+}
+
+TEST_CASE("a tree layer and an image's layer carry their aliases and IDs into the merge") {
+    // push_layer(tree) counts nothing at parse: one walk says whether the merge must look.
+    Config trees({.tweaks = nullptr});
+    REQUIRE(trees.push_layer("base", parse("(weapons (plasma (@aka laser) (damage 3)))")));
+    REQUIRE(trees.push_layer("over", parse("(weapons (laser (damage 5)))")));
+    CHECK(ok(trees.get<int>("weapons.plasma.damage")) == 5);
+    CHECK_FALSE(trees.root()->try_get("weapons.laser"));
+    // An image's section records the count, as a cache does, so the load walks nothing.
+    test::TempDir dir;
+    std::string image;
+    {
+        Config build({.tweaks = nullptr});
+        REQUIRE(build.push_layer(
+            "core", dir.write("core.dta",
+                              "(weapons (plasma (@id a7d2c41e9b06f58a3c1d2e4f60718293) "
+                              "(@aka laser) (damage 3)))\n")));
+        REQUIRE(
+            build.push_layer("content", dir.write("content.dta", "(weapons (laser (hint 1)))\n")));
+        const Symbol contract[] = {Symbol("core"), Symbol("content")};
+        REQUIRE(write_stack_image(build, contract, string_out(image)));
+    }
+    const std::string path = dir.write("game.datb", image);
+    Config cfg({.tweaks = nullptr, .stack_image = path});
+    std::vector<ProjectLayer> layers;
+    layers.push_back({.name = Symbol("core"), .path = Symbol(dir.path("core.dta"))});
+    layers.push_back({.name = Symbol("content"), .path = Symbol(dir.path("content.dta"))});
+    REQUIRE(ok(cfg.push_image_layers({layers.data(), layers.size()})) == 2);
+    CHECK(ok(cfg.get<int>("weapons.plasma.hint")) == 1);
+    CHECK_FALSE(cfg.root()->try_get("weapons.laser"));
+    REQUIRE(
+        cfg.push_layer_text("agent", "(weapons (a7d2c41e9b06f58a3c1d2e4f60718293 (damage 9)))"));
+    CHECK(ok(cfg.get<int>("weapons.plasma.damage")) == 9);
+    CHECK(cfg.root()->try_find("weapons")->size() == 2);
 }

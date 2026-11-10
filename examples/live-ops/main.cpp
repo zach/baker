@@ -54,7 +54,7 @@ bool stage(const baker::Config& cfg, const std::string& name, baker::LayerReport
         std::printf("  refused: %s\n", baker::to_string(e).data());
     if (!report->ok()) return false;
     for (const baker::LayerEffectEntry& e : report->effect)
-        std::printf("  %s: %s -> %s\n", e.path.c_str(),
+        std::printf("  %s: %s -> %s\n", e.path->data(),
                     e.below ? baker::to_string(*e.below).c_str() : "(none)",
                     baker::to_string(e.values).c_str());
     return true;

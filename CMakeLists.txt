@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(baker VERSION 0.8.0 LANGUAGES CXX)
+project(baker VERSION 0.9.0 LANGUAGES CXX)
 
 option(BAKER_BUILD_SCRIPT     "Build baker::script (evaluation, objects, tasks)" ON)
 option(BAKER_BUILD_SHAPE      "Build baker::shape (data-declared shapes)" ON)
@@ -159,6 +159,7 @@ add_library(baker_data
   src/data/symbol.cpp
   src/data/text.cpp
   src/data/tweak.cpp
+  src/data/tweak_index.cpp
   src/data/version.cpp
   src/data/write.cpp)
 add_library(baker::data ALIAS baker_data)
@@ -185,7 +186,7 @@ endif()
 # --- baker::shape: shapes declared in data, checked at load. Depends only
 #     on baker::data.
 if(BAKER_BUILD_SHAPE)
-  add_library(baker_shape src/shape/shape.cpp src/shape/views.cpp)
+  add_library(baker_shape src/shape/shape.cpp src/shape/shape_tools.cpp src/shape/views.cpp)
   add_library(baker::shape ALIAS baker_shape)
   baker_configure_library(baker_shape)
   target_link_libraries(baker_shape PUBLIC baker::data)

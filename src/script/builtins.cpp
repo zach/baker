@@ -278,10 +278,12 @@ struct Doc {
     std::string_view view;
 };
 
+// `usage`: how a special form is written, the whole call, a line a form (FuncRef::usage).
 template <class F>
-void add(Context& ctx, Symbol name, F&& f, Doc doc = {}) {
+void add(Context& ctx, Symbol name, F&& f, Doc doc = {}, Doc usage = {}) {
     auto r = ctx.func(name, std::forward<F>(f));
     if (r && !doc.view.empty()) r->doc(doc.view);
+    if (r && !usage.view.empty()) r->usage(usage.view);
 }
 
 }  // namespace
@@ -296,7 +298,8 @@ void register_builtins(Context& ctx) {
             return Node();
         },
         "`{if cond then [else]}`: evaluates `then` if `cond` is true, else `else` if given "
-        "(else 0). Only the branch taken is evaluated.");
+        "(else 0). Only the branch taken is evaluated.",
+        "{if cond then [else]}");
     add(
         ctx, "set",
         [](Raw<Var> place, Node value) -> Expected<Node> {
@@ -338,15 +341,18 @@ void register_builtins(Context& ctx) {
         },
         "`{do ($a ($b 1)) body...}`: binds the variables (unset, or to a value) for the "
         "duration of the body, restores them after, and returns the body's last value. "
-        "Without the list, just runs the body.");
+        "Without the list, just runs the body.",
+        "{do ($var ($var value)...) body...}\n{do body...}");
     add(
         ctx, "func", [](Args a) { return define(a, false); },
         "`{func name ($params...) body...}`: defines a script function. `(@status stub)`, "
         "`(@status provisional)`, `(@status deprecated replacement)` and `(@doc \"...\")` may "
-        "follow the parameters.");
+        "follow the parameters.",
+        "{func name ($params...) [(@status ...)] [(@doc \"...\")] body...}");
     add(
         ctx, "override", [](Args a) { return define(a, true); },
-        "As `func`, but may replace a native function, which it logs.");
+        "As `func`, but may replace a native function, which it logs.",
+        "{override name ($params...) [(@status ...)] [(@doc \"...\")] body...}");
 
     // --- Arithmetic: variadic, folded left. Ints stay ints (wrapping on overflow)
     // until a float joins. ---
@@ -389,9 +395,15 @@ void register_builtins(Context& ctx) {
     add(ctx, "+=", assign(Op::Add),
         "`{+= $x n}`, or in a method `{+= [property] n}`: adds, stores and returns the new "
         "value.");
-    add(ctx, "-=", assign(Op::Sub), "`{-= $x n}`: subtracts, stores and returns the new value.");
-    add(ctx, "*=", assign(Op::Mul), "`{*= $x n}`: multiplies, stores and returns the new value.");
-    add(ctx, "/=", assign(Op::Div), "`{/= $x n}`: divides (a float), stores and returns it.");
+    add(ctx, "-=", assign(Op::Sub),
+        "`{-= $x n}`, or in a method `{-= [property] n}`: subtracts, stores and returns the "
+        "new value.");
+    add(ctx, "*=", assign(Op::Mul),
+        "`{*= $x n}`, or in a method `{*= [property] n}`: multiplies, stores and returns the "
+        "new value.");
+    add(ctx, "/=", assign(Op::Div),
+        "`{/= $x n}`, or in a method `{/= [property] n}`: divides (a float), stores and returns "
+        "it.");
 
     // --- Comparison: chained over every adjacent pair, each argument evaluated once, stopping
     // at the first pair that fails: `{0.3 <= $value <= 0.7}`. ---

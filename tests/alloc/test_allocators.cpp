@@ -23,6 +23,7 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 extern std::atomic<size_t> g_default_allocations;  // main.cpp
 extern std::atomic<size_t> g_default_by_kind[baker::kMemoryKinds];
@@ -184,6 +185,42 @@ TEST_CASE(
     }
     CHECK(ok);
     MESSAGE("tables: " << unowned << " allocations through the default allocator");
+    if (baker::test::counting_allocations()) CHECK(global == 0);
+    CHECK(mine.allocs == mine.frees);
+    CHECK(mine.live_bytes == 0);
+}
+
+TEST_CASE(
+    "the change log keeps its transactions on the Config's allocator, and nothing through operator "
+    "new") {
+    Counting mine;
+    const baker::Allocator alloc = mine.allocator();
+    size_t global = 0;
+    bool ok = false;
+    {
+        const baker::test::AllocationScope scope;
+        {
+            baker::Config config({.tweaks = nullptr}, alloc);
+            config.set_change_history(8);
+            ok = config.push_layer_text("base", "(a 1) (b 2 3 4 5 6)").has_value();
+            if constexpr (!baker::kShipping) {
+                config.begin_transaction("drag");
+                for (int i = 0; i < 20; ++i) ok = ok && config.set("a", baker::Node(i)).has_value();
+                const baker::Node one[] = {baker::Node(1)};
+                ok = ok &&
+                     config.set(baker::Path("b"), std::span<const baker::Node>(one)).has_value();
+                config.end_transaction();
+                ok = ok && config.clear_scratch("a").has_value();
+                ok = ok &&
+                     config.transaction_count() == 3;  // the push's commit, the drag, the clear
+                ok = ok && config.push_layer_text("top", "(a 9) (c 1) (b #append 7)").has_value();
+                ok = ok && config.remove_layer("top").has_value();
+                ok = ok && config.transaction_count() == 5;
+            }
+        }
+        global = scope.count();
+    }
+    CHECK(ok);
     if (baker::test::counting_allocations()) CHECK(global == 0);
     CHECK(mine.allocs == mine.frees);
     CHECK(mine.live_bytes == 0);

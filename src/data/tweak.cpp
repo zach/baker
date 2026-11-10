@@ -64,6 +64,7 @@ void TweakBase::attach(detail::Configuration) {
     next_ = registry_->head_;
     if (next_) next_->prev_ = this;
     registry_->head_ = this;
+    registry_->binder_ = 0;  // the next change indexes the tweaks again
     registry_->unlock();
     if (Config* c = registry_->config()) c->bind(*this);
 }
@@ -80,6 +81,7 @@ void TweakBase::detach() noexcept {
         if (next_) next_->prev_ = prev_;
     }
     prev_ = next_ = nullptr;
+    registry_->binder_ = 0;
     registry_->unlock();
     detail::destroy(default_allocator(MemoryKind::Tweaks), extra_);
     extra_ = nullptr;
@@ -98,7 +100,7 @@ bool TweakBase::unbind() {
     return true;
 }
 
-bool TweakBase::bind(const Array& root, const Callback<void(const Error&)>& warn) {
+bool TweakBase::bind(const Array& root, const Callback<void(const Error&)>& warn, bool* warned) {
     const Path& path = parsed();
     if constexpr (kShipping) {
         if (meta_.dev_only) return unbind();
@@ -106,8 +108,10 @@ bool TweakBase::bind(const Array& root, const Callback<void(const Error&)>& warn
     detail::Resolved r;
     const auto status = detail::resolve(root, path, r);
     if (status != detail::ResolveStatus::Ok) {
-        if (status == detail::ResolveStatus::Malformed && warn)
-            warn(detail::get_error(root, path, nullptr));
+        if (status == detail::ResolveStatus::Malformed) {
+            if (warn) warn(detail::get_error(root, path, nullptr));
+            if (warned) *warned = true;
+        }
         return unbind();
     }
     const Values& values = r.values;
@@ -122,6 +126,7 @@ bool TweakBase::bind(const Array& root, const Callback<void(const Error&)>& warn
             const detail::ConvertInfo want = info();
             warn(detail::get_error(root, path, &want));
         }
+        if (warned) *warned = true;
         return unbind();
     }
     bound_ = Ref<Array>(const_cast<Array*>(holder));

@@ -3,6 +3,8 @@
 #include "arena.hpp"
 #include "common/containers.hpp"
 
+#include <baker/record_id.hpp>
+
 #include <algorithm>
 #include <bit>
 
@@ -310,16 +312,17 @@ bool merge_into(Vec<Node>& dst, Vec<SourceSpan>* spans, size_t dst_first, const 
         for (size_t i = dst_first; i < dst.size(); ++i)
             if (const Array* da = dst[i].try_array())
                 if (const Symbol t = da->tag(); !t.empty()) index.add(t, i);
-        // The aliases too, after every key, so a key wins: one pass over the
-        // existing children, where a scan per missed key would be quadratic in a layer
-        // that adds many.
+        // The aliases and IDs too, after every key, so a key wins: one pass
+        // over the existing children, where a scan per missed key would be quadratic in a
+        // layer that adds many.
         if (aliased)
             for (size_t i = dst_first; i < dst.size(); ++i) {
                 const Array* da = dst[i].try_array();
-                const Array* aka = da && da->meta_first() ? da->meta(aka_tag()) : nullptr;
-                if (!aka) continue;
-                for (const Node& old : aka->values())
-                    if (const auto o = old.try_sym(); o && !o->empty()) index.add(*o, i);
+                if (!da || !da->meta_first()) continue;
+                if (const Array* aka = da->meta(aka_tag()))
+                    for (const Node& old : aka->values())
+                        if (const auto o = old.try_sym(); o && !o->empty()) index.add(*o, i);
+                if (const Symbol id = id_symbol(*da); !id.empty()) index.add(id, i);
             }
     }
     bool removes = false;  // a (key #remove) child: applied after the merge, below
@@ -346,15 +349,23 @@ bool merge_into(Vec<Node>& dst, Vec<SourceSpan>* spans, size_t dst_first, const 
                 }
             }
         }
-        // A key the stack lacks may be a renamed record's old one: it merges into the
-        // record that still answers to it, (@aka old), which keeps its new key.
+        // A key the stack lacks may be a renamed record's old one, or a record's ID: it
+        // merges into the record that answers to it, (@aka old) or (@id ...), which keeps
+        // its key. The ID is tried only for a tag that spells one.
         bool via_alias = false;
         if (indexed && aliased && found != dst.size()) {
             via_alias = dst[found].try_array()->tag() != tag;
         } else if (found == dst.size() && !tag.empty() && aliased && !indexed) {
+            const bool is_id = RecordId::parse(tag.str()).has_value();
             for (size_t i = dst_first; i < dst.size() && !via_alias; ++i) {
                 const Array* da = dst[i].try_array();
-                const Array* aka = da && da->meta_first() ? da->meta(aka_tag()) : nullptr;
+                if (!da || !da->meta_first()) continue;
+                if (is_id && id_symbol(*da) == tag) {
+                    found = i;
+                    via_alias = true;
+                    break;
+                }
+                const Array* aka = da->meta(aka_tag());
                 if (!aka) continue;
                 for (const Node& old : aka->values())
                     if (old.is(tag)) {

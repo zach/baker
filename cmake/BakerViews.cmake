@@ -1,6 +1,6 @@
 # baker_generate_views(<target> PROJECT <baker-project.dta> [OUTPUT <dir>])
 #
-# Generates the project's C++ views (docs/language.md, Views) with `baker_bake --views` into
+# Generates the project's C++ views (docs/cpp.md, Views) with `baker_bake --views` into
 # <dir> (default: baker_views/<target> under the current binary directory), adds it to
 # <target>'s include path, and regenerates whenever a file of the contract stack or the
 # project file changes: the tool writes a depfile, and rewrites a header only when its text

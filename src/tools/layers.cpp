@@ -75,10 +75,14 @@ Expected<List<LayerEffectEntry>> layer_effect(const Config& cfg, std::string_vie
 
     const Source in_scratch{scratch_name()};
     Vec<Node> below;
-    for (const Leaf& leaf : leaves_of(*tree)) {
+    const Vec<Leaf> leaves = leaves_of(*tree);
+    size_t chars = 0;
+    for (const Leaf& leaf : leaves) chars += leaf.path.size();
+    ReportTexts text(leaves.size(), chars);
+    for (const Leaf& leaf : leaves) {
         LayerEffectEntry e{};
         const Path path(leaf.path);
-        e.path = Symbol(leaf.path);
+        e.path = text(leaf.path);
         e.values = list_of(leaf.values);
         e.folded = leaf.folded;
         e.op = op_of(*leaf.holder);
@@ -102,7 +106,7 @@ Expected<List<LayerEffectEntry>> layer_effect(const Config& cfg, std::string_vie
     if (li)
         for (const Declaration& d : declared(impl.layers[*li])) {
             LayerEffectEntry e{};
-            e.path = d.name;
+            e.path = text(d.name.str());
             e.values = one(d.form);
             e.declares = d.directive;
             e.source = Source{Symbol(layer), d.file, d.line};
@@ -337,6 +341,89 @@ Expected<List<ExplainEntry>> explain(const Config& cfg, const Path& path) {
     }
     std::reverse(out.begin(), out.end());
     return List<ExplainEntry>(out);
+}
+
+// baker.changes/1: the log as a tool reads it.
+namespace {
+
+const char* kind_name(ChangeKind k) {
+    switch (k) {
+        case ChangeKind::Set: return "set";
+        case ChangeKind::Add: return "add";
+        case ChangeKind::Remove: return "remove";
+        case ChangeKind::Rename: return "rename";
+        case ChangeKind::Reorder: return "reorder";
+        case ChangeKind::Append: return "append";
+        case ChangeKind::Drop: return "drop";
+    }
+    return "";
+}
+
+void json_tree(Str& out, const Ref<Array>& tree) {
+    if (!tree) {
+        out += "null";
+        return;
+    }
+    Str text;
+    write(Node(tree), detail::str_out(text));
+    detail::json_string(out, text.view());
+}
+
+void json_source(Str& out, const Source& s) {
+    out += "{\"layer\": ";
+    detail::json_string(out, s.layer.str());
+    out += ", \"file\": ";
+    detail::json_string(out, s.file.str());
+    out += ", \"line\": " + detail::decimal(s.line) + "}";
+}
+
+}  // namespace
+
+void write_changes_json(const Config& cfg, TextSink out) {
+    Str json = R"({"schema": "baker.changes/1", "transactions": [)";
+    const size_t n = cfg.transaction_count();
+    for (size_t i = 0; i < n; ++i) {
+        const Transaction& t = cfg.transaction_at(i);
+        json += i ? ",\n  {\"id\": " : "\n  {\"id\": ";
+        json += detail::decimal(static_cast<int64_t>(t.id)) + ", \"name\": ";
+        detail::json_string(json, t.name.str());
+        json += ", \"time_ns\": " + detail::decimal(static_cast<int64_t>(t.time_ns));
+        json += Str(", \"undone\": ") + (t.undone ? "true" : "false") + ", \"written\": [";
+        for (size_t w = 0; w < t.written.size(); ++w) {
+            json += w ? ", {\"file\": " : "{\"file\": ";
+            detail::json_string(json, t.written[w].file.str());
+            json += ", \"line\": " + detail::decimal(t.written[w].line) + "}";
+        }
+        json += "], \"records\": [";
+        for (size_t r = 0; r < t.records.size(); ++r) {
+            const ChangeRecord& c = t.records[r];
+            json += r ? ",\n    {\"kind\": \"" : "\n    {\"kind\": \"";
+            json += kind_name(c.kind);
+            json += R"(", "path": )";
+            detail::json_string(json, c.path.str());
+            json += ", \"id\": ";
+            char hex[RecordId::kDigits];
+            c.id.write(hex);
+            detail::json_string(
+                json, c.id.empty() ? std::string_view() : std::string_view(hex, RecordId::kDigits));
+            if (!c.renamed_from.empty()) {
+                json += ", \"renamed_from\": ";
+                detail::json_string(json, c.renamed_from.str());
+            }
+            json += ", \"before\": ";
+            json_tree(json, c.before);
+            json += ", \"after\": ";
+            json_tree(json, c.after);
+            json += ", \"layer\": ";
+            detail::json_string(json, c.layer.str());
+            json += ", \"source\": ";
+            json_source(json, c.source);
+            json += ", \"time_ns\": " + detail::decimal(static_cast<int64_t>(c.time_ns)) + "}";
+        }
+        json += t.records.empty() ? "]}" : "\n  ]}";
+    }
+    json += n ? "\n]}\n" : "]}\n";
+    out(json.view());
 }
 
 }  // namespace baker::tools

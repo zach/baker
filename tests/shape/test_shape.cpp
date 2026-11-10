@@ -906,8 +906,10 @@ TEST_CASE("the view words are checked: a flag is (@view) or (@view no), @cxx is 
         return std::any_of(e.begin(), e.end(),
                            [&](const std::string& s) { return s.find(part) != std::string::npos; });
     };
-    CHECK(has(errors("#shape (s (@view yes) (x int))"), "shape 's' is (@view) or (@view no)"));
+    CHECK(has(errors("#shape (s (@view yes) (x int))"),
+              "shape 's' is (@view), (@view by_id) or (@view no)"));
     CHECK(has(errors("#shape (s (x int (@view maybe)))"), "field 'x' is (@view) or (@view no)"));
+    CHECK(has(errors("#shape (s (x int (@view by_id)))"), "field 'x' is (@view) or (@view no)"));
     CHECK(has(errors("#shape (s (x int (@cxx float)))"), "field 'x' (@cxx T): T is int8"));
     CHECK(has(errors("#shape (s (x float (@cxx int32)))"), "field 'x' (@cxx T)"));
     CHECK(has(errors("#shape (s (x symbol (@cxx int32)))"), "field 'x' (@cxx T)"));
@@ -967,8 +969,9 @@ TEST_CASE("a view's digest is symbol_hash of the shape's layout, and of nothing 
         "   (button symbol (@one_of light heavy) (@optional))\n"
         "   (@rule \"m\" {> $damage 0}))",
         "move");
+    // The fields in the struct's order: by alignment, largest first, then as declared.
     CHECK(d ==
-          symbol_hash("move\nkeyed\nstartup\nint\nuint16\ndamage\nfloat\ndouble\nbutton\nsymbol"));
+          symbol_hash("move\nkeyed\ndamage\nfloat\ndouble\nbutton\nsymbol\nstartup\nint\nuint16"));
     // The same layout, without any tuning word, hashes the same.
     CHECK(
         d ==
@@ -976,7 +979,12 @@ TEST_CASE("a view's digest is symbol_hash of the shape's layout, and of nothing 
             "#shape (move (@at m) (@keyed) (startup int (@cxx uint16)) (damage float (@cxx double))"
             " (on_hit any (@view no)) (button symbol))",
             "move"));
-    // What moves it: a type, a name, the order, a @cxx, a field left out, keyed.
+    // Fields of other alignments declared in another order make the same struct.
+    CHECK(d == digest_of("#shape (move (@at m) (@keyed) (damage float (@cxx double)) (startup int"
+                         " (@cxx uint16)) (button symbol))",
+                         "move"));
+    // What moves it: a type, a name, the order within an alignment, a @cxx, a field left
+    // out, keyed, by_id.
     const auto moved = [&](std::string_view text) { return digest_of(text, "move") != d; };
     CHECK(moved(
         "#shape (move (@at m) (@keyed) (startup float (@cxx double)) (damage float (@cxx double))"
@@ -984,9 +992,9 @@ TEST_CASE("a view's digest is symbol_hash of the shape's layout, and of nothing 
     CHECK(
         moved("#shape (move (@at m) (@keyed) (startup int (@cxx uint16)) (dmg float (@cxx double))"
               " (on_hit any (@view no)) (button symbol))"));
-    CHECK(moved(
-        "#shape (move (@at m) (@keyed) (damage float (@cxx double)) (startup int (@cxx uint16))"
-        " (on_hit any (@view no)) (button symbol))"));
+    CHECK(
+        moved("#shape (move (@at m) (@keyed) (startup int (@cxx uint16)) (button symbol)"
+              " (on_hit any (@view no)) (damage float (@cxx double)))"));
     CHECK(moved(
         "#shape (move (@at m) (@keyed) (startup int (@cxx uint32)) (damage float (@cxx double))"
         " (on_hit any (@view no)) (button symbol))"));
@@ -996,6 +1004,9 @@ TEST_CASE("a view's digest is symbol_hash of the shape's layout, and of nothing 
     CHECK(
         moved("#shape (move (startup int (@cxx uint16)) (damage float (@cxx double))"
               " (on_hit any (@view no)) (button symbol))"));
+    CHECK(moved(
+        "#shape (move (@at m) (@keyed) (@view by_id) (startup int (@cxx uint16)) (damage float"
+        " (@cxx double)) (on_hit any (@view no)) (button symbol))"));
     CHECK(shape::view_digest(shape::Set(), Symbol("move")) == 0);
 }
 
@@ -1014,10 +1025,10 @@ TEST_CASE("the digest spells lists, keys and nested shapes canonically") {
     CHECK(shape::view_digest(set, Symbol("vec")) == symbol_hash("vec\nx\nfloat\ny\nfloat"));
     CHECK(shape::view_digest(set, Symbol("unit")) ==
           symbol_hash("unit\nkeyed\npos\nlist(float,3)\ntags\nlist(symbol,1,4)\nnext\n"
-                      "list(key_of(units))\nweapon\nkey_of(items.weapons)\nat\nshape(vec," +
-                      vec + ")\npath\nlist(shape(vec," + vec + "))"));
+                      "list(key_of(units))\nweapon\nkey_of(items.weapons)\npath\nlist(shape(vec," +
+                      vec + "))\nat\nshape(vec," + vec + ")"));
     CHECK(shape::view_digest(set, Symbol("loop")) ==
-          symbol_hash("loop\nself\nshape(loop,cycle)\nn\nint"));
+          symbol_hash("loop\nn\nint\nself\nshape(loop,cycle)"));
 }
 
 TEST_CASE("the contract set holds the named layers' shapes, outside every #ifdef") {
@@ -1071,7 +1082,7 @@ namespace {
 // The shapes the golden headers and the data tests' reader are generated from.
 const char* const kViewShapes =
     "#shape (vec2 (@view) (x float) (y float))\n"
-    "#shape (move (@at fighters * moves) (@keyed) (@view)\n"
+    "#shape (move (@at fighters * moves) (@keyed) (@view by_id)\n"
     "   (startup     int (@range 1 60) (@cxx uint16))\n"
     "   (damage      float (@renamed_from hurt))\n"
     "   (name        string (@optional))\n"
@@ -1155,6 +1166,9 @@ TEST_CASE("view_shapes: the marked and listed shapes and what they nest, sorted;
         has(errors("#shape (boss_phase (@view) (x int))\n#shape (boss__phase (@view) (y int))", {}),
             "shapes 'boss__phase' and 'boss_phase' both generate `BossPhase`"));
     CHECK(has(errors("#shape (a (@view) (x int (@cxx_name int)))", {}), "member `int`"));
+    CHECK(has(errors("#shape (a (@view by_id) (x int))", {}),
+              "shape 'a' is (@view by_id), which only a (@keyed) shape's table can keep"));
+    CHECK(errors("#shape (a (@at as) (@keyed) (@view by_id) (x int))", {}).empty());
 }
 
 TEST_CASE("the generated headers match their golden files (BAKER_UPDATE_GOLDEN=1 rewrites them)") {
@@ -1261,4 +1275,405 @@ TEST_CASE("a key_of names a record by its alias, and the report lists the keys s
     CHECK(e[0].find("'lazer' is not a key of weapons (laser?)") != std::string::npos);
     REQUIRE(r.aliases_used.size() == 1);
     CHECK(r.aliases_used[0] == Symbol("laser"));
+}
+
+TEST_CASE("an undeclared field is one warning for its shape, with a count of the records") {
+    const shape::Report r = check_text(
+        "#shape (enemy (@at enemies) (@keyed) (hp int))\n"
+        "(enemies\n"
+        "  (orc (hp 10) (taunt \"grr\"))\n"
+        "  (elf (hp 8) (taunt \"hm\") (glow 1))\n"
+        "  (imp (hp 3) (taunt \"hee\")))\n");
+    std::vector<std::string> warnings;
+    for (const Error& w : r.warnings) warnings.emplace_back(w.message());
+    REQUIRE(warnings.size() == 2);
+    // The first record that has it, and how many more.
+    CHECK(warnings[0] ==
+          "'taunt' is not a field of shape 'enemy' (extra fields are allowed); also in 2 more "
+          "records");
+    CHECK(r.warnings[0].line() == 3);
+    CHECK(r.warnings[0].path().find("orc") != std::string_view::npos);
+    CHECK(warnings[1] == "'glow' is not a field of shape 'enemy' (extra fields are allowed)");
+    CHECK(r.errors.empty());
+}
+
+// --- The shape check of a candidate, or a push, scoped to what it changes. ---
+
+namespace {
+
+// A base of keyed units naming weapons, one unit (the old) with a field its shape does not
+// declare: a warning that stands in the base.
+const char* const kScopedBase =
+    "#shape (unit (@at units) (@keyed) (hp int (@range 1 100)) (weapon (key_of weapons)))\n"
+    "#shape (weapon (@at weapons) (@keyed) (damage int (@range 0 50)))\n"
+    "(weapons (laser (damage 5)) (cannon (damage 9)))\n"
+    "(units (old (hp 10) (weapon cannon) (colour red))\n"
+    "       (scout (hp 20) (weapon laser))\n"
+    "       (tank (hp 80) (weapon cannon)))\n";
+
+bool any_has(const std::vector<std::string>& list, const std::string& part) {
+    return std::any_of(list.begin(), list.end(),
+                       [&](const std::string& s) { return s.find(part) != std::string::npos; });
+}
+
+struct ScopedRun {
+    std::map<std::string, std::string> files{{"base.dta", kScopedBase}};
+    Config cfg{{.tweaks = nullptr}};
+    std::vector<std::string> reported;
+    ScopedRun() {
+        cfg.session().set_reader([this](std::string_view p, TextSink out) {
+            const auto it = files.find(std::string(p));
+            if (it == files.end()) return false;
+            out(it->second);
+            return true;
+        });
+        cfg.set_warning_handler([&](const Error& e) { reported.emplace_back(to_string(e)); });
+        cfg.add_validator(shape::validator(), {.any_thread = true});
+        REQUIRE(cfg.push_layer("base", "base.dta"));
+    }
+};
+
+}  // namespace
+
+TEST_CASE("a candidate's shape check holds its own records' findings, not the base's") {
+    ScopedRun run;
+    CHECK(any_has(run.reported, "'colour' is not a field of shape 'unit'"));  // the whole base
+    const LayerPolicy policy{.warnings_refuse = true};
+
+    // One record changed: checked whole, as merged; the old unit's warning is not its.
+    LayerReport r = ok(run.cfg.check_layer_text("tune", "(units (scout (hp 30)))\n", policy));
+    CHECK(texts(r.warnings).empty());
+    CHECK(r.ok());
+    // A record the candidate names is checked with its fields from below.
+    r = ok(run.cfg.check_layer_text("tune", "(units (old (hp 11)))\n", policy));
+    CHECK(any_has(texts(r.warnings), "'colour' is not a field of shape 'unit'"));
+    CHECK_FALSE(r.ok());
+
+    // A broken record is still refused, located.
+    r = ok(run.cfg.check_layer_text("tune", "(units (scout (hp 300)))\n", policy));
+    CHECK(any_has(texts(r.refusals), "'hp' is 300, outside 1.0 to 100.0"));
+    CHECK(r.warnings.size() == 1);
+    // A new record is checked whole, and its key looked up in the merged table.
+    r = ok(run.cfg.check_layer_text("tune", "(units (spy (hp 5) (weapon lazer)))\n", policy));
+    CHECK(any_has(texts(r.refusals), "'lazer' is not a key of weapons (laser?)"));
+
+    // A candidate that declares a shape is checked whole: the base's warning is in it.
+    r = ok(run.cfg.check_layer_text(
+        "tune",
+        "#shape (unit (@at units) (@keyed) (speed float (@optional)))\n(units (scout (hp 30)))\n",
+        policy));
+    CHECK(any_has(texts(r.warnings), "'colour' is not a field of shape 'unit'"));
+}
+
+TEST_CASE("a candidate that removes a keyed record reports the records that name it") {
+    ScopedRun run;
+    const LayerPolicy policy{};
+    // Followed through the key index: the tank and the old unit name the cannon.
+    LayerReport r = ok(run.cfg.check_layer_text("cut", "(weapons (cannon #remove))\n", policy));
+    const auto refusals = texts(r.refusals);
+    const auto warnings = texts(r.warnings);
+    CHECK(any_has(warnings, "'cannon' is not a key of weapons  (base.dta:4, at units/old/weapon)"));
+    CHECK(
+        any_has(warnings, "'cannon' is not a key of weapons  (base.dta:6, at units/tank/weapon)"));
+    CHECK_FALSE(any_has(warnings, "units/scout"));
+    // The old unit is checked whole, since it names what was removed.
+    CHECK(any_has(warnings, "'colour' is not a field of shape 'unit'"));
+    CHECK(refusals.empty());  // no policy rule; the shape's findings warn
+
+    // A removal of a table a key field names checks the whole tree.
+    r = ok(run.cfg.check_layer_text("cut", "(weapons #remove)\n", policy));
+    CHECK(any_has(texts(r.warnings), "no table weapons encloses it  (base.dta:5"));
+
+    // An alias the removed record answered to is followed too.
+    run.files["aka.dta"] = "(weapons (laser (@aka beam)))\n(units (beamer (hp 5) (weapon beam)))\n";
+    REQUIRE(run.cfg.push_layer("aka", "aka.dta"));
+    r = ok(run.cfg.check_layer_text("cut", "(weapons (laser #remove))\n", policy));
+    CHECK(any_has(texts(r.warnings), "'beam' is not a key of weapons"));
+    CHECK(any_has(texts(r.warnings), "units/scout/weapon"));
+}
+
+TEST_CASE("a scoped shape::check walks only what the changed tree names") {
+    shape::Set set;
+    shape::Report all;
+    const Ref<Array> base = add_text(set, kScopedBase, all, "base.dta");
+    shape::check(*base, set, all);
+    CHECK(all.warnings.size() == 1);
+    LoadSession session;
+    const Ref<Array> changed = ok(read_string("(units (tank (hp 0)))\n", "c.dta", session));
+    shape::Report scoped;
+    // The merged tree is the base here: the tank's hp in it is 80, so the record is clean.
+    shape::check(*base, set, scoped, nullptr, {.changed = changed.get()});
+    CHECK(scoped.errors.empty());
+    CHECK(scoped.warnings.empty());
+    const Ref<Array> old = ok(read_string("(units (old (hp 10)))\n", "c.dta", session));
+    shape::check(*base, set, scoped, nullptr, {.changed = old.get()});
+    CHECK(texts(scoped.warnings) == texts(all.warnings));
+}
+
+TEST_CASE(
+    "after a push, the warning handler gets the pushed records' findings; after a reload, "
+    "the whole tree's") {
+    ScopedRun run;
+    run.reported.clear();
+    run.files["tune.dta"] = "(units (scout (hp 300)))\n";
+    REQUIRE(run.cfg.push_layer("tune", "tune.dta"));
+    CHECK(run.reported.size() == 1);
+    CHECK(any_has(run.reported, "'hp' is 300"));
+    CHECK_FALSE(any_has(run.reported, "colour"));
+    // A tree pushed is scoped the same way.
+    run.reported.clear();
+    REQUIRE(run.cfg.push_layer("more", ok(read_string("(units (tank (hp 0)))\n", "more.dta"))));
+    CHECK(run.reported.size() == 1);
+    CHECK(any_has(run.reported, "'hp' is 0"));
+    if constexpr (!kShipping) {
+        // A reload may change anything: the whole tree.
+        run.reported.clear();
+        run.files["base.dta"] = std::string(kScopedBase) + "; edited\n";
+        REQUIRE(run.cfg.reload());
+        CHECK(any_has(run.reported, "colour"));
+        CHECK(any_has(run.reported, "'hp' is 300"));
+        CHECK(any_has(run.reported, "'hp' is 0"));
+        // So does a toggle.
+        run.reported.clear();
+        REQUIRE(run.cfg.set_layer_enabled("more", false));
+        CHECK(any_has(run.reported, "colour"));
+        CHECK(any_has(run.reported, "'hp' is 300"));
+    }
+}
+
+TEST_CASE("a push whose report holds runs no any_thread validator after its merge") {
+    ScopedRun run;
+    int any_runs = 0, owner_runs = 0;
+    run.cfg.add_validator(
+        [&](const ValidatorStack&, const Callback<void(const Error&)>&) { ++any_runs; },
+        {.any_thread = true});
+    run.cfg.add_validator(
+        [&](const ValidatorStack&, const Callback<void(const Error&)>&) { ++owner_runs; });
+    const LayerPolicy policy{};
+    const char* const text = "(units (scout (hp 30)))\n";
+    LayerReport r = ok(run.cfg.check_layer_text("tune", text, policy));
+    CHECK(any_runs == 1);
+    CHECK(owner_runs == 1);
+    run.reported.clear();
+    REQUIRE(run.cfg.push_layer_text("tune", text, {.policy = &policy, .checked = &r}));
+    CHECK(any_runs == 1);         // the check's run holds
+    CHECK(owner_runs == 2);       // a validator not any_thread runs after the merge, as before
+    CHECK(run.reported.empty());  // the shape validator is any_thread: it did not run again
+    // Without a report that holds, the push checks, and its merge runs them all.
+    REQUIRE(run.cfg.push_layer_text("tune2", text, {.policy = &policy}));
+    CHECK(any_runs == 3);
+    CHECK(owner_runs == 4);
+}
+
+// --- What the check costs grows with the data, not its square. Each stack below gave
+// these findings before that change as well. ---
+
+namespace {
+
+std::vector<std::string> findings(const shape::Report& r) {
+    std::vector<std::string> out = texts(r.errors);
+    for (const std::string& w : texts(r.warnings)) out.push_back("warning " + w);
+    return out;
+}
+
+}  // namespace
+
+TEST_CASE("keyed shapes at several depths, with wildcards, report as each array tested them all") {
+    std::string text;
+    // Sixteen keyed shapes that govern nothing here, at four depths, sharing the data's first
+    // segments or a wildcard, so that each is tested against the arrays of its depth.
+    const char* const places[] = {"nowhere", "zone nowhere", "* * nowhere", "zone * rooms nowhere"};
+    for (int i = 0; i < 16; ++i)
+        text += "#shape (idle" + std::to_string(i) + " (@at " + places[i % 4] + std::to_string(i) +
+                ") (@keyed) (v int))\n";
+    text +=
+        "#shape (zone_entry (@at zone) (@keyed) (rooms any) (level int (@optional)))\n"
+        "#shape (room (@at zone * rooms) (@keyed) (v int (@range 0 5)))\n"
+        "#shape (any_room (@at * * rooms) (@keyed) (w int (@optional)))\n"
+        "#shape (north_room (@at zone north rooms) (@keyed) (x int))\n"
+        "#shape (deep (@at zone * rooms * items) (@keyed) (n int))\n"
+        "#shape (sword (n int) (edge int))\n"
+        "(zone\n"
+        "  (north (rooms (r1 (v 1) (x 2))\n"
+        "                (r2 (v 9) (w 1) (items (sword (n 1)) (bow (n oops))))))\n"
+        "  (south (level 2) (rooms (r3 (w 2)) (r4 (v 3) (q 1))))\n"
+        "  (east (rooms)))\n"
+        "(other (rooms (r5 (v 1))))\n"
+        "(a (b (rooms (r6 (w x)))))\n"
+        "(sword (n 2))\n";
+    const std::string extra = " (extra fields are allowed)";
+    CHECK(findings(check_text(text)) ==
+          std::vector<std::string>{
+              "baker: 'v' is 9, outside 0.0 to 5.0  (t.dta:25, at zone/north/rooms/r2/v)",
+              "baker: 'north_room' has no 'x'  (t.dta:25, at zone/north/rooms/r2)",
+              "baker: 'sword' has no 'edge'  (t.dta:25, at zone/north/rooms/r2/items/sword)",
+              "baker: 'n' is symbol, not int  (t.dta:25, at zone/north/rooms/r2/items/bow/n)",
+              "baker: 'room' has no 'v'  (t.dta:26, at zone/south/rooms/r3)",
+              "baker: 'w' is symbol, not int  (t.dta:29, at a/b/rooms/r6/w)",
+              "baker: 'sword' has no 'edge'  (t.dta:30, at sword)",
+              "warning baker: 'x' is not a field of shape 'room'" + extra +
+                  "  (t.dta:24, at zone/north/rooms/r1/x)",
+              "warning baker: 'v' is not a field of shape 'any_room'" + extra +
+                  "; also in 2 more records  (t.dta:24, at zone/north/rooms/r1/v)",
+              "warning baker: 'x' is not a field of shape 'any_room'" + extra +
+                  "  (t.dta:24, at zone/north/rooms/r1/x)",
+              "warning baker: 'v' is not a field of shape 'north_room'" + extra +
+                  "; also in 1 more record  (t.dta:24, at zone/north/rooms/r1/v)",
+              "warning baker: 'w' is not a field of shape 'room'" + extra +
+                  "; also in 1 more record  (t.dta:25, at zone/north/rooms/r2/w)",
+              "warning baker: 'items' is not a field of shape 'room'" + extra +
+                  "  (t.dta:25, at zone/north/rooms/r2/items)",
+              "warning baker: 'items' is not a field of shape 'any_room'" + extra +
+                  "  (t.dta:25, at zone/north/rooms/r2/items)",
+              "warning baker: 'w' is not a field of shape 'north_room'" + extra +
+                  "  (t.dta:25, at zone/north/rooms/r2/w)",
+              "warning baker: 'items' is not a field of shape 'north_room'" + extra +
+                  "  (t.dta:25, at zone/north/rooms/r2/items)",
+              "warning baker: 'q' is not a field of shape 'room'" + extra +
+                  "  (t.dta:26, at zone/south/rooms/r4/q)",
+              "warning baker: 'q' is not a field of shape 'any_room'" + extra +
+                  "  (t.dta:26, at zone/south/rooms/r4/q)"});
+}
+
+TEST_CASE("wide records: each missing required field, in the shape's order") {
+    // 130 fields, every seventh optional, f100 renamed from old100; and one of 64.
+    const auto optional = [](int i) { return i % 7 == 3; };
+    std::string text = "#shape (wide (@at wides) (@keyed)";
+    for (int i = 0; i < 130; ++i)
+        text += " (f" + std::to_string(i) + " int" + (optional(i) ? " (@optional)" : "") +
+                (i == 100 ? " (@renamed_from old100)" : "") + ")";
+    text += ")\n#shape (w64 (@at w64s) (@keyed)";
+    for (int i = 0; i < 64; ++i) text += " (g" + std::to_string(i) + " int)";
+    text += ")\n";
+    const auto record = [](const char* prefix, int n, auto keep, bool reverse) {
+        std::string r;
+        for (int k = 0; k < n; ++k) {
+            const int i = reverse ? n - 1 - k : k;
+            if (keep(i)) r += " (" + std::string(prefix) + std::to_string(i) + " 1)";
+        }
+        return r;
+    };
+    text += "(wides\n";
+    text += " (whole" + record("f", 130, [](int) { return true; }, false) + ")\n";
+    text += " (backward" +
+            record("f", 130, [](int i) { return i != 5 && i != 64 && i != 129; }, true) + ")\n";
+    text += " (renamed" +
+            record("f", 130, [](int i) { return i != 100 && i != 63; }, false) + " (old100 2))\n";
+    text += " (bare (f0 1))\n";
+    text +=
+        " (required_only" + record("f", 130, [&](int i) { return !optional(i); }, true) + "))\n";
+    text += "(w64s\n";
+    text += " (all" + record("g", 64, [](int) { return true; }, true) + ")\n";
+    text += " (ends" + record("g", 64, [](int i) { return i != 0 && i != 63; }, true) + "))\n";
+    std::vector<std::string> want = {"baker: 'wide' has no 'f5'  (t.dta:5, at wides/backward)",
+                                     "baker: 'wide' has no 'f64'  (t.dta:5, at wides/backward)",
+                                     "baker: 'wide' has no 'f63'  (t.dta:6, at wides/renamed)"};
+    for (int i = 1; i < 130; ++i)
+        if (!optional(i))
+            want.push_back("baker: 'wide' has no 'f" + std::to_string(i) +
+                           "'  (t.dta:7, at wides/bare)");
+    want.emplace_back("baker: 'w64' has no 'g0'  (t.dta:11, at w64s/ends)");
+    want.emplace_back("baker: 'w64' has no 'g63'  (t.dta:11, at w64s/ends)");
+    want.emplace_back(
+        "warning baker: 'old100' is now 'f100' (format rewrites it)  (t.dta:6, at "
+        "wides/renamed/old100)");
+    CHECK(findings(check_text(text)) == want);
+}
+
+TEST_CASE("a key's table past wide arrays: the nearest still shadows the outer") {
+    // Twenty units, a wide table each key looks outward past, to the root's weapons and
+    // gear.items, unless the unit holds its own.
+    std::string units = "(units\n";
+    for (int i = 0; i < 20; ++i) {
+        units += " (u" + std::to_string(i) + " (weapon " + (i % 2 ? "laser" : "cannon") + ")";
+        if (i == 7)
+            units += " (weapons (custom)) (gear (items (boots))) (sidearm custom) (kit boots)";
+        if (i == 8) units += " (sidearm custom) (kit helm boots)";
+        if (i == 9) units += " (kit helm)";
+        units += ")\n";
+    }
+    const std::string shapes =
+        "#shape (unit (@at units) (@keyed) (weapon (key_of weapons))\n"
+        "  (sidearm (key_of weapons) (@optional)) (kit (list (key_of gear.items)) (@optional))\n"
+        "  (weapons any (@optional)) (gear any (@optional)))\n"
+        "(weapons (laser) (cannon))\n(gear (items (helm)))\n";
+    CHECK(findings(check_text(shapes + units + ")\n")) ==
+          std::vector<std::string>{
+              "baker: 'laser' is not a key of weapons  (t.dta:14, at units/u7/weapon)",
+              "baker: 'custom' is not a key of weapons  (t.dta:15, at units/u8/sidearm)",
+              "baker: 'boots' is not a key of gear.items  (t.dta:15, at units/u8/kit)"});
+    // A table of the units' own, late in the wide array, shadows the root's for all of them.
+    std::vector<std::string> want;
+    for (int i = 0; i < 20; i += 2) {
+        if (i == 8) {
+            want.emplace_back(
+                "baker: 'laser' is not a key of weapons  (t.dta:14, at units/u7/weapon)");
+            want.emplace_back(
+                "baker: 'cannon' is not a key of weapons  (t.dta:15, at units/u8/weapon)");
+            want.emplace_back(
+                "baker: 'custom' is not a key of weapons  (t.dta:15, at units/u8/sidearm)");
+            want.emplace_back(
+                "baker: 'boots' is not a key of gear.items  (t.dta:15, at units/u8/kit)");
+            continue;
+        }
+        want.push_back("baker: 'cannon' is not a key of weapons  (t.dta:" + std::to_string(7 + i) +
+                       ", at units/u" + std::to_string(i) + "/weapon)");
+    }
+    want.emplace_back("baker: 'unit' has no 'weapon'  (t.dta:27, at units/weapons)");
+    want.emplace_back(
+        "warning baker: 'laser' is not a field of shape 'unit' (extra fields are allowed)  "
+        "(t.dta:27, at units/weapons/laser)");
+    CHECK(findings(check_text(shapes + units + " (weapons (laser)))\n")) == want);
+
+    // Twenty fighters, each a table of its own moves past the wide fighters and moves; the
+    // root's moves only where no fighter's shadow them.
+    std::string fighters =
+        "#shape (move (@at fighters * moves) (@keyed) (next (key_of moves) (@optional)))\n"
+        "#shape (combo (@at combos) (@keyed) (first (key_of moves)))\n(moves";
+    for (int i = 0; i < 20; ++i) fighters += " (root" + std::to_string(i) + ")";
+    fighters += ")\n(fighters\n";
+    for (int i = 0; i < 20; ++i) {
+        const std::string n = std::to_string(i);
+        fighters += " (f" + n + " (moves";
+        for (int m = 0; m < 18; ++m) fighters += " (m" + n + "_" + std::to_string(m) + ")";
+        fighters += " (jab (next m" + n + "_3)) (poke (next root2)) (kick (next jab))))\n";
+    }
+    fighters += ")\n(combos (c1 (first root4)) (c2 (first jab)))\n";
+    want.clear();
+    for (int i = 0; i < 20; ++i)
+        want.push_back("baker: 'root2' is not a key of moves  (t.dta:" + std::to_string(5 + i) +
+                       ", at fighters/f" + std::to_string(i) + "/moves/poke/next)");
+    want.emplace_back("baker: 'jab' is not a key of moves  (t.dta:26, at combos/c2/first)");
+    CHECK(findings(check_text(fighters)) == want);
+}
+
+TEST_CASE("each_ruled visits the same records with the same paths at depth") {
+    std::string text =
+        "#shape (unit (@at units) (@keyed) (@rule \"r\" {f}))\n"
+        "#shape (room (@at zone * rooms) (@keyed) (@rule \"q\" {g}))\n"
+        "#shape (boss_phase (@rule \"p\" {g}))\n"
+        "#shape (plain (n int))\n(units";
+    for (int i = 0; i < 20; ++i) text += " (u" + std::to_string(i) + " (hp 1))";
+    text +=
+        ")\n(zone (north (rooms (r1 (v 1)) (r2 (boss_phase (at 3))))) (south (rooms (r3))))\n"
+        "(bosses (dragon (phases (boss_phase (at 1)) (boss_phase (at 2)))))\n"
+        "(plain (n 3))\n";
+    shape::Set shapes;
+    shape::Report report;
+    const Ref<Array> tree = add_text(shapes, text, report);
+    std::vector<std::string> seen;
+    shape::each_ruled(*tree, shapes,
+                      [&](const Array& record, const shape::Shape& s, std::string_view path) {
+                          seen.push_back(std::string(s.name.str()) + " " + std::string(path) +
+                                         " :" + std::to_string(record.line()));
+                      });
+    std::vector<std::string> want;
+    for (int i = 0; i < 20; ++i) want.push_back("unit units/u" + std::to_string(i) + " :5");
+    for (const char* v :
+         {"room zone/north/rooms/r1 :6", "room zone/north/rooms/r2 :6",
+          "boss_phase zone/north/rooms/r2/boss_phase :6", "room zone/south/rooms/r3 :6",
+          "boss_phase bosses/dragon/phases/boss_phase :7",
+          "boss_phase bosses/dragon/phases/boss_phase :7"})
+        want.emplace_back(v);
+    CHECK(seen == want);
 }

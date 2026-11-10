@@ -171,6 +171,10 @@ struct ValidatorStack {
     // What the layers' files declared (Config::read_session), with a checked candidate's
     // text read too.
     const LoadSession& session;
+    // What changed: the candidate's own tree when a candidate is checked, the pushed
+    // layer's after a push; null after a reload, a toggle, a restore, a removal, or anything
+    // else that may change the tree anywhere. A validator may judge only what it names.
+    const Array* changed = nullptr;
 };
 
 struct ValidatorOptions {
@@ -178,6 +182,10 @@ struct ValidatorOptions {
     // at once with the Config's own: a LayerChecker runs it on the thread that checks. A
     // validator without it runs on the Config's thread only.
     bool any_thread = false;
+    // It runs only in checks of a candidate layer (check_layer, a push with a policy), which
+    // it can refuse, never after a merge, where it could only warn: a shipping host keeps
+    // the checks an overlay must pass without paying for them at every change.
+    bool checks_only = false;
 };
 
 struct LayerOptions {
@@ -204,7 +212,8 @@ struct LayerOptions {
     // name with the same text, or the same tree, on top. Otherwise the push checks, as
     // without it. A tree must not change between the check and the push. A validator that
     // reads something outside the Config (check_validator's Context) is trusted not to have
-    // changed its verdict meanwhile.
+    // changed its verdict meanwhile. A push whose report holds runs no any_thread validator
+    // after its merge: the check that made the report ran them over the same stack.
     const LayerReport* checked = nullptr;
 };
 
@@ -299,7 +308,9 @@ private:
 };
 
 struct LayerEffectEntry {
-    Symbol path;  // dotted, as get<T>() takes it
+    // Dotted, as get<T>() takes it. Text, not a Symbol: a report interns no path, so a
+    // candidate checked again and again, refused or not, adds no names to the program.
+    Ref<String> path;
     // This layer's values, one node each: (aim (0 0)) is one, an array; (aim 0 0) is two. A
     // verb's operands, a record one operand; a removal's #remove.
     RowValues values;
@@ -370,6 +381,39 @@ struct JournalEntry {
     WrittenLine written;  // for Written: the file and line
 };
 
+// The change log: every change to the data, as transactions of change records, kept
+// beside the journal when a tool asks for it (set_change_history). A record holds the whole
+// old and new values as trees (null for absent), the record's (@id ...) when it has one, the
+// layer the new value was written to, and where the old value came from.
+enum class ChangeKind : uint8_t {
+    Set,      // a value at a path
+    Add,      // a record (a keyed child) added
+    Remove,   // one removed
+    Rename,   // one renamed: `renamed_from` is the old key, now its alias
+    Reorder,  // a parent's records in another order
+    Append,   // a list grown by a layer's #append: `after` holds the operand
+    Drop,     // a list shrunk by #drop
+};
+struct ChangeRecord {
+    ChangeKind kind = ChangeKind::Set;
+    Symbol path;  // dotted, from the root
+    RecordId id;  // the record's, or empty
+    Ref<Array> before, after;
+    Symbol layer;   // written to: "scratch", or the layer's name
+    Source source;  // where the old value came from
+    uint64_t time_ns = 0;
+    Symbol renamed_from;
+};
+// One action's records: a set, a console command, a push, a reload, a promotion.
+struct Transaction {
+    uint64_t id = 0;  // the session's sequence, from 1
+    Symbol name;  // "set", "clear_scratch", the commit's trigger, or what begin_transaction gave
+    uint64_t time_ns = 0;
+    List<ChangeRecord> records;
+    List<WrittenLine> written;  // the files a promotion or a write-back wrote
+    bool undone = false;        // undo() returned to before it; redo() applies it again
+};
+
 struct WriteReport {
     List<WrittenLine> written;  // every file and line written
     List<Error> refused;        // promote(): every refusal; then nothing was written
@@ -419,6 +463,40 @@ public:
 private:
     friend class Config;
     void stamp(LayerReport& report, uint64_t subject, const LayerPolicy& policy) const noexcept;
+    State* state_ = nullptr;
+};
+
+// A reload in three calls, so the reading and parsing can run off the game's thread:
+// Config::begin_reload on the Config's thread copies what the reload reads against;
+// run() on any thread finds the files that changed and reads and parses them, into the
+// copy, touching nothing of the Config's; Config::finish_reload on the Config's thread
+// merges, binds and notifies, unless the stack changed since begin_reload (a layer pushed,
+// popped or toggled, another reload), when it changes nothing and says Refused: begin
+// again. Live edits meanwhile are fine; the merge reads them as they stand.
+//
+// run() reads through the session's reader, lister and stamper, writes caches through the Config's
+// writer, reads its clock, and allocates from its allocator, on the thread that runs it:
+// those must be safe there. Warnings it meets wait for finish_reload, which gives them to
+// the warning handler. The Config must outlive the job; it needs atomic reference counts
+// (the default) to run on another thread. Move-only.
+class ReloadJob {
+public:
+    ReloadJob() noexcept = default;
+    ReloadJob(ReloadJob&& other) noexcept : state_(other.state_) { other.state_ = nullptr; }
+    ReloadJob& operator=(ReloadJob&& other) noexcept;
+    ReloadJob(const ReloadJob&) = delete;
+    ReloadJob& operator=(const ReloadJob&) = delete;
+    ~ReloadJob();
+    // A job begun and not yet finished; empty under BAKER_SHIPPING, where reload does nothing.
+    [[nodiscard]] bool empty() const noexcept { return !state_; }
+    // The scan, the reads and the parses. Once; finish_reload runs it if it was not.
+    void run();
+    [[nodiscard]] bool ran() const noexcept;
+
+    struct State;  // defined in config.cpp
+
+private:
+    friend class Config;
     State* state_ = nullptr;
 };
 
@@ -565,9 +643,10 @@ public:
     // does, before `changed`). Nothing to do when there are none.
     void apply_edits();
     // A value as the game reads it, live edits included. A record or a table above a live
-    // edit not yet applied is read from a fresh merge, so it holds the edit; a T that keeps
-    // views into the tree (std::string_view, Values) must not be read so, and should be read
-    // after apply_edits().
+    // edit not yet applied is read from a merge with the edits, made at the first such read
+    // and kept until the next change, so it holds the edit; a T that keeps views into the
+    // tree (std::string_view, Values) must not be read so, and should be read after
+    // apply_edits().
     template <class T>
     [[nodiscard]] Expected<T> get(const Path& path) const {
         Values v;
@@ -597,8 +676,15 @@ public:
     [[nodiscard]] uint64_t epoch() const noexcept { return epoch_; }
 
     // --- Hot reload and telemetry. ---
-    // Re-reads changed files; true if anything changed.
+    // Re-reads changed files; true if anything changed. In place, on this thread: one that
+    // finds nothing changed allocates nothing.
     [[nodiscard]] Expected<bool> reload(const ReloadRequest& request = {});
+    // A reload in parts (ReloadJob, above): begun here, run anywhere, finished here. The
+    // outcome is Ok when the stack changed, Unchanged when no file did, and Refused when the
+    // stack changed under the job (begin again) or reloads are refused; a layer that does
+    // not read is the error, and changes nothing.
+    [[nodiscard]] ReloadJob begin_reload(const ReloadRequest& request = {});
+    [[nodiscard]] Expected<ReloadOutcome> finish_reload(ReloadJob job);
     ReloadId on_reload(const Path& group, Callback<void()> rebuild,
                        Callback<Reload()> migrate = {});
     // Called after every change with its finished record (not under BAKER_SHIPPING).
@@ -628,7 +714,9 @@ public:
     // restore) with the stack and the warning handler, to report on the data, and by each
     // check of a candidate layer: baker::shape::validator() checks shapes this way,
     // and baker::check_validator() script calls. Validators run in the order they
-    // were added.
+    // were added; one added with checks_only runs in the checks alone, and an any_thread one
+    // not after the merge of a push whose report held (LayerOptions::checked). The stack's
+    // `changed` says what a check's candidate, or a push, changed.
     using Validator =
         Callback<void(const ValidatorStack& stack, const Callback<void(const Error&)>& warn)>;
     using ValidatorId = uint32_t;
@@ -690,6 +778,30 @@ public:
         for (size_t i = 0, n = journal_size(); i < n; ++i) fn(journal_at(i));
     }
     void set_journal_history(size_t capacity);
+    // The change log: off by default. With a capacity, every live edit and every
+    // commit is a transaction of records, the last `capacity` kept, oldest first through
+    // transactions(fn). A set with the log on allocates its values' trees; with it off, the
+    // fast path is as before. Under BAKER_SHIPPING nothing is recorded.
+    void set_change_history(size_t capacity);
+    [[nodiscard]] size_t change_history() const noexcept;
+    template <class F>
+    void transactions(F&& fn) const {
+        for (size_t i = 0, n = transaction_count(); i < n; ++i) fn(transaction_at(i));
+    }
+    [[nodiscard]] size_t transaction_count() const noexcept;
+    [[nodiscard]] const Transaction& transaction_at(size_t i) const noexcept;
+    // Groups the changes until the matching end_transaction into one, named: a console
+    // command, a drag, a tool's action. Nests; the outermost names it. Without one open,
+    // each change is its own transaction.
+    void begin_transaction(std::string_view name);
+    void end_transaction();
+    // Undo and redo per transaction. undo() returns to the state before the latest
+    // applied transaction (the layers, their toggles and scratch, as restore() does), in
+    // memory: the files a promotion or a write-back wrote stay written, and its `written`
+    // names them. redo() applies the latest undone one again; a new change after an undo
+    // drops the undone ones. NotFound with nothing to undo or redo; Refused with the log off.
+    [[nodiscard]] Expected<void> undo();
+    [[nodiscard]] Expected<void> redo();
 
     [[nodiscard]] Expected<WriteReport> write_back(const Path& path);
     // `pin`: the row also carries `(@was v...)`, the stack's value below `layer` as it is now,
@@ -723,6 +835,7 @@ public:
 private:
     struct Impl;
     friend class TweakBase;
+    friend class ReloadJob;  // runs on its copy through the Impl's reading
     friend struct detail::ToolsAccess;
 
     void bind(TweakBase& t);
@@ -737,7 +850,7 @@ private:
     enum class ScratchHit : uint8_t { None, Found, PastEnd };
     [[nodiscard]] ScratchHit scratch_values(const Path& path, Values& out) const noexcept;
     [[nodiscard]] bool edits_beneath(const Path& path) const noexcept;
-    [[nodiscard]] Ref<Array> with_edits() const;  // a fresh merge, live edits included
+    [[nodiscard]] Ref<Array> with_edits() const;  // a merge with the live edits, kept
     // `info` null: past the end.
     [[nodiscard]] static Error scratch_error(const Path& path, const detail::ConvertInfo* info);
     template <class T>

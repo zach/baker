@@ -16,6 +16,8 @@
 #include <random>
 #include <ranges>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 using namespace baker;
@@ -385,6 +387,122 @@ TEST_CASE("sorted and linear find agree on random arrays") {
             REQUIRE((l == nullptr) == (r == nullptr));
             if (l) CHECK(l == r);  // the same (shared) child array
         }
+    }
+}
+
+namespace {
+// The child find() means, by a scan of the nodes themselves: the first array tagged `tag`.
+const Array* first_tagged(const Array& a, Symbol tag) {
+    if (tag.empty()) return nullptr;
+    for (const Node& n : a)
+        if (const Array* c = n.try_array(); c && c->tag() == tag) return c;
+    return nullptr;
+}
+
+// Every lookup `sorted` answers as `linear` does, and as a scan of either's nodes does.
+void check_agree(const Array& linear, const Array& sorted, const std::vector<Symbol>& tags) {
+    for (const Symbol t : tags) {
+        CAPTURE(t.str());
+        const Array* l = linear.try_find(t);
+        CHECK(l == first_tagged(linear, t));
+        CHECK(sorted.try_find(t) == l);  // the same (shared) child array, or none
+        CHECK(first_tagged(sorted, t) == l);
+        if (t.is_meta()) CHECK(sorted.meta(t) == linear.meta(t));
+    }
+}
+}  // namespace
+
+TEST_CASE("sorted find agrees with linear across sizes, duplicates, metadata and edits") {
+    std::mt19937 rng(320);
+    for (const uint32_t n : {0u, 1u, 2u, 8u, 20u, 100u, 1000u, 10000u}) {
+        CAPTURE(n);
+        // Tags from a pool a third the array's size, so most repeat; every seventh is
+        // metadata's. Now and then a node that is no tagged array: a number, a symbol, an
+        // array tagged '', a command.
+        std::vector<Symbol> tags;
+        for (uint32_t i = 0; i < std::max(1u, n / 3); ++i)
+            tags.emplace_back((i % 7 == 6 ? "@m" : "t") + std::to_string(i));
+        const auto any_tag = [&] { return tags[rng() % tags.size()]; };
+        std::vector<Node> nodes;
+        nodes.emplace_back(Symbol("root"));
+        for (uint32_t i = 0; i < n; ++i) {
+            const auto v = static_cast<int64_t>(i);
+            switch (rng() % 10) {
+                case 0: nodes.emplace_back(v); break;
+                case 1: nodes.emplace_back(any_tag()); break;
+                case 2: nodes.emplace_back(array(Symbol(""), v)); break;
+                case 3: nodes.emplace_back(array(any_tag(), v), Type::Command); break;
+                default: nodes.emplace_back(array(any_tag(), v)); break;
+            }
+        }
+        std::vector<Symbol> asked = tags;
+        asked.insert(asked.end(),
+                     {Symbol(""), Symbol("absent"), Symbol("@absent"), Symbol("root")});
+
+        auto linear = Array::make_copy(nodes);
+        auto sorted = Array::make_copy(nodes);
+        sorted->sort_for_lookup();
+        REQUIRE(sorted->sorted_for_lookup());
+        CHECK((*sorted)[0].is("root"));
+        check_agree(*linear, *sorted, asked);
+
+        // Through a cache, still sorted, with the same answers.
+        std::string bytes;
+        ok(write_cache(*sorted, string_out(bytes)));
+        auto back = ok(read_cache_bytes(bytes, "sorted.datb"));
+        CHECK(back->sorted_for_lookup());
+        for (const Symbol t : asked) {
+            const Array* l = linear->try_find(t);
+            const Array* b = back->try_find(t);
+            REQUIRE((l == nullptr) == (b == nullptr));
+            if (l) CHECK(structurally_equal(*l, *b));
+        }
+
+        if (n == 0) continue;
+        // An edit turns sorting off, and every lookup still answers as the linear copy does;
+        // sorting again restores it.
+        for (int edit = 0; edit < 3; ++edit) {
+            const auto at = 1 + rng() % n;
+            const Node child = array(any_tag(), int64_t{-1});
+            linear->set(at, child);
+            sorted->set(at, child);
+            CHECK_FALSE(sorted->sorted_for_lookup());
+            // Not a check against `linear`: the edit replaced different children in each.
+            for (const Symbol t : asked) CHECK(sorted->try_find(t) == first_tagged(*sorted, t));
+        }
+        linear = Array::make_copy(sorted->nodes());
+        sorted->sort_for_lookup();
+        check_agree(*linear, *sorted, asked);
+    }
+}
+
+TEST_CASE("sorted find confirms each child whose tag shares a key with the one asked") {
+    // Two names whose hashes share the top 30 bits, which is the sorted run's key: found by
+    // hashing names without interning them, until two collide (about 40,000 tries).
+    const auto collide = [](const std::string& prefix) {
+        std::unordered_map<uint64_t, std::string> seen;
+        for (uint32_t i = 0;; ++i) {
+            std::string name = prefix + std::to_string(i);
+            const auto [it, added] = seen.emplace(symbol_hash(name) >> 34, name);
+            if (!added) return std::pair<Symbol, Symbol>(Symbol(it->second), Symbol(name));
+        }
+    };
+    for (const std::string prefix : {"c", "@c"}) {
+        CAPTURE(prefix);
+        const auto [a, b] = collide(prefix);
+        REQUIRE(a != b);
+        auto both = array("root", array(b, 1), array("x", 2), array(a, 3), array(b, 4), array(a, 5),
+                          array("@y", 6));
+        auto linear = Array::make_copy(both->nodes());
+        both->sort_for_lookup();
+        CHECK(both->find_int(a) == 3);  // the first of each, past the other's children
+        CHECK(both->find_int(b) == 1);
+        check_agree(*linear, *both, {a, b, Symbol("x"), Symbol("@y")});
+        // A name absent from the array whose key is present: no child confirms it.
+        auto only_a = array("root", array(a, 1), array("x", 2));
+        only_a->sort_for_lookup();
+        CHECK(only_a->try_find(b) == nullptr);
+        CHECK(only_a->find_int(a) == 1);
     }
 }
 

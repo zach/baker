@@ -23,6 +23,7 @@ build/game assets > assets.json      # exit 1 when a file is not there, 2 when i
 
 | Field | Contents |
 |---|---|
+| `schema` | `"baker.assets/1"` |
 | `root` | the project file's directory, which every `target` is relative to |
 | `assets` | one edge per value, sorted by `from.file`, then `from.line`, then `from.path` |
 | `from.file`, `from.line` | where the value is written: the layer that names it, so an overlay's own line |
@@ -37,3 +38,13 @@ A list field gives one edge per element, each at the field's line. The merged st
 is listed: a layer that replaces a record's asset replaces its edge, and a disabled layer
 contributes none. `check` reports an absent file as a shape error, so a gate catches it
 before a pipeline does.
+
+## Stability
+
+- **The same data gives the same bytes,** as long as the same files are there: the edges are
+  sorted by the data alone (above), and only `exists` reads the disk.
+- **Formatting:** UTF-8, one edge per line, a newline at the end. Strings escape `"`, `\` and
+  control characters (`\n`, `\t`, `\u00XX`); other characters are written as they are.
+  Numbers are integers.
+- **Versioning** follows [`check`'s](check-json.md#stability): a field is added only with a new
+  minor version, and removed, renamed or changed only with a new major version.

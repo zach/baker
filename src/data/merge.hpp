@@ -19,9 +19,10 @@ class Arena;
 class MergeScratch {
 public:
     explicit MergeScratch(const Allocator& alloc = default_allocator()) : alloc_(alloc) {}
-    // Some array below carries an (@aka ...): a key the lower array lacks is then looked for
-    // among its children's aliases, and merges into the renamed record. A stack with
-    // no alias never pays the scan: the owner sets it from what its reads counted.
+    // Some array below carries an (@aka ...) or an (@id ...): a key the lower array lacks is
+    // then looked for among its children's aliases and IDs, and merges into the record that
+    // answers to it, which keeps its key. A stack with neither never pays the
+    // scan: the owner sets it from what its reads counted.
     bool aliases = false;
 
 private:

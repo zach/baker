@@ -44,7 +44,7 @@ TEST_CASE("check_layer reports the effect and changes nothing") {
     const LayerReport r = ok(cfg.check_layer("balance", tree("(shop (sword (price 8)))\n")));
     CHECK(r.ok());
     REQUIRE(r.effect.size() == 1);
-    CHECK(r.effect[0].path == Symbol("shop.sword.price"));
+    CHECK(r.effect[0].path->view() == "shop.sword.price");
     CHECK(to_string(r.effect[0].values) == "8");
     CHECK(to_string(*r.effect[0].below) == "10");
     CHECK(r.effect[0].source.layer == Symbol("balance"));
@@ -202,13 +202,13 @@ TEST_CASE("on a wide table, the check finds what lookups find") {
         "x", tree("(shop (item5 (price 7)) (item38 (price 8)) (item41 (price 9)))\n")));
     REQUIRE(r.effect.size() == 3);
     for (const LayerEffectEntry& e : r.effect) {
-        CAPTURE(e.path.str());
-        if (e.path == Symbol("shop.item41.price")) {
+        CAPTURE(e.path->view());
+        if (e.path->view() == "shop.item41.price") {
             CHECK_FALSE(e.below);
             continue;
         }
-        const Source s = ok(cfg.source(Path(e.path.str())));
-        CHECK(to_string(*e.below) == std::to_string(ok(cfg.get<int>(Path(e.path.str())))));
+        const Source s = ok(cfg.source(Path(e.path->view())));
+        CHECK(to_string(*e.below) == std::to_string(ok(cfg.get<int>(Path(e.path->view())))));
         CHECK(e.below_source->layer == s.layer);
         CHECK(e.below_source->line == s.line);
     }
@@ -240,4 +240,74 @@ TEST_CASE("a validator sees the enabled layers, bottom to top, and a candidate l
     REQUIRE(seen.size() == 4);
     CHECK(seen[3] == candidate.get());
     CHECK(bow == 15);
+}
+
+TEST_CASE("a checks_only validator runs in a layer check, never after a merge") {
+    Config cfg({.tweaks = nullptr});
+    int runs = 0;
+    cfg.add_validator([&](const ValidatorStack&, const Callback<void(const Error&)>&) { ++runs; },
+                      {.checks_only = true});
+    REQUIRE(cfg.push_layer_text("base", "(speed 3)"));
+    CHECK(runs == 0);
+    (void)ok(cfg.check_layer_text("overlay", "(speed 4)"));
+    CHECK(runs == 1);
+}
+
+TEST_CASE("a check interns no path: a refused candidate checked 1,000 times adds no names") {
+    TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer("default", dir.write("default.dta",
+                                                "(nopath_shop (nopath_sword (nopath_price 10)))\n"
+                                                "(nopath_debug (nopath_god 0))\n")));
+    // Names the stack has, in paths it has not: each new, so existing_only refuses them.
+    const std::string text =
+        "(nopath_debug (nopath_sword (nopath_price 3)))\n"
+        "(nopath_shop (nopath_god 1))\n";
+    const LayerPolicy policy{.existing_only = true};
+    const Ref<Array> candidate = ok(read_string(text, "remote.dta"));
+
+    // A first check interns the names a check reads by (metadata words, the old forms') once.
+    const Ref<Array> warm =
+        ok(read_string("(nopath_shop (nopath_sword (nopath_price 9)))\n", "remote.dta"));
+    REQUIRE(cfg.check_layer("remote", warm, policy)->ok());
+    size_t before = Symbol::table_size();
+    const LayerReport r = ok(cfg.check_layer("remote", candidate, policy));
+    CHECK(Symbol::table_size() == before);  // the first check of it too: its paths are text
+    CHECK_FALSE(r.ok());
+    REQUIRE(r.effect.size() == 2);
+    CHECK(r.effect[0].path->view() == "nopath_debug.nopath_sword.nopath_price");
+    CHECK(r.effect[1].path->view() == "nopath_shop.nopath_god");
+    CHECK(refusals(r) ==
+          "1: 'nopath_debug.nopath_sword.nopath_price' is new; the layer may only change values "
+          "the stack has\n"
+          "2: 'nopath_shop.nopath_god' is new; the layer may only change values the stack has\n");
+
+    // As text, read each time: the first read interns the layer's name, and then nothing.
+    REQUIRE(cfg.check_layer_text("remote", text, policy));
+    const LayerChecker checker = cfg.checker();
+    REQUIRE(checker.check_text("remote", text, policy));
+    before = Symbol::table_size();
+    bool refused_each = true;
+    for (int i = 0; i < 1000; ++i) {
+        refused_each = refused_each && !cfg.check_layer_text("remote", text, policy)->ok();
+        refused_each = refused_each && !checker.check_text("remote", text, policy)->ok();
+        refused_each = refused_each && !cfg.check_layer("remote", candidate, policy)->ok();
+    }
+    CHECK(refused_each);
+    CHECK(Symbol::table_size() == before);
+
+    // 1,000 different candidates, each refused, each a path of two names the stack has.
+    std::string keys;
+    for (int i = 0; i < 32; ++i) keys += "(nopath_k" + std::to_string(i) + " 0)\n";
+    REQUIRE(cfg.push_layer("keys", dir.write("keys.dta", keys)));
+    std::vector<std::string> texts;
+    for (int i = 0; i < 1000; ++i)
+        texts.push_back("(nopath_k" + std::to_string(i / 32) + " (nopath_k" +
+                        std::to_string(i % 32) + " 1))\n");
+    REQUIRE(cfg.check_layer_text("remote", texts[0], policy));
+    before = Symbol::table_size();
+    for (const std::string& t : texts)
+        refused_each = refused_each && !cfg.check_layer_text("remote", t, policy)->ok();
+    CHECK(refused_each);
+    CHECK(Symbol::table_size() == before);
 }

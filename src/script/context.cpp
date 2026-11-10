@@ -485,12 +485,18 @@ VarRef Context::var(Symbol name) {
 VarRef Context::add_global(Symbol name, Node initial, std::string_view doc) {
     VarRef v = var(name);
     v = std::move(initial);
-    for (Global& g : impl_->globals)
-        if (g.name == name) {
-            g.doc = doc;
-            return v;
-        }
-    impl_->globals.push_back({name, Str(doc)});
+    Impl& impl = *impl_;
+    if (impl.is_global(name)) {
+        for (Global& g : impl.globals)
+            if (g.name == name) {
+                g.doc = doc;
+                return v;
+            }
+    }
+    const uint32_t bit = name.index();
+    if (bit / 64 >= impl.global_bits.size()) impl.global_bits.resize(bit / 64 + 1);
+    impl.global_bits[bit / 64] |= uint64_t{1} << (bit % 64);
+    impl.globals.push_back({name, Str(doc)});
     return v;
 }
 
@@ -925,6 +931,10 @@ Expected<FuncRef> Context::declare(Symbol name, std::span<const OverloadDescript
 
 void FuncRef::set_doc(std::string_view text) {
     static_cast<Function*>(f_)->doc = text;
+}
+
+void FuncRef::set_usage(std::string_view text) {
+    static_cast<Function*>(f_)->usage = text;
 }
 
 FuncRef& FuncRef::status(Status status, Symbol replacement) {

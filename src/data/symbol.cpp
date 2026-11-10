@@ -6,6 +6,7 @@
 #include "text.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -86,10 +87,33 @@ private:
     struct Table {
         Slot* slots;
         size_t capacity;
-        Table* older;  // the table this one replaced, kept: a reader may still be probing it
+        uint64_t seed;  // the process's: where a hash's probe starts
+        Table* older;   // the table this one replaced, kept: a reader may still be probing it
     };
 
-    static Table* new_table(size_t n) {
+    // Where `hash`'s probe starts in `t`. The hash is public and fixed (symbol_hash, the same
+    // in every build), so its low bits are anyone's to collide: names chosen for one home
+    // made a probe walk thousands of slots. Mixed with a seed the process picks, a home is
+    // not known in advance; finding names that share one takes colliding all 64 bits.
+    [[nodiscard]] static size_t home(const Table& t, uint64_t hash) noexcept {
+        uint64_t z = hash ^ t.seed;  // splitmix64's finalizer
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        return static_cast<size_t>(z ^ (z >> 31)) & (t.capacity - 1);
+    }
+
+    // A seed that differs from run to run: the table's own address (placed by the allocator
+    // and, with ASLR, the loader) and the clock, mixed.
+    static uint64_t pick_seed(const void* self) noexcept {
+        uint64_t z =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(self)) ^
+            static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()) *
+                0x9e3779b97f4a7c15ULL;
+        z = (z ^ (z >> 33)) * 0xff51afd7ed558ccdULL;
+        return z ^ (z >> 33);
+    }
+
+    static Table* new_table(size_t n, uint64_t seed) {
         auto* t = static_cast<Table*>(
             detail::default_alloc(sizeof(Table), alignof(Table), MemoryKind::Symbols));
         auto* s = static_cast<Slot*>(
@@ -97,6 +121,7 @@ private:
         for (size_t i = 0; i < n; ++i) new (s + i) Slot(nullptr);
         t->slots = s;
         t->capacity = n;
+        t->seed = seed;
         t->older = nullptr;
         return t;
     }
@@ -105,7 +130,7 @@ private:
     static const detail::SymbolEntry* find(const Table& t, std::string_view text,
                                            uint64_t hash) noexcept {
         const size_t mask = t.capacity - 1;
-        for (size_t i = static_cast<size_t>(hash) & mask;; i = (i + 1) & mask) {
+        for (size_t i = home(t, hash);; i = (i + 1) & mask) {
             const detail::SymbolEntry* e = t.slots[i].load(std::memory_order_acquire);
             if (!e) return nullptr;
             if (e->hash == hash && (e->size & detail::kSymbolSizeMask) == text.size() &&
@@ -147,7 +172,7 @@ private:
                                                   uint64_t hash,
                                                   const detail::SymbolEntry*& clash) noexcept {
         const size_t mask = t.capacity - 1;
-        for (size_t i = static_cast<size_t>(hash) & mask;; i = (i + 1) & mask) {
+        for (size_t i = home(t, hash);; i = (i + 1) & mask) {
             const detail::SymbolEntry* e = t.slots[i].load(std::memory_order_relaxed);
             if (!e) return nullptr;
             if (e->hash != hash) continue;
@@ -161,14 +186,14 @@ private:
     // Under the lock. The entry is complete before the store publishes it.
     static void insert(Table& t, const detail::SymbolEntry* e) noexcept {
         const size_t mask = t.capacity - 1;
-        size_t i = static_cast<size_t>(e->hash) & mask;
+        size_t i = home(t, e->hash);
         while (t.slots[i].load(std::memory_order_relaxed)) i = (i + 1) & mask;
         t.slots[i].store(e, std::memory_order_release);
     }
 
     // Under the lock: a table of twice the capacity, published once it holds every entry.
     Table* grow(Table& old) {
-        Table* t = new_table(old.capacity * 2);
+        Table* t = new_table(old.capacity * 2, old.seed);
         for (size_t i = 0; i < old.capacity; ++i)
             if (const auto* e = old.slots[i].load(std::memory_order_relaxed)) insert(*t, e);
         t->older = &old;  // never freed: a reader may still be probing it
@@ -203,7 +228,7 @@ private:
     }
 
     std::mutex mutex_;  // held to insert; never to read
-    std::atomic<Table*> table_{new_table(1024)};
+    std::atomic<Table*> table_{new_table(1024, pick_seed(this))};
     size_t count_ = 0;     // under the lock
     char* cur_ = nullptr;  // blocks are never freed
     size_t used_ = 0;

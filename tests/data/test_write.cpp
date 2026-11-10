@@ -176,8 +176,11 @@ TEST_CASE("preview is bounded on shared trees") {
         src += "[M" + std::to_string(i) + " (M" + std::to_string(i - 1) + " M" +
                std::to_string(i - 1) + ")]\n";
     src += "(top M60)";
-    auto root = parse(src);
-    const std::string p(detail::preview((*root)[0], 40).view());
+    LoadSession s;  // 2^61 nodes, shared: past any limit on what macros take
+    s.limits.max_macro_nodes = UINT64_MAX;
+    auto root = read_string(src, "t.dta", s);
+    REQUIRE(root);
+    const std::string p(detail::preview((**root)[0], 40).view());
     CHECK(p.size() == 40);
     CHECK(p.ends_with("..."));
 }

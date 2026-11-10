@@ -121,6 +121,54 @@ int main(int argc, char** argv) {
     if (const auto i = table.index_of("kestrel.heavy"))  // the alias still finds it
         std::printf("table: heavy is slam, row %u\n", *i);
 
+    // An agent's change set: a layer that names the record by its ID, so it
+    // survives a rename it did not see; checked, pushed, promoted and undone, each step one
+    // transaction of the change log. The promotion's writer keeps the text here rather
+    // than in the data, as the kit's dry run does.
+    if constexpr (!baker::kShipping) {
+        const std::string_view change =
+            "(fighters (kestrel (moves (a7d2c41e9b06f58a3c1d2e4f60718293 (damage 14)))))";
+        if (auto report = cfg.check_layer_text("change-set", change); !report || !report->ok()) {
+            print("the change set was refused\n");
+            return 1;
+        }
+        cfg.set_change_history(8);
+        std::string captured;
+        cfg.set_writer([&captured](std::string_view, std::string_view text) {
+            captured = text;
+            return true;
+        });
+        if (auto r = cfg.push_layer_text("change-set", change); !r) {
+            print(baker::to_string(r.error()));
+            return 1;
+        }
+        if (auto r = cfg.promote("change-set", "content"); !r || !r->ok()) {
+            print("the promotion was refused\n");
+            return 1;
+        }
+        const auto value = [](const baker::Ref<baker::Array>& tree) {
+            return tree ? baker::to_string(*tree) : std::string("none");
+        };
+        cfg.transactions([&](const baker::Transaction& t) {
+            for (const baker::ChangeRecord& r : t.records)
+                std::printf("%s: %s %s -> %s in %s\n", t.name.c_str(), r.path.c_str(),
+                            value(r.before).c_str(), value(r.after).c_str(), r.layer.c_str());
+            for (const baker::WrittenLine& w : t.written) {
+                const std::string_view file = w.file.str();
+                std::printf("%s wrote %.*s:%d\n", t.name.c_str(),
+                            static_cast<int>(file.size() - file.rfind('/') - 1),
+                            file.data() + file.rfind('/') + 1, w.line);
+            }
+        });
+        if (!cfg.undo() || !cfg.undo()) {
+            print("undo failed\n");
+            return 1;
+        }
+        const baker::Table<game::Move> back = baker::table<game::Move>(cfg);
+        std::printf("undone: slam damage %.0f, %s\n", back[*back.index_of("kestrel.slam")].damage,
+                    cfg.layer_root("change-set") ? "the change set stays" : "the change set gone");
+    }
+
     // Shipping: the contract layers and the tables baked into one image (the host kit's
     // `bake --baker-stack` does this on the game's binary), which a Config opens in place
     // of the layers' text; the local layer, above the contract, loads as today.

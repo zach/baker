@@ -1,11 +1,13 @@
 // Live (host/live.hpp): a Config, its stack opened from the project file, reloaded when a
 // watched file is saved.
 
-#include <baker/host/console.hpp>
 #include <baker/host/live.hpp>
 #include <baker/tools/console.hpp>
 
 #include "common/containers.hpp"
+
+#include <atomic>
+#include <thread>
 
 #if BAKER_HOST_SHAPE
 #include <baker/shape.hpp>
@@ -58,6 +60,64 @@ struct Live::Impl {
     uint64_t seen = 0;   // the Config's epoch() when the game last read it
     bool watching = false;
     bool stack_changed = false;  // set after any change; #autorun runs again
+
+    // Reloads on the host's worker. The work holds the slot, not Live, so a job the
+    // host runs after Live closed, or never runs, touches nothing freed.
+    struct JobSlot {
+        enum : int { Queued, Running, Done, Cancelled };
+        ReloadJob job;
+        std::atomic<int> state{Queued};
+    };
+    Callback<void(Callback<void()>)> run_async;
+    Rc<JobSlot> job;             // the worker's, begun and not yet finished
+    bool reload_wanted = false;  // the watcher saw a change not yet in a job
+    uint64_t reload_origin = 0;  // the newest write the change was seen with
+
+    // Begins a reload on the worker, or runs one here without one.
+    void start_reload() {
+        reload_wanted = false;
+        const ReloadRequest req{.trigger = Symbol("watcher"), .origin_ns = reload_origin};
+        if (!run_async) {
+            auto r = cfg.reload(req);
+            if (!r) log(r.error());
+            return;
+        }
+        job = Rc<JobSlot>::make(default_allocator(MemoryKind::Tools));
+        job->job = cfg.begin_reload(req);
+        run_async([slot = job] {
+            int queued = JobSlot::Queued;
+            if (!slot->state.compare_exchange_strong(queued, JobSlot::Running,
+                                                     std::memory_order_acq_rel))
+                return;  // cancelled: Live closed
+            slot->job.run();
+            slot->state.store(JobSlot::Done, std::memory_order_release);
+        });
+    }
+    // Finishes the worker's reload once its run returned; one the stack moved under is
+    // begun again.
+    void poll_job() {
+        if (!job || job->state.load(std::memory_order_acquire) != JobSlot::Done) return;
+        auto r = cfg.finish_reload(std::move(job->job));
+        job = nullptr;
+        if (!r)
+            log(r.error());
+        else if (*r == ReloadOutcome::Refused)
+            reload_wanted = true;
+    }
+    // Before closing, or a reload now: a job not yet started is cancelled, one running is
+    // waited for; either way it is destroyed here, while the Config it read from lives.
+    void settle_job(bool cancel) {
+        if (!job) return;
+        int queued = JobSlot::Queued;
+        if (cancel && job->state.compare_exchange_strong(queued, JobSlot::Cancelled,
+                                                         std::memory_order_acq_rel)) {
+            job->job = ReloadJob();
+            job = nullptr;
+            return;
+        }
+        while (job->state.load(std::memory_order_acquire) != JobSlot::Done)
+            std::this_thread::yield();
+    }
 };
 
 Live::Live(Context& ctx, const ConfigOptions& config)
@@ -71,6 +131,7 @@ Live::Live(Context& ctx, const ConfigOptions& config)
 }
 
 Live::~Live() {
+    impl_->settle_job(true);  // the worker may still be reading into the job
     detail::destroy(default_allocator(MemoryKind::Tools), impl_);
 }
 
@@ -83,6 +144,12 @@ Expected<void> Live::open(const LiveOptions& options) {
     if (options.lister) im.cfg.session().set_lister(options.lister);
     if (options.disk_path) im.watcher.set_disk_path_hook(options.disk_path);
     if (options.stamp) im.watcher.set_stamp_hook(options.stamp);
+    im.run_async = options.run_async;
+    if constexpr (!kShipping) {
+        // The reload's scan opens only the files whose stamp moved.
+        im.cfg.session().set_stamper(
+            [hook = options.stamp](std::string_view path) { return file_stamp(path, hook); });
+    }
 
     // The stack: the nearest project file, or the one the host built.
     Project read;
@@ -112,11 +179,17 @@ Expected<void> Live::open(const LiveOptions& options) {
             im.problem(r.error());
             return Unexpected(std::move(r).error());
         }
-    im.cfg.add_validator(check_validator(im.ctx, {.packs = &im.cfg.read_session()}));
+    // A shipping build keeps them for the checks an overlay must pass, not after each merge,
+    // where they would only warn.
+    constexpr bool kChecksOnly = kShipping;
+    im.cfg.add_validator(check_validator(im.ctx, {.packs = &im.cfg.read_session()}),
+                         {.checks_only = kChecksOnly});
 #if BAKER_HOST_SHAPE
-    im.cfg.add_validator(shape::validator(), {.any_thread = true});
-    im.cfg.add_validator(id_validator(), {.any_thread = true});  // two records, one @id
-    im.cfg.add_validator(tools::rules_validator(im.ctx));        // the shapes' rules, in script
+    im.cfg.add_validator(shape::validator(), {.any_thread = true, .checks_only = kChecksOnly});
+    // two records, one @id
+    im.cfg.add_validator(id_validator(), {.any_thread = true, .checks_only = kChecksOnly});
+    // the shapes' rules, in script
+    im.cfg.add_validator(tools::rules_validator(im.ctx), {.checks_only = kChecksOnly});
 #endif
     auto opened = open_project(im.cfg, *project, options.open);
     if (!opened) {
@@ -126,9 +199,13 @@ Expected<void> Live::open(const LiveOptions& options) {
     Vec<Error> problems;  // a layer that did not read, with go_on: kept past autorun's reset
     for (const ProjectProblem& p : *opened) problems.push_back(p.error);
 
-    if (auto r = tools::bind_config_tools(im.ctx, im.cfg, {.allow_write = options.console_write});
-        !r)
-        im.log(r.error());
+    // Tool code: a shipping game neither binds config.* nor links it.
+    if constexpr (!kShipping) {
+        if (auto r =
+                tools::bind_config_tools(im.ctx, im.cfg, {.allow_write = options.console_write});
+            !r)
+            im.log(r.error());
+    }
     im.autorun();
     for (const Error& e : problems) im.problem(e);
 
@@ -138,7 +215,9 @@ Expected<void> Live::open(const LiveOptions& options) {
             im.rewatch();
         }
         if (options.console_port || options.console_any_port) {
-            im.console = Own<Console>::make(default_allocator(MemoryKind::Tools), im.ctx);
+            ConsoleOptions console = options.console;
+            if (!console.log) console.log = options.log;
+            im.console = Own<Console>::make(default_allocator(MemoryKind::Tools), im.ctx, console);
             if (!im.console->listen(options.console_any_port ? 0 : options.console_port)) {
                 im.log(make_error(ErrorCode::Io, "the console cannot listen on 127.0.0.1:" +
                                                      detail::decimal(options.console_port)));
@@ -159,9 +238,11 @@ void Live::begin_frame() {
                                   "the project file changed; restart to open the stack it "
                                   "describes now",
                                   f, 1));
-        auto r = im.cfg.reload({.trigger = "watcher", .origin_ns = im.watcher.newest_write_ns()});
-        if (!r) im.log(r.error());
+        im.reload_wanted = true;
+        im.reload_origin = im.watcher.newest_write_ns();
     }
+    im.poll_job();
+    if (im.reload_wanted && !im.job) im.start_reload();
     // The stack read other files (a new #include, a layer pushed or removed): watch those.
     if (im.watching && im.cfg.stack_files_epoch() != im.epoch) im.rewatch();
     if (im.stack_changed) {
@@ -179,6 +260,8 @@ void Live::end_frame() noexcept {
 
 bool Live::reload_now() {
     Impl& im = *impl_;
+    im.settle_job(false);  // a worker's reload lands first, the host's worker willing
+    im.poll_job();
     auto r = im.cfg.reload({.trigger = "reload"});
     if (!r) {
         im.log(r.error());

@@ -90,6 +90,16 @@ struct Tools {
     Vec<std::pair<Symbol, ConfigSnapshot>> snapshots;
 };
 
+// A command that changes the data is one transaction of the change log, named after it:
+// a `config.promote` is one step to undo, however many values it wrote.
+struct Step {
+    Step(Config& c, std::string_view name) : cfg(c) { cfg.begin_transaction(name); }
+    ~Step() { cfg.end_transaction(); }
+    Step(const Step&) = delete;
+    Step& operator=(const Step&) = delete;
+    Config& cfg;
+};
+
 Expected<Node> explain_node(Config& cfg, std::string_view path) {
     auto entries = explain(cfg, Path(path));
     if (!entries) return Unexpected(std::move(entries).error());
@@ -143,19 +153,20 @@ Expected<Node> report_node(Expected<WriteReport> r) {
 Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOptions& options) {
     const Rc<Tools> tools = Rc<Tools>::make(ctx.allocator(), cfg, ctx.allocator());
     Expected<void> status;
-    auto bind = [&](const char* name, auto&& f, const char* doc) {
+    // `usage`: the call as written, with its arguments named (FuncRef::usage).
+    auto bind = [&](const char* name, const char* usage, auto&& f, const char* doc) {
         if (!status) return;
         auto r = ctx.func(Symbol(name), std::forward<decltype(f)>(f));
         if (!r) {
             status = Unexpected(std::move(r).error());
             return;
         }
-        r->doc(doc);
+        r->doc(doc).usage(usage);
     };
 
     // --- Reading: in every build. ---
     bind(
-        "config.get",
+        "config.get", "{config.get path}",
         [tools](Name path) -> Expected<Node> {
             auto entries = explain(tools->cfg, Path(path.text));
             if (!entries) return Unexpected(std::move(entries).error());
@@ -168,7 +179,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
         },
         "The value at a path, as get() reads it: several values come as one array.");
     bind(
-        "curve.sample",
+        "curve.sample", "{curve.sample path x}",
         [tools](Name path, double x) -> Expected<double> {
             auto curve = tools->cfg.get<Curve>(Path(path.text));
             if (!curve) return Unexpected(std::move(curve).error());
@@ -177,7 +188,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
         "A curve's value at x: the path's values read as a curve (points (x y), with an "
         "optional interpolation and extension).");
     bind(
-        "config.source",
+        "config.source", "{config.source path}",
         [tools](Name path) -> Expected<Node> {
             auto s = tools->cfg.source(Path(path.text));
             if (!s) return Unexpected(std::move(s).error());
@@ -189,13 +200,14 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
         "Where a path's value comes from: (source (layer L) (file F) (line N)), with "
         "(origin O) (tool T) when a tool generated the file.");
     bind(
-        "config.explain", [tools](Name path) { return explain_node(tools->cfg, path.text); },
+        "config.explain", "{config.explain path}",
+        [tools](Name path) { return explain_node(tools->cfg, path.text); },
         "Every contributor to a path's value, bottom to top: each entry's layer, values (one child "
         "each), standing (wins, shadowed, removes, composes, disabled), op (#append, #drop, "
         "#remove), "
         "file, and line.");
     bind(
-        "config.layers",
+        "config.layers", "{config.layers}",
         [tools]() -> Node {
             Vec<Node> out;
             for (const Symbol l : tools->cfg.layers()) {
@@ -208,14 +220,16 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
         },
         "The layers bottom to top, ending with scratch, each with whether it is enabled.");
     bind(
-        "config.effect",
+        "config.effect", "{config.effect layer}",
         [tools](Name layer) -> Expected<Node> {
             auto effect = layer_effect(tools->cfg, layer.text);
             if (!effect) return Unexpected(std::move(effect).error());
             Vec<Node> out;
             for (const LayerEffectEntry& e : *effect) {
                 Vec<Node> f;
-                f.push_back(tagged("path", Node(e.path)));
+                // A symbol, as the console writes paths: a layer the stack holds, its names
+                // already interned.
+                f.push_back(tagged("path", Node(Symbol(e.path->view()))));
                 if (!e.declares.empty()) f.push_back(tagged("declares", Node(e.declares)));
                 f.push_back(tagged("value", e.values));
                 if (!e.op.empty()) f.push_back(tagged("op", Node(e.op)));
@@ -234,7 +248,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
         "(@was ...) pin no longer names the values below, and (folded N) when N more of the "
         "layer's children with the row's tag merge into its record.");
     bind(
-        "config.diff",
+        "config.diff", "{config.diff layer_a layer_b}",
         [tools](Name a, Name b) -> Expected<Node> {
             auto diff = tools::diff(tools->cfg, a.text, b.text);
             if (!diff) return Unexpected(std::move(diff).error());
@@ -260,7 +274,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
     if constexpr (!kShipping) {
         // --- Live edits and telemetry: development builds only. ---
         bind(
-            "config.set",
+            "config.set", "{config.set path value...}",
             [tools](Name path, Args values) -> Expected<Node> {
                 Vec<Node> nodes;
                 for (size_t i = 0; i < values.size(); ++i) {
@@ -270,6 +284,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
                 }
                 if (nodes.empty())
                     return Unexpected(make_error(ErrorCode::Type, "config.set needs a value"));
+                const Step step(tools->cfg, "config.set");
                 auto r = tools->cfg.set(Path(path.text),
                                         std::span<const Node>(nodes.data(), nodes.size()));
                 if (!r) return Unexpected(std::move(r).error());
@@ -277,7 +292,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             },
             "Tunes a path live, in the scratch layer; returns the value set.");
         bind(
-            "config.clear_scratch",
+            "config.clear_scratch", "{config.clear_scratch path}",
             [tools](Name path) -> Expected<Node> {
                 // A path with no live edit changes nothing, not even a merge. All of scratch
                 // is never this call with the path left out: a tool probing whether the
@@ -286,6 +301,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
                 for (const Symbol p : tools->cfg.unsaved())
                     edited = edited || Path(p.str()).matches(path.text);
                 if (!edited) return Node(int64_t{0});
+                const Step step(tools->cfg, "config.clear_scratch");
                 auto r = tools->cfg.clear_scratch(path.text);
                 if (!r) return Unexpected(std::move(r).error());
                 return Node(int64_t{1});
@@ -293,23 +309,25 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             "Drops a path's live edit, so its value is the files' again, and the journal "
             "records it reverted; returns 1 if there was an edit to drop, 0 if not.");
         bind(
-            "config.toggle",
+            "config.toggle", "{config.toggle layer}",
             [tools](Name layer) -> Expected<Node> {
+                const Step step(tools->cfg, "config.toggle");
                 auto r = tools->cfg.toggle_layer(layer.text);
                 if (!r) return Unexpected(std::move(r).error());
                 return Node(int64_t{*r});
             },
             "Turns a layer (or scratch) off or on; returns 1 if it is now enabled.");
         bind(
-            "config.reload",
+            "config.reload", "{config.reload}",
             [tools]() -> Expected<Node> {
+                const Step step(tools->cfg, "config.reload");
                 auto r = tools->cfg.reload({.trigger = Symbol("console")});
                 if (!r) return Unexpected(std::move(r).error());
                 return Node(int64_t{*r});
             },
             "Re-reads changed files now; returns 1 if anything changed.");
         bind(
-            "config.digest",
+            "config.digest", "{config.digest}",
             [tools]() -> Node {
                 char hex[17];
                 uint64_t d = tools->cfg.digest();
@@ -319,12 +337,12 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             "The digest of the data as the game reads it, live edits included, as 16 hex "
             "digits: the same on every machine with the same data.");
         bind(
-            "config.epoch",
+            "config.epoch", "{config.epoch}",
             [tools]() -> Node { return Node(static_cast<int64_t>(tools->cfg.epoch())); },
             "A number that moves on every reload, layer change and live edit: a tool asks for "
             "it, and for the values again only when it moved.");
         bind(
-            "config.unsaved",
+            "config.unsaved", "{config.unsaved}",
             [tools]() -> Node {
                 Vec<Node> out;
                 for (const Symbol p : tools->cfg.unsaved()) out.emplace_back(p);
@@ -332,7 +350,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             },
             "The paths tuned live and not yet written back.");
         bind(
-            "config.journal",
+            "config.journal", "{config.journal [since_ns]}",
             [tools](std::optional<int64_t> since_ns) -> Node {
                 static const char* const kFates[] = {"unsaved", "written", "reverted",
                                                      "superseded"};
@@ -360,7 +378,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             "The live edits of this session, oldest first, each with its old and new values, "
             "where the old one came from, and its fate; [since_ns] keeps the later ones.");
         bind(
-            "config.loop",
+            "config.loop", "{config.loop}",
             [tools]() -> Node {
                 const LoopStats s = tools->cfg.loop_stats();
                 auto rows = [](const List<LoopRow>& rs) {
@@ -390,7 +408,7 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             },
             "Edit-to-see and reload times, per file and per layer.");
         bind(
-            "config.snapshot",
+            "config.snapshot", "{config.snapshot name}",
             [tools](Name named) -> Node {
                 const Symbol name(named.text);
                 for (auto& [n, snap] : tools->snapshots)
@@ -403,11 +421,12 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
             },
             "Captures the whole state (layers, toggles, scratch) under a name.");
         bind(
-            "config.restore",
+            "config.restore", "{config.restore name}",
             [tools](Name named) -> Expected<Node> {
                 const Symbol name(named.text);
                 for (const auto& [n, snap] : tools->snapshots)
                     if (n == name) {
+                        const Step step(tools->cfg, "config.restore");
                         auto r = tools->cfg.restore(snap);
                         if (!r) return Unexpected(std::move(r).error());
                         return Node(name);
@@ -416,15 +435,45 @@ Expected<void> bind_config_tools(Context& ctx, Config& cfg, const ConfigToolOpti
                     make_error(ErrorCode::NotFound, "no snapshot named '" + Str(name.str()) + "'"));
             },
             "Returns to a named snapshot.");
+        bind(
+            "config.undo", "{config.undo}",
+            [tools]() -> Expected<Node> {
+                auto r = tools->cfg.undo();
+                if (!r) return Unexpected(std::move(r).error());
+                return Node(int64_t{1});
+            },
+            "Returns to before the latest transaction of the change log (config.set_change_history "
+            "turns it on): a command, a drag, a promotion as one step. The files a promotion "
+            "wrote stay written.");
+        bind(
+            "config.redo", "{config.redo}",
+            [tools]() -> Expected<Node> {
+                auto r = tools->cfg.redo();
+                if (!r) return Unexpected(std::move(r).error());
+                return Node(int64_t{1});
+            },
+            "Applies the latest undone transaction again.");
+        bind(
+            "config.set_change_history", "{config.set_change_history capacity}",
+            [tools](int64_t capacity) -> Node {
+                tools->cfg.set_change_history(static_cast<size_t>(std::max<int64_t>(capacity, 0)));
+                return Node(int64_t{static_cast<int64_t>(tools->cfg.change_history())});
+            },
+            "Keeps the last N transactions of change records, for config.undo and config.redo; "
+            "0 turns the log off.");
         if (options.allow_write) {
             bind(
-                "config.write_back",
-                [tools](Name path) { return report_node(tools->cfg.write_back(Path(path.text))); },
+                "config.write_back", "{config.write_back path}",
+                [tools](Name path) {
+                    const Step step(tools->cfg, "config.write_back");
+                    return report_node(tools->cfg.write_back(Path(path.text)));
+                },
                 "Writes a live-tuned value back to the line it came from; returns the lines "
                 "written and any refusals.");
             bind(
-                "config.promote",
+                "config.promote", "{config.promote from to}",
                 [tools](Name from, Name to) {
+                    const Step step(tools->cfg, "config.promote");
                     return report_node(tools->cfg.promote(from.text, to.text));
                 },
                 "Writes everything a layer changes into another layer's file, or nothing; "

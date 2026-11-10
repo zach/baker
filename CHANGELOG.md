@@ -3,6 +3,104 @@
 Baker's releases, newest first. Versions follow [semantic versioning](https://semver.org);
 before 1.0.0, a minor version may change the API.
 
+## 0.9.0 - 2026-11-10
+
+This release adds a change log with undo and redo, and lets a reload read and parse off the
+game thread. Most of the rest is cost: a review of the whole library removed quadratic
+paths, per-call allocations and work repeated on every change. A stack image must be baked
+again, generated view headers regenerated, and a shipping `host::Live` no longer binds the
+`config.*` commands (see **Breaking**).
+
+- **Breaking: the stack image is version 3.** Its checksum and its table section changed; an
+  older image is refused, naming both versions. Bake images again. A table section no longer
+  carries a relocation list or the process's pointers, so two builds of the same data write
+  the same bytes. On a test stack the image went from 9.6 to 7.8 MB and opens cold in less
+  than half of 0.8.0's time.
+- **Breaking: generated views order members by alignment,** largest first, and every view
+  digest changed. Regenerate the headers (`baker_generate_views`, or `baker_bake --views`);
+  `check` reports an old header as drift, and an image refuses its sections. A view
+  initialized by position breaks; initialize it by member name.
+- **Breaking: a baked table keeps record IDs only for `(@view by_id)`.** Mark a keyed
+  shape `(@view by_id)` if the game calls `Table::index_of(RecordId)` or `id_of(i)`; without
+  it they find nothing. The tree keeps every ID for `find_by_id`, `id_validator` and the
+  tools.
+- **Breaking: `LayerEffectEntry::path` is a `Ref<String>`,** the dotted path as text
+  (`path->view()`), so checking candidate layers no longer adds a permanent symbol per path:
+  1,000 refused candidates once added 999 symbols, now none.
+- **Breaking: a shipping `host::Live` binds no `config.*` commands,** and links none of the
+  layer tools: about 160 KB less code. A shipping `#autorun` that calls `config.get` fails
+  unless the game binds `tools::bind_config_tools` itself. Its four validators run only when
+  an overlay is checked, not after every merge.
+- **Breaking: the console answers within a budget.** `host::ConsoleOptions` (also
+  `LiveOptions::console`): `budget_ns`, 0.5 ms by default, after which `poll()` leaves
+  the rest for the next frame, clients taking turns; and `max_bytes`, 1 MB, past which a
+  client's unanswered input drops it. 0 turns either off. `Console(ctx, options)`.
+- **Breaking: macros expand to at most `ParseLimits::max_macro_nodes`,** 2^20 nodes a use by
+  default, shared bodies included; past it the read fails with `ErrorCode::Limit`, naming the
+  macro. A 347-byte macro bomb took 1.6 s and 1.27 GB to be refused, and one written with
+  shared lists was not refused at all; both are now refused in milliseconds.
+- **Breaking: `shape::Field`'s members are reordered** (200 to 184 bytes). Only code that
+  initializes a `Field` by position is affected.
+- **New: the change log.** `set_change_history(n)` keeps the last `n` transactions, each
+  a list of change records (set, add, remove, rename, reorder, append, drop) with whole
+  values, the layer written and its source; `begin_transaction` and `end_transaction`
+  group them. `undo()` and `redo()` move through them in memory; files a promotion wrote stay
+  written. Off by default, it costs a test per edit. The console has
+  `config.set_change_history`, `config.undo` and `config.redo`, each command being one
+  transaction; `tools::write_changes_json` and the kit's `promote --baker-json` write
+  `baker.changes/1`.
+- **New: a layer names a record by its ID.** A layer's child tagged with a record's
+  `(@id ...)` merges into that record, as an alias does; the record keeps its key.
+- **New: reload off the game thread.** `Config::begin_reload()` takes what to check,
+  `ReloadJob::run()` reads and parses on any thread, and `finish_reload(job)` merges on the
+  game thread when the host chooses, refusing a job the stack changed under. In the host
+  kit, `LiveOptions::run_async` hands the job to the game's job system: a 3 MB reload costs
+  the game thread 1.7 ms in place of 54 ms. `reload()` still does it all at once.
+- **New: reloads check stamps.** `LoadSession::set_stamper` lets a reload open only the
+  files whose stamp moved; `host::file_stamp` is one, and `Live` installs it. A quiet scan
+  of 50 files: 155 to 55 µs.
+- **New: `ValidatorOptions::checks_only`,** a validator that judges candidate layers but
+  does not run after a merge; `ValidatorStack::changed`, the tree a check or push brought;
+  `shape::Scope` for `shape::check`.
+- **New: `FuncRef::usage`,** a special form's whole call, a line a form, in the Markdown and
+  JSON references (`baker.reference/1.6`). The reference documents every `config.*`
+  command.
+- **New: `SchedulerStats::pool_bytes`.**
+- **Changed: the shape check of a push checks what the layer changes,** not the whole tree,
+  unless the layer declares a `#shape` or removes a key a table names; a candidate's report
+  holds only its own findings, so an old warning in the base no longer refuses every
+  overlay under `warnings_refuse`. With 100,000 records and one changed, the validator went
+  from 13 ms to under 2 µs. The ID, rules and check validators still judge the whole tree.
+- **Changed: a field a shape does not declare is one warning** for its shape, at its first
+  record, saying how many more records have it.
+- **Changed: task frames come in size classes,** from 128 bytes up to
+  `SchedulerOptions::frame_bytes`: 10,000 live native tasks take 2.5 MB, not 42.5 MB.
+- **Faster.**
+  - `format` finds alignment in n log n: 2.8 MB in 148 ms, not 44 s.
+  - A read above a pending live edit shares one merge until the next edit: 106 ns, not 40 µs.
+  - A live edit with many pending edits, and a change with many tweaks, are linear: 2,000
+    tweaks rebind in 51 µs, not 731.
+  - An edit in one layer no longer rebuilds baked tables that an upper layer overrides
+    elsewhere: 0.008 ms, not 1.45.
+  - Sorted lookup beats linear from about 100 children cold and 8 warm.
+  - `ctx.call` and script messages of 6 to 8 arguments allocate nothing.
+  - A curve read from a load bakes at its first sample: 46 ns a read and sample, not 93 to 134.
+  - `key_of` fields, wide shapes and data rules in shapes no longer cost the square of the
+    data: 100,000 records with a `key_of` field check in 8 ms, not 3 s.
+  - The symbol table's probe is seeded per process, so text a game does not control cannot
+    pile its names up on purpose.
+  - `host::Watcher` and `file_stamp` call the system directly and allocate nothing;
+    `watch()` is linear. On Windows a stamp no longer follows symbolic links.
+- **Fixed.**
+  - A push whose check report was held reported its shape findings a second time after the
+    merge.
+  - A table whose records' parent was renamed kept the old parent tag.
+  - A promotion of a change set spelled by alias or ID wrote a new record keyed by it.
+  - A stack image's layers lost their aliases.
+  - Padding bytes from the stack reached a baked table's curves.
+  - A push checked by the shape validator was about 16% slower in wall time than 0.6.0 on
+    shapes of several ranged fields; it is now within 2 to 4%.
+
 ## 0.8.0 - 2026-11-06
 
 This release generates C++ from your shapes: structs and readers for your tables (views),

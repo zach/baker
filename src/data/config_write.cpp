@@ -1,6 +1,7 @@
 // Config's write-back: planning an edit of a layer's file, writing it, and promoting
 // scratch. The layer tools (explain, layer_effect, diff) are baker::tools'.
 
+#include "arena.hpp"
 #include "config_impl.hpp"
 
 #include <baker/parse.hpp>
@@ -39,17 +40,34 @@ int32_t line_at(std::string_view text, uint32_t offset) {
 
 // Every tagged child's leaves, a repeated tag's included, each path once: all a layer
 // contributes, however its tags repeat. Their values are the caller's to fill.
+// The paths a layer's tree holds values at, spelled as the merged tree spells them: a
+// child keyed by a record's alias or ID (`merged` given) takes the record's
+// key, so the write lands in the record wherever the target spells it.
 void collect_paths(const Array& a, size_t first, const Str& prefix, HashMap<Str, char>& seen,
-                   Vec<Leaf>& out) {
+                   Vec<Leaf>& out, const Array* merged) {
     for (size_t i = first; i < a.size(); ++i) {
         if (!is_tagged(a[i])) continue;
         const Array& child = *a[i].try_array();
         if (child.tag().is_meta() && child.tag() == detail::was_tag()) continue;  // the layer's own
+        Symbol name = child.tag();
+        const Array* record = merged ? merged->try_find(name) : nullptr;
+        if (merged && !record && !name.is_meta())
+            for (size_t m = 1; m < merged->size() && !record; ++m) {
+                const Array* c = (*merged)[m].try_array();
+                if (!c || !c->meta_first()) continue;
+                const Array* aka = c->meta(detail::aka_tag());
+                const bool by_alias = aka && std::any_of(aka->values().begin(), aka->values().end(),
+                                                         [&](const Node& n) { return n.is(name); });
+                if (by_alias || detail::id_symbol(*c) == name) {
+                    record = c;
+                    name = c->tag();
+                }
+            }
         Str path = prefix;
         if (!path.empty()) path += '.';
-        detail::append_path_name(path, child[0].try_sym()->str());
+        detail::append_path_name(path, name.str());
         if (has_values(child) && seen.emplace(path, 0).second) out.push_back({path, &child, {}});
-        if (!detail::composes(child)) collect_paths(child, 1, path, seen, out);  // operands
+        if (!detail::composes(child)) collect_paths(child, 1, path, seen, out, record);  // operands
     }
 }
 
@@ -331,6 +349,18 @@ Vec<Leaf> leaves_of(const Array& root) {
     return out;
 }
 
+ReportTexts::ReportTexts(size_t count, size_t chars) noexcept
+    : expected_(count * (sizeof(String) + 1 + alignof(Node)) + chars) {}
+
+ReportTexts::~ReportTexts() {
+    if (arena_) const detail::Arena::Handle creator(arena_);  // the strings keep it
+}
+
+Ref<String> ReportTexts::operator()(std::string_view text) {
+    if (!arena_) arena_ = detail::Arena::create(default_allocator(MemoryKind::Config), expected_);
+    return arena_->make_string(text);
+}
+
 bool write_disk_file(std::string_view where, std::string_view text) {
     const Str path(where);
     std::FILE* f = std::fopen(path.c_str(), "wb");
@@ -429,17 +459,35 @@ Expected<Plan> Config::Impl::plan(const LayerState& layer, const Path& path, con
         return std::nullopt;
     };
     const Array* cur = layer.root.get();
+    const Array* mer = alias_root();  // the merged record beside `cur`, for its aliases and ID
     size_t offset = 0;  // where index 0 is: 1 after a tag, 0 in the root or an element
     Vec<size_t> targets;
     size_t missing_from = path.size();
+    const auto child_named = [&](Symbol name) {
+        size_t k = cur->size();
+        for (size_t j = 0; j < cur->size() && k == cur->size(); ++j)
+            if (is_tagged((*cur)[j]) && (*(*cur)[j].try_array())[0].is(name)) k = j;
+        return k;
+    };
     for (size_t i = 0; i < path.size(); ++i) {
         const Path::Segment& seg = path[i];
         size_t k = cur->size();
         if (seg.is_index) {
             k = offset + seg.index < cur->size() ? offset + seg.index : cur->size();
+            mer = nullptr;
         } else {
-            for (size_t j = 0; j < cur->size() && k == cur->size(); ++j)
-                if (is_tagged((*cur)[j]) && (*(*cur)[j].try_array())[0].is(seg.name)) k = j;
+            k = child_named(seg.name);
+            // The layer may spell the record by an alias or its ID.
+            const Array* rec = mer ? mer->try_find(seg.name) : nullptr;
+            if (k == cur->size() && rec && rec->meta_first()) {
+                if (const Array* aka = rec->meta(detail::aka_tag()))
+                    for (const Node& old : aka->values())
+                        if (const auto o = old.try_sym(); o && k == cur->size())
+                            k = child_named(*o);
+                if (const Symbol id = detail::id_symbol(*rec); !id.empty() && k == cur->size())
+                    k = child_named(id);
+            }
+            mer = rec;
         }
         if (k == cur->size()) {
             missing_from = i;
@@ -607,6 +655,7 @@ Expected<WriteReport> Config::Impl::write_into(Config& c, size_t li, const Path&
     if (auto e = composed(path, li)) return Unexpected(*e);
     auto p = plan(layers[li], path, values, insert, base.reader(), pin);
     if (!p) return Unexpected(std::move(p).error());
+    const Ref<Array> target_before = layers[li].root;  // for the log's records
     ReloadRecord rec = begin(trigger_name("write_back"));
     uint64_t t = rec.start_ns;
     if (p->changed) {
@@ -619,6 +668,11 @@ Expected<WriteReport> Config::Impl::write_into(Config& c, size_t li, const Path&
             finish(c, rec, t);
             return Unexpected(std::move(r).error());
         }
+    }
+    const bool log = logging();  // the write as one transaction, with its line
+    if (log) {
+        begin_change(trigger_name("write_back"));
+        walk_changes(c, *target_before, *layers[li].root, Symbol(layers[li].name.view()));
     }
     // The file holds the value now. Drop it from scratch, unless a layer above still hides it.
     const Path key = last_is_index(path) ? parent_of(path) : path;
@@ -643,7 +697,9 @@ Expected<WriteReport> Config::Impl::write_into(Config& c, size_t li, const Path&
     if (p->changed) {
         const WrittenLine line{s.file, s.line};
         report.written = List<WrittenLine>(std::span<const WrittenLine>(&line, 1));
+        if (log) changes.pending_written.push_back(line);
     }
+    if (log) close_change();
     settle(written_edit, EditFate::Written, {s.file, s.line});
     return report;
 }
@@ -699,6 +755,7 @@ Expected<WriteReport> Config::promote(std::string_view from, std::string_view to
             make_error(ErrorCode::NotFound, "no layer named '" + Str(ti ? from : to) + "'"));
     if (fi == ti) return Unexpected(refused("cannot promote a layer into itself"));
     const Ref<Array> tree = fi ? impl_->layers[*fi].root : impl_->scratch_root();
+    const Ref<Array> target_before = impl_->layers[*ti].root;  // for the log's records
     // Each path the source holds, valued as the Config reads it with the source on top:
     // the enabled layers below, then the source, merged, so a repeated tag folds as a
     // merge folds it rather than as find() would see it alone.
@@ -706,7 +763,7 @@ Expected<WriteReport> Config::promote(std::string_view from, std::string_view to
     Ref<Array> upto = Array::make(0);
     if (tree) {
         HashMap<Str, char> seen;
-        collect_paths(*tree, 0, "", seen, leaves);
+        collect_paths(*tree, 0, "", seen, leaves, impl_->alias_root());
         const size_t below = fi ? *fi : impl_->layers.size();
         for (size_t i = 0; i < below; ++i)
             if (impl_->layers[i].options.enabled)
@@ -784,11 +841,18 @@ Expected<WriteReport> Config::promote(std::string_view from, std::string_view to
             return Unexpected(std::move(r).error());
         }
     }
+    const bool log = impl_->logging();  // the promotion as one transaction
+    if (log) {  // `target` is the layer as planned: the same tree whether or not written
+        impl_->begin_change(trigger_name("promote"));
+        impl_->walk_changes(*this, *target_before, *target.root, Symbol(to));
+    }
     impl_->commit(*this, rec, t);
     impl_->finish(*this, rec, t);
     Vec<WrittenLine> written;
     for (const Leaf& leaf : leaves) {
-        const Source s = impl_->source_in(impl_->layers[*ti], Path(leaf.path));
+        // Located in the target as planned: the same text the file now holds, or, with a
+        // writer that only captures it (a dry run), the text it would hold.
+        const Source s = impl_->source_in(target, Path(leaf.path));
         if (!virt.empty()) written.push_back({s.file, s.line});
         // Scratch's edits are in the file now.
         if (from == "scratch") {
@@ -798,6 +862,10 @@ Expected<WriteReport> Config::promote(std::string_view from, std::string_view to
         }
     }
     report.written = List<WrittenLine>(written);
+    if (log) {
+        impl_->changes.pending_written.assign(written.begin(), written.end());
+        impl_->close_change();
+    }
     return report;
 }
 

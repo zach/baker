@@ -28,7 +28,7 @@ std::string merged(std::string_view base, std::string_view over) {
 
 const LayerEffectEntry* entry(const List<LayerEffectEntry>& effect, const char* path) {
     for (const LayerEffectEntry& e : effect)
-        if (e.path == Symbol(path)) return &e;
+        if (e.path->view() == path) return &e;
     return nullptr;
 }
 
@@ -261,7 +261,7 @@ TEST_CASE("the check reports each verb, a stale pin, and operands that change no
     REQUIRE(r.effect.size() == 4);
     CHECK(r.effect[0].op == Symbol("#drop"));
     CHECK(r.effect[1].op == Symbol("#append"));
-    CHECK(r.effect[1].path == Symbol("things"));
+    CHECK(r.effect[1].path->view() == "things");
     CHECK(to_string(r.effect[1].values) == "(lamp -2 4 0)");
     CHECK(messages(r.warnings) ==
           std::vector<std::string>{"'items' has no z to drop",

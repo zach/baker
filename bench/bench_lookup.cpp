@@ -10,6 +10,7 @@
 // arrays out breadth first).
 #include <baker/array.hpp>
 #include <baker/cache.hpp>
+#include <baker/curve.hpp>
 #include <baker/parse.hpp>
 
 #include <algorithm>
@@ -130,6 +131,34 @@ int main() {
                 sorted_big->try_find(opaque(big_keys[static_cast<unsigned>(i) % un]))->size());
         });
         std::printf("try_find, %4d children, avg: linear %7.2f ns, sorted %6.2f ns\n", n, l, s);
+    }
+
+    // A curve read from a load against one over the host's points: samples
+    // spread over its span; then a read of the key and a sample, as a frame reads it.
+    for (const int n : {4, 16}) {
+        std::string curve_text = "(curve";
+        std::vector<baker::CurvePoint> points;
+        for (int i = 0; i < n; ++i) {
+            const double y = (i * 7 % 5) + 0.25 * i;
+            curve_text += " (" + std::to_string(i * 10) + " " + std::to_string(y) + ")";
+            points.push_back({i * 10.0, std::stod(std::to_string(y))});
+        }
+        curve_text += ")";
+        auto curve_root = baker::read_string(curve_text, "curve.dta");
+        if (!curve_root) return 1;
+        const baker::Symbol tag("curve");
+        const baker::Curve tree_curve = *(*curve_root)->find<baker::Curve>(tag);
+        const baker::Curve host_curve(points);
+        const double span = (n - 1) * 10.0;
+        auto at = [span](int i) { return static_cast<double>(i % 1000) * span / 1000.0; };
+        const double t = ns_per_call([&](int i) { return opaque(tree_curve).sample(at(i)); });
+        const double h = ns_per_call([&](int i) { return opaque(host_curve).sample(at(i)); });
+        const double r = ns_per_call(
+            [&](int i) { return (*curve_root)->find<baker::Curve>(opaque(tag))->sample(at(i)); });
+        std::printf(
+            "curve sample, %2d points monotone: from a load %6.2f ns, host's points %6.2f ns\n", n,
+            t, h);
+        std::printf("curve find<Curve> and sample, %2d points: %6.2f ns\n", n, r);
     }
 
     // Cold: a working set larger than L2.

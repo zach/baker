@@ -6,6 +6,7 @@
 #include "alloc_counter.hpp"
 #include "temp_dir.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <map>
@@ -289,5 +290,128 @@ TEST_CASE("under BAKER_SHIPPING the watcher is inert") {
         dir.write("default.dta", "(speed 2)\n");
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
         CHECK_FALSE(w.poll());
+    }
+}
+
+namespace {
+
+// A write time as std::filesystem gives it, in nanoseconds since 1970, as the watcher read
+// it before it called the system itself.
+uint64_t filesystem_ns(std::filesystem::file_time_type t) {
+#ifdef _LIBCPP_VERSION
+    const auto since = t.time_since_epoch();  // libc++'s file clock counts from 1970
+#else
+    const auto since = std::chrono::clock_cast<std::chrono::system_clock>(t).time_since_epoch();
+#endif
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(since).count();
+    return ns > 0 ? static_cast<uint64_t>(ns) : 0;
+}
+
+// What std::filesystem says of `path`, as a stamp hook would.
+FileStamp filesystem_stamp(const std::string& path) {
+    std::error_code ec;
+    FileStamp s;
+    const auto t = std::filesystem::last_write_time(path, ec);
+    if (ec) return s;
+    s.present = true;
+    s.write_ns = filesystem_ns(t);
+    const auto size = std::filesystem::file_size(path, ec);
+    s.size = ec ? 0 : static_cast<uint64_t>(size);
+    return s;
+}
+
+}  // namespace
+
+TEST_CASE("file_stamp reads what std::filesystem read, from the system's own call") {
+    TempDir dir;
+    const std::string file = dir.write("data/old.dta", "(speed 1)\n");
+    const std::string folder = dir.path("data");
+    const std::string missing = dir.path("data/missing.dta");
+    // Written an hour ago: a stamp is trusted only for a file left alone for a while.
+    const auto hour_ago = std::filesystem::file_time_type::clock::now() - std::chrono::hours(1);
+    std::error_code ec;
+    std::filesystem::last_write_time(file, hour_ago, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::last_write_time(folder, hour_ago, ec);
+    REQUIRE_FALSE(ec);
+    for (const std::string& path : {file, folder}) {
+        CAPTURE(path);
+        const FileStamp want = filesystem_stamp(path);
+        REQUIRE(want.present);
+        CHECK(want.write_ns < baker::host::file_clock_now_ns());
+        const uint64_t by_hook =
+            baker::host::file_stamp(path, [&](std::string_view, FileStamp& out) {
+                out = want;
+                return true;
+            });
+        CHECK(by_hook != 0);
+        CHECK(baker::host::file_stamp(path) == by_hook);
+    }
+    CHECK(filesystem_stamp(file).size == 10);
+    CHECK(filesystem_stamp(folder).size == 0);
+    CHECK(baker::host::file_stamp(missing) == 0);
+    CHECK(baker::host::file_stamp(file) != baker::host::file_stamp(folder));
+}
+
+TEST_CASE("a stamp, and a poll that stamps an unchanged file, allocate nothing") {
+    if constexpr (!kShipping) {
+        TempDir dir;
+        const std::string file = dir.write("data/old.dta", "(speed 1)\n");
+        std::error_code ec;
+        std::filesystem::last_write_time(
+            file, std::filesystem::file_time_type::clock::now() - std::chrono::hours(1), ec);
+        REQUIRE_FALSE(ec);
+        uint64_t stamp = 0;
+        {
+            const test::AllocationScope scope;
+            for (int i = 0; i < 5; ++i) stamp ^= baker::host::file_stamp(file);
+            CHECK(scope.count() == 0);
+        }
+        CHECK(stamp != 0);
+
+        // A file whose directory was missing at watch() is stamped at each due poll, there
+        // now or not.
+        const std::string later = dir.path("later/local.dta");
+        const std::string_view more[] = {later};
+        Watcher w;
+        w.watch({}, more);
+        REQUIRE(w.by_stamp() == 1);
+        dir.write("later/local.dta", "(jump 2)\n");
+        REQUIRE(first_change(w));
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));  // a stamp check falls due
+        const test::AllocationScope scope;
+        for (int i = 0; i < 5; ++i) CHECK_FALSE(w.poll());
+        CHECK(scope.count() == 0);
+    }
+}
+
+TEST_CASE("watch() is linear in the files it is given") {
+    if constexpr (!kShipping) {
+        // Paths with a scheme, so the disk takes no part: what is timed is watch()'s own work,
+        // listing each file and finding it among those it watched before.
+        auto list = [](size_t n) {
+            std::vector<StackFile> files(n);
+            for (size_t i = 0; i < n; ++i)
+                files[i].path = Symbol("linear://f" + std::to_string(i) + ".dta");
+            return files;
+        };
+        const std::vector<StackFile> few = list(1'000), many = list(16'000);
+        auto best_us = [](const std::vector<StackFile>& files) {
+            Watcher w;
+            w.watch(files);
+            double best = 1e30;
+            for (int run = 0; run < 3; ++run) {
+                const auto start = std::chrono::steady_clock::now();
+                w.watch(files);  // again: each file is one it watched before
+                best = std::min(best, std::chrono::duration<double, std::micro>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count());
+                CHECK(w.watched() == files.size());
+            }
+            return best;
+        };
+        const double t_few = best_us(few), t_many = best_us(many);
+        MESSAGE("watch(): 1,000 files " << t_few << " us, 16,000 files " << t_many << " us");
+        CHECK(t_many < 64 * t_few);  // 16 times the files: about 16 times, not 256
     }
 }

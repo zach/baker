@@ -2,6 +2,7 @@
 #include <baker/array.hpp>
 
 #include "arena.hpp"
+#include "array_fill.hpp"
 #include "markers.hpp"
 #include "text.hpp"
 
@@ -101,9 +102,16 @@ void Array::finish(int verb) noexcept {
     // A verb stands in the first value slot, which the parser knows; a pin is metadata.
     if (verb < 0) verb = size_ >= 2 && data()[1].type() == Type::Symbol ? -1 : 0;
     if (verb || first_meta) below = static_cast<uint16_t>(below | marker_flag(verb, first_meta));
-    // sort_for_lookup() runs this again, so the old boundary goes first.
-    flags_ = static_cast<uint16_t>((flags_ & kFlagBits) | (below & kHasMarker) |
+    // sort_for_lookup() runs this again, so the old boundary goes first; so does sorted
+    // mode, whose run keys these are not (sort_for_lookup() sets it again after).
+    flags_ = static_cast<uint16_t>((flags_ & kFlagBits & ~kSortedForLookup) | (below & kHasMarker) |
                                    (std::min(first_meta, kMetaFar) << kMetaShift));
+}
+
+void Array::unsort() noexcept {
+    flags_ = static_cast<uint16_t>(flags_ & ~kSortedForLookup);
+    uint32_t* tags = tag_run();
+    for (uint32_t i = 0; i < size_; ++i) tags[i] = tag_key(data()[i]);
 }
 
 #if defined(_MSC_VER)
@@ -127,7 +135,8 @@ void Array::set(size_t i, Node node) noexcept {
     assert(i < size_);
     const uint16_t h = above(child_height(node));
     if (h > height_) height_ = h;
-    flags_ = static_cast<uint16_t>(flags_ & ~kSortedForLookup);
+    if (flags_ & kSortedForLookup) [[unlikely]]
+        unsort();
     // A verb or a pin made here is flagged as finish() flags one.
     if (const Array* a = node.array()) {
         const bool pin = i > 0 && node.type() == Type::Array && a->tag().is_meta() &&
@@ -157,8 +166,33 @@ void Array::set(size_t i, Node node) noexcept {
         return;
     }
     // Arena nodes count nothing: the old node is dropped as it is, and the arena counts
-    // the new one's owner if it is another.
-    detail::Arena::of(owner).adopt(data() + i, std::move(node), false);
+    // the new one's owner if it is another. Curves baked from the load bake again.
+    detail::Arena& arena = detail::Arena::of(owner);
+    arena.changed();
+    arena.adopt(data() + i, std::move(node), false);
+}
+
+void detail::ArrayFill::fill(Array& a, const Node& first, const Node& second,
+                             std::span<const Node> rest) noexcept {
+    assert(a.size_ == rest.size() + 2 && owner_of(&a).kind == kSoloArray);
+    Node* d = a.data();
+    d[0] = first;
+    d[1] = second;
+    for (size_t i = 0; i < rest.size(); ++i) d[i + 2] = rest[i];
+    // finish()'s own test of the verb slot, without its out-of-line call for every symbol.
+    a.finish(marker_of(second) != Marker::None ? 1 : 0);
+}
+
+void detail::ArrayFill::clear(Array& a) noexcept {
+    assert(owner_of(&a).kind == kSoloArray);
+    Node* d = a.data();
+    uint32_t* tags = a.tag_run();
+    for (uint32_t i = 0; i < a.size_; ++i) {
+        d[i] = Node();
+        tags[i] = Array::kNoTag;
+    }
+    a.height_ = 1;
+    a.flags_ = 0;
 }
 
 namespace {

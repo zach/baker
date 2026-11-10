@@ -10,23 +10,28 @@
 namespace baker::detail {
 
 struct TableSlot {
-    explicit TableSlot(const Allocator& a) : at(a), sources(a), errors(a) {}
+    explicit TableSlot(const Allocator& a) : at(a), sources(a), source_tags(a), errors(a) {}
     TableSlot(TableSlot&&) noexcept = default;
     TableSlot& operator=(TableSlot&&) noexcept = default;
     TableSpec spec;
     Vec<Symbol> at;  // the shape's (@at ...) segments; `*` is any tag
     Ref<const BakedTable> built;
-    // The arrays whose children are the records, in tree order, as of the last build: a
-    // tree that shares them all has the same records.
-    Vec<const Array*> sources;
+    // The arrays whose children are the records, in tree order, as of the last build, held
+    // so a later tree can be compared with them; and the tags the `*` segments stood for
+    // above each, wildcards to a source. A tree that holds the same arrays, or equal ones,
+    // under the same tags has the same records.
+    Vec<Ref<Array>> sources;
+    Vec<Symbol> source_tags;
     Vec<Error> errors;  // the last build's, as given to the warning handler
 };
 
 // Reads the spec's `at` into the slot; refused when it has no segment (a keyed shape is
 // at a place).
 [[nodiscard]] Expected<void> parse_table_at(const TableSpec& spec, TableSlot& slot);
-// Whether `root` holds the same governing arrays the slot was built from.
-[[nodiscard]] bool table_sources_unchanged(const TableSlot& slot, const Array& root,
+// Whether `root` holds the governing arrays the slot was built from, or equal ones under the
+// same tags; an equal one takes the old one's place in the slot, so the next compare is a
+// pointer test.
+[[nodiscard]] bool table_sources_unchanged(TableSlot& slot, const Array& root,
                                            const Allocator& alloc);
 // Builds the slot's table from `root`: one block from `alloc`; errors in records (a field
 // that is not a literal, a wrong type) to `warn`, located, the member left at its default.

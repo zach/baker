@@ -11,14 +11,16 @@
 namespace views_test {
 
 struct Item {
-    float price = 0;
     std::string_view tag;
     baker::ListView<int32_t> sizes;
+    float price = 0;
 
     static constexpr std::string_view kShapeName = baker::view_text("item");
-    static constexpr uint64_t kShapeDigest = 0x3e9003c5e79980e0ull;
+    static constexpr uint64_t kShapeDigest = 0x78a7c3c95e7bd592ull;
     static constexpr std::string_view kAt = "items";
     static constexpr bool kKeyed = true;
+    // (@view by_id): the table keeps each record's ID, for index_of(RecordId).
+    static constexpr bool kById = false;
     // The members a baked table relocates: defined in item_read.hpp.
     static constexpr std::span<const baker::ViewFixup> fixups() noexcept;
 };

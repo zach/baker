@@ -18,6 +18,8 @@ struct Vec2 {
     static constexpr uint64_t kShapeDigest = 0xf3e3be8f64913e9eull;
     static constexpr std::string_view kAt = "";
     static constexpr bool kKeyed = false;
+    // (@view by_id): the table keeps each record's ID, for index_of(RecordId).
+    static constexpr bool kById = false;
     // The members a baked table relocates: defined in vec2_read.hpp.
     static constexpr std::span<const baker::ViewFixup> fixups() noexcept;
 };

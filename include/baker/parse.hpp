@@ -84,6 +84,13 @@ struct ParseLimits {
     // seen before costs nothing, so a second read of the same text counts none. Lower it for
     // text you do not trust. Loading a binary cache is not counted.
     uint64_t max_new_symbols = uint64_t{1} << 20;
+    // Nodes a top-level read takes from macros: each use of a macro counts every node of its
+    // body, the arrays in it and what they hold, whether the use copies them or shares them.
+    // Macros that use macros multiply, so a few hundred bytes of text could otherwise ask for
+    // billions of nodes; past this the read fails with ErrorCode::Limit before it builds
+    // them. A project's colors and constants take a few thousand. Lower it for text you do
+    // not trust.
+    uint64_t max_macro_nodes = uint64_t{1} << 20;
 };
 
 // A file that declared itself a pack (above).
@@ -207,6 +214,14 @@ public:
     // reading. A null lister restores the default.
     void set_lister(Lister lister);
     [[nodiscard]] const Lister& lister() const noexcept;
+    // A file's stamp: its size and last write mixed into one number, 0 if unknown. With
+    // one, a Config's reload reads again only a file whose stamp moved since it was read;
+    // without, it reads and hashes every file the stack was built from, since the
+    // core reads no file's metadata. A host with the operating system's file times gives
+    // one (host::Live does). It must answer for what the reader reads.
+    using Stamper = Callback<uint64_t(std::string_view path)>;
+    void set_stamper(Stamper stamper);
+    [[nodiscard]] const Stamper& stamper() const noexcept;
 
     // Searched, in order, after the including file's directory.
     void add_include_dir(std::string_view dir);

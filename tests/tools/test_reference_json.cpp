@@ -1,4 +1,4 @@
-// The machine-readable reference, baker.reference/1.5.
+// The machine-readable reference, baker.reference/1.6.
 #include <doctest.h>
 #include <baker/config.hpp>
 #include <baker/object.hpp>
@@ -49,7 +49,7 @@ TEST_CASE("the reference as JSON lists functions, types, classes, globals, and p
                  "{class Ghost (haunt () 1)}",
                  "lib.dta"));
     const std::string json = reference_json(ctx);
-    CHECK(json.rfind("{\n  \"schema\": \"baker.reference/1.5\",\n  \"functions\": [", 0) == 0);
+    CHECK(json.rfind("{\n  \"schema\": \"baker.reference/1.6\",\n  \"functions\": [", 0) == 0);
     CHECK(json == reference_json(ctx));  // the same bytes, run to run
     CHECK(json.back() == '\n');
 
@@ -57,7 +57,7 @@ TEST_CASE("the reference as JSON lists functions, types, classes, globals, and p
     CHECK(has(
         json,
         R"j({"name": "spawn", "tier": "native", "status": "normal", )j"
-        R"j("replacement": "", "doc": "", "file": "", "line": 0, "overloads": )j"
+        R"j("replacement": "", "doc": "", "usage": [], "file": "", "line": 0, "overloads": )j"
         R"j([{"params": [{"type": "symbol", "kind": "value", "raw": false, )j"
         R"j("values": ["symbol"], "count": "exact", "element": null, "length": null}, )j"
         R"j({"type": "int", "kind": "optional", )j"
@@ -179,4 +179,23 @@ TEST_CASE("the macros a layer brought go with the layer") {
         REQUIRE(cfg.remove_layer("mod.dta"));
         CHECK(names() == std::vector<std::string>{"SPEED"});
     }
+}
+
+TEST_CASE("a special form's usage stands in for its signature, in both references") {
+    Context ctx;
+    auto f = ctx.func("repeat", [](Args a) -> Expected<Node> { return a.eval(a.size() - 1); });
+    REQUIRE(f);
+    f->doc("Runs its body.").usage("{repeat n body...}\n{repeat body...}");
+    std::string json;
+    write_reference_json(ctx, string_out(json));
+    if constexpr (kShipping) {
+        CHECK(has(json, R"j("doc": "", "usage": [])j"));  // a shipping build keeps neither
+        return;
+    }
+    CHECK(has(json, R"j("usage": ["{repeat n body...}", "{repeat body...}"])j"));
+    std::string md;
+    reference(ctx, string_out(md));
+    CHECK(md.find("- `{repeat n body...}` → value\n- `{repeat body...}` → value\n") !=
+          std::string::npos);
+    CHECK(md.find("{repeat values...}") == std::string::npos);
 }

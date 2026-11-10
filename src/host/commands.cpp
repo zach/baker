@@ -3,6 +3,7 @@
 #include <baker/host/commands.hpp>
 #include <baker/host/live.hpp>
 #include <baker/image.hpp>
+#include <baker/tools/console.hpp>
 #include <baker/tools/format.hpp>
 #include <baker/tools/layers.hpp>
 #include <baker/tools/reference.hpp>
@@ -63,6 +64,14 @@ struct Loaded {
 bool load(Loaded& l, const CommandLine& line) {
     if (l.hooks.bind) l.hooks.bind(l.ctx);
     l.bound = true;
+    // A shipping Live binds no config.*; the commands are tool code, and eval offers
+    // them in every build. Bound before the open, as Live binds them before #autorun.
+    if constexpr (kShipping)
+        if (auto r = tools::bind_config_tools(l.ctx, l.live.config()); !r) {
+            err(describe(r.error()));
+            err("\n");
+            return false;
+        }
     LiveOptions o;
     o.project = line.project;
     o.built = l.hooks.built;
@@ -557,8 +566,8 @@ bool composes(const LayerEffectEntry& e) {
 // The row of `root` an effect entry was read from: the first with its key, or for a later
 // row that composes (a key's second #append), the one on the entry's line.
 const Array* row_of(const Array* root, const LayerEffectEntry& e) {
-    const Path path(e.path.str());
-    const Array* a = root && path.valid() ? root->try_get(e.path.str()) : nullptr;
+    const Path path(e.path->view());
+    const Array* a = root && path.valid() ? root->try_get(path) : nullptr;
     if (!a || a->line() == e.source.line || path.empty()) return a;
     const Array* parent =
         path.size() == 1 ? root : root->try_get(Path(detail::text_of(path, path.size() - 1)));
@@ -577,7 +586,7 @@ void print_rows(const Config& cfg, std::string_view layer, const List<LayerEffec
     out("; " + Str(heading) + "\n");
     const Ref<Array> root = cfg.layer_root(layer);
     for (const LayerEffectEntry& e : effect) {
-        const std::string_view key = e.path.str();
+        const std::string_view key = e.path->view();
         if (!e.declares.empty()) {  // a declaration is written as itself, not as a row
             out(Str(e.declares.str()) + " " + values_text(e.values) + "\n");
             continue;
@@ -620,7 +629,7 @@ Str notes_of(const Config& cfg, std::string_view layer) {
             if (!text.empty()) text += ' ';
             text += v.try_str() ? Str(*v.try_str()) : detail::text_of(v);
         }
-        out += "# " + Str(e.path.str()) + ": " + text + "\n";
+        out += "# " + Str(e.path->view()) + ": " + text + "\n";
     }
     return out;
 }
@@ -647,7 +656,7 @@ int print_effect(const Config& cfg, std::string_view layer, std::string_view hea
     for (const LayerEffectEntry& e : *effect) {
         const bool verb = !e.op.empty() && e.op != Symbol("#remove");  // #remove is the value
         const Str what = e.declares.empty() ? Str() : Str(e.declares.str()) + " ";
-        out("  " + what + Str(e.path.str()) + "  " +
+        out("  " + what + Str(e.path->view()) + "  " +
             (e.below ? values_text(*e.below, verb) : Str("(new)")) + " -> " +
             (verb ? Str(e.op.str()) + " " : Str()) + values_text(e.values) + "  (" +
             Str(e.source.file.str()) + ":" + detail::decimal(e.source.line) + ")" +
@@ -770,6 +779,8 @@ bool write_whole(std::string_view path, std::string_view text) {
     return std::fclose(f) == 0 && ok;
 }
 
+int send(const CommandLine& line, const CommandHooks& hooks, const Str& output, int status);
+
 int promote(const CommandLine& line, const CommandHooks& hooks) {
     Loaded l(hooks);
     if (!load(l, line)) return kCommandError;
@@ -817,6 +828,23 @@ int promote(const CommandLine& line, const CommandHooks& hooks) {
             " files would change;\napply it from " + Str(root.generic_string()) +
             " with git apply -p1 (or patch -p1)\n");
         return report->ok() ? 0 : kCommandFailed;
+    }
+    if (line.json) {
+        // The promotion's transaction as baker.changes/1: what it writes and each
+        // value it changes. Without --baker-write, the writer captures the files instead,
+        // so the records are what the promotion would make and nothing is written.
+        if (!line.write) cfg.set_writer([](std::string_view, std::string_view) { return true; });
+        cfg.set_change_history(1);
+        auto report = cfg.promote(line.layer, line.to);
+        if (!report) {
+            err(describe(report.error()));
+            err("\n");
+            return kCommandError;
+        }
+        report_refusals(*report);
+        Str json;
+        tools::write_changes_json(cfg, detail::str_out(json));
+        return send(line, hooks, json, report->ok() ? 0 : kCommandFailed);
     }
     if (!line.write)
         return print_effect(

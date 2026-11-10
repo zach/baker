@@ -10,7 +10,10 @@
 #include "text.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <new>
+#include <type_traits>
 
 namespace baker {
 
@@ -82,14 +85,22 @@ bool is_record(const Node& n) noexcept {
     return c && !c->tag().empty() && !c->tag().is_meta();
 }
 
+// The alignment a list's elements need: the largest power of two dividing their size, up
+// to the pool's 16 (a type's alignment divides its size).
+constexpr size_t element_align(size_t size) noexcept {
+    const size_t low = size & (~size + 1);
+    return low == 0 || low > kPoolAlign ? kPoolAlign : low;
+}
+
 // The pool's two passes: measured, then written. `at` is null while measuring.
 class Pool {
 public:
     explicit Pool(char* base) noexcept : base_(base) {}
     [[nodiscard]] size_t used() const noexcept { return used_; }
-    // `bytes` of room, 16-aligned: where they are when writing, null when measuring.
-    char* take(size_t bytes) noexcept {
-        used_ = aligned(used_, kPoolAlign);
+    [[nodiscard]] char* base() const noexcept { return base_; }
+    // `bytes` of room at `align`: where they are when writing, null when measuring.
+    char* take(size_t bytes, size_t align) noexcept {
+        used_ = aligned(used_, align);
         char* p = base_ ? base_ + used_ : nullptr;
         used_ += bytes;
         return p;
@@ -100,10 +111,67 @@ private:
     size_t used_ = 0;
 };
 
+// The pool's strings, each distinct text once. Measuring finds each string's place by its
+// text, first against the last text of the same member, which a column of repeated values
+// hits; writing replays those places in the same order, so no text is looked up twice.
+class PoolStrings {
+public:
+    PoolStrings(const Allocator& alloc, size_t expected)
+        : seen_(Seen::allocator_type(alloc)), places_(alloc) {
+        places_.reserve(expected);
+    }
+
+    // Where `s`, a string at offset `member` of its struct, goes in the pool (or, measuring,
+    // will go), taking room for its first copy.
+    char* place(Pool& pool, std::string_view s, uint32_t member) {
+        if (!pool.base()) {
+            Recent& r = recent_[(member / alignof(std::string_view)) % kRecent];
+            if (r.at != kNone && r.text == s) {
+                places_.push_back(r.at);
+                return nullptr;
+            }
+            const auto it = seen_.find(s);
+            size_t at = 0;
+            if (it != seen_.end()) {
+                at = it->second;
+                places_.push_back(at);
+            } else {
+                (void)pool.take(s.size() + 1, 1);
+                at = pool.used() - s.size() - 1;
+                seen_.emplace(s, at);
+                places_.push_back(at | kFirst);
+            }
+            r = {s, at};
+            return nullptr;
+        }
+        const size_t place = places_[next_++];
+        if ((place & kFirst) == 0) return pool.base() + place;
+        char* p = pool.take(s.size() + 1, 1);
+        if (!s.empty()) std::memcpy(p, s.data(), s.size());  // an empty view may point nowhere
+        p[s.size()] = '\0';
+        return p;
+    }
+
+private:
+    using Seen = HashMap<std::string_view, size_t>;
+    static constexpr size_t kFirst = ~(~size_t{0} >> 1);  // the top bit: the first copy
+    static constexpr size_t kNone = ~size_t{0};
+    struct Recent {
+        std::string_view text;
+        size_t at = kNone;  // its offset in the pool; kNone: an empty slot
+    };
+    static constexpr size_t kRecent = 16;  // by the member's offset
+    Seen seen_;
+    Vec<size_t> places_;  // each string's offset in the pool, in the order placed
+    size_t next_ = 0;     // writing: the next of places_
+    Recent recent_[kRecent];
+};
+
 // Relocates what `row`'s fix-ups point at into the pool (or measures it). `temp` is room
 // for one list element of any nested view, for reading elements that are views.
 struct Relocator {
     Pool& pool;
+    PoolStrings& strings;
     Vec<char>& temp;
 
     void run(char* row, std::span<const ViewFixup> fixups) {
@@ -111,7 +179,7 @@ struct Relocator {
             char* at = row + f.offset;
             switch (f.kind) {
                 case ViewFixupKind::Symbol: break;
-                case ViewFixupKind::String: string(at); break;
+                case ViewFixupKind::String: string(at, f.offset); break;
                 case ViewFixupKind::Curve: curve(at); break;
                 case ViewFixupKind::Struct: run(at, f.nested_fixups()); break;
                 case ViewFixupKind::List: list(at, f); break;
@@ -119,13 +187,11 @@ struct Relocator {
         }
     }
 
-    void string(char* at) {
+    void string(char* at, uint32_t member) {
         std::string_view s;
         std::memcpy(&s, at, sizeof(std::string_view));
-        char* p = pool.take(s.size() + 1);
+        const char* p = strings.place(pool, s, member);
         if (!p) return;
-        if (!s.empty()) std::memcpy(p, s.data(), s.size());  // an empty view may point nowhere
-        p[s.size()] = '\0';
         const std::string_view moved(p, s.size());
         std::memcpy(at, &moved, sizeof(std::string_view));
     }
@@ -134,12 +200,15 @@ struct Relocator {
         Curve c;
         std::memcpy(&c, at, sizeof(Curve));
         const auto n = static_cast<uint32_t>(c.size());
-        char* p = pool.take(size_t{n} * sizeof(CurvePoint));
+        char* p = pool.take(size_t{n} * sizeof(CurvePoint), alignof(CurvePoint));
         if (!p) return;
         auto* points = reinterpret_cast<CurvePoint*>(p);
         for (uint32_t i = 0; i < n; ++i) points[i] = c.point(i);
-        const Curve moved(std::span<const CurvePoint>(points, n), c.mode(), c.extend());
-        std::memcpy(at, &moved, sizeof(Curve));
+        // Made in zeroed bytes, so the block's copy has zero padding, not the stack's.
+        alignas(Curve) unsigned char moved[sizeof(Curve)] = {};
+        static_assert(std::is_trivially_destructible_v<Curve>);
+        new (moved) Curve(std::span<const CurvePoint>(points, n), c.mode(), c.extend());
+        std::memcpy(at, moved, sizeof(Curve));
     }
 
     void list(char* at, const ViewFixup& f) {
@@ -149,7 +218,7 @@ struct Relocator {
         const auto* list = static_cast<const Array*>(raw.data);
         const Values v = list->values();
         const uint32_t n = raw.size;
-        char* elements = pool.take(size_t{n} * f.element_size);
+        char* elements = pool.take(size_t{n} * f.element_size, element_align(f.element_size));
         for (uint32_t i = 0; i < n; ++i) {
             char* e = elements ? elements + size_t{i} * f.element_size : nullptr;
             // Each element into its slot (or into temp while measuring), then relocated.
@@ -180,7 +249,7 @@ struct Relocator {
                 case ViewFixup::Element::String: {
                     const std::string_view x = v[i].try_str().value_or(std::string_view());
                     std::memcpy(into, &x, sizeof(std::string_view));
-                    string(into);
+                    string(into, f.offset);
                     break;
                 }
                 case ViewFixup::Element::Curve: {
@@ -279,7 +348,7 @@ Symbol BakedTable::key_of(uint32_t i) const noexcept {
 }
 
 RecordId BakedTable::id_of(uint32_t i) const noexcept {
-    return i < rows_ ? ids_[i] : RecordId{};
+    return i < rows_ && ids_ ? ids_[i] : RecordId{};
 }
 
 std::optional<uint32_t> BakedTable::find(const Symbol* tags, size_t n) const noexcept {
@@ -350,14 +419,30 @@ Expected<void> parse_table_at(const TableSpec& spec, TableSlot& slot) {
     return {};
 }
 
-bool table_sources_unchanged(const TableSlot& slot, const Array& root, const Allocator& alloc) {
+namespace {
+// What a walk found, kept in the slot: the arrays, held, and the tags of each one's `*`s.
+void keep_sources(TableSlot& slot, const Vec<Governed>& found, const Vec<Symbol>& tags) {
+    slot.sources.clear();
+    for (const Governed& g : found) slot.sources.emplace_back(const_cast<Array*>(g.parent));
+    slot.source_tags.assign(tags.begin(), tags.end());
+}
+}  // namespace
+
+bool table_sources_unchanged(TableSlot& slot, const Array& root, const Allocator& alloc) {
     Vec<Governed> found(alloc);
     Vec<Symbol> tags(alloc);
     Walker w{{slot.at.data(), slot.at.size()}, found, tags, Vec<Symbol>(alloc)};
     w.walk(root, 0);
-    if (found.size() != slot.sources.size()) return false;
+    if (found.size() != slot.sources.size() || tags.size() != slot.source_tags.size()) return false;
+    if (!std::equal(tags.begin(), tags.end(), slot.source_tags.begin())) return false;
+    // A merge builds anew an array a layer overrides, so an edit elsewhere hands back an
+    // equal copy: compared by content, its records shared with the last tree's are pointer
+    // tests.
     for (size_t i = 0; i < found.size(); ++i)
-        if (found[i].parent != slot.sources[i]) return false;
+        if (found[i].parent != slot.sources[i].get() &&
+            !structurally_equal(*found[i].parent, *slot.sources[i]))
+            return false;
+    keep_sources(slot, found, tags);
     return true;
 }
 
@@ -373,7 +458,7 @@ Ref<const BakedTable> build_table(TableSlot& slot, const Array& root, const Allo
     Vec<Symbol> wild(alloc);
     Walker w{at, found, wild, Vec<Symbol>(alloc)};
     w.walk(root, 0);
-    slot.sources.clear();
+    keep_sources(slot, found, wild);
     slot.errors.clear();
     struct Record {
         const Array* array;
@@ -381,24 +466,49 @@ Ref<const BakedTable> build_table(TableSlot& slot, const Array& root, const Allo
     };
     Vec<Record> records(alloc);
     for (uint32_t g = 0; g < found.size(); ++g) {
-        slot.sources.push_back(found[g].parent);
         const Array& p = *found[g].parent;
         for (uint32_t i = p.tag().empty() ? 0 : 1; i < p.size(); ++i)
             if (is_record(p[i])) records.push_back({p[i].try_array(), g});
     }
     const auto rows = static_cast<uint32_t>(records.size());
 
-    // Pass 1: each row read into temp, its pool bytes measured.
-    Vec<char> row_temp(alloc), elem_temp(alloc);
-    row_temp.resize(spec.row_size);
+    // Each row read once, into a zeroed buffer laid out as the block's rows, so its
+    // bytes, padding included, are what reading it in place would leave; its pool bytes
+    // measured from the row as read. The rows move into the block once it is sized.
+    const size_t rows_bytes = size_t{rows} * spec.row_size;
+    const size_t row_align = std::max<size_t>(spec.row_align, kPoolAlign);
+    struct RowsBuffer {
+        const Allocator& alloc;
+        size_t bytes;
+        char* data;
+        ~RowsBuffer() {
+            if (data) detail::deallocate(alloc, data, bytes);
+        }
+    } read_rows{
+        alloc, rows_bytes,
+        rows_bytes ? static_cast<char*>(detail::allocate(alloc, rows_bytes, row_align)) : nullptr};
+    if (rows_bytes) std::memset(read_rows.data, 0, rows_bytes);
+    Vec<char> elem_temp(alloc);
+    size_t string_members = 0;
+    for (const ViewFixup& f : spec.fixups)
+        string_members += f.kind == ViewFixupKind::String ? 1 : 0;
+    PoolStrings strings(alloc, size_t{rows} * string_members);
     size_t pool_bytes = 0;
     {
         Pool measure(nullptr);
-        Relocator r{measure, elem_temp};
-        for (const Record& rec : records) {
-            spec.init(row_temp.data());
-            (void)spec.read(*rec.array, row_temp.data(), nullptr);
-            r.run(row_temp.data(), spec.fixups);
+        Relocator r{measure, strings, elem_temp};
+        for (uint32_t i = 0; i < rows; ++i) {
+            const Record& rec = records[i];
+            char* row = read_rows.data + size_t{i} * spec.row_size;
+            spec.init(row);
+            Error err;
+            if (!spec.read(*rec.array, row, &err)) {
+                const Symbol* wild_tags = wild.data() + found[rec.governed].first_tag;
+                err.set_path(record_path(at, wild_tags, rec.array->tag()).view());
+                slot.errors.push_back(err);
+                if (warn) warn(err);
+            }
+            r.run(row, spec.fixups);
         }
         pool_bytes = measure.used();
     }
@@ -409,54 +519,48 @@ Ref<const BakedTable> build_table(TableSlot& slot, const Array& root, const Allo
             if (const Array* aka = rec.array->meta(aka_tag()))
                 alias_count += static_cast<uint32_t>(aka->values().size());
 
-    // The block: the header, the rows, the pool, the tags, the ids, the three indices.
-    const size_t rows_at =
-        aligned(sizeof(BakedTable), std::max<size_t>(spec.row_align, kPoolAlign));
-    const size_t pool_at = aligned(rows_at + size_t{rows} * spec.row_size, kPoolAlign);
+    // The block: the header, the rows, the pool, the tags, the keys, the parents, and, for a
+    // view that looks records up by ID, the ids and their index.
+    const size_t ids_n = spec.by_id ? rows : 0;
+    const size_t rows_at = aligned(sizeof(BakedTable), row_align);
+    const size_t pool_at = aligned(rows_at + rows_bytes, kPoolAlign);
     const size_t tags_at = aligned(pool_at + pool_bytes, alignof(Symbol));
     const size_t tags_n = size_t{rows} * (wildcards + 1);
-    const size_t ids_at = aligned(tags_at + tags_n * sizeof(Symbol), alignof(RecordId));
     const size_t keys_at =
-        aligned(ids_at + size_t{rows} * sizeof(RecordId), alignof(BakedTable::KeyEntry));
+        aligned(tags_at + tags_n * sizeof(Symbol), alignof(BakedTable::KeyEntry));
     const size_t keys_n = size_t{rows} + alias_count;
-    const size_t idx_at =
-        aligned(keys_at + keys_n * sizeof(BakedTable::KeyEntry), alignof(BakedTable::IdEntry));
-    const size_t parents_at = aligned(idx_at + size_t{rows} * sizeof(BakedTable::IdEntry),
-                                      alignof(BakedTable::ParentEntry));
+    const size_t parents_at =
+        aligned(keys_at + keys_n * sizeof(BakedTable::KeyEntry), alignof(BakedTable::ParentEntry));
     const size_t parents_n = wildcards ? found.size() : 0;
-    const size_t bytes = parents_at + parents_n * sizeof(BakedTable::ParentEntry);
-    char* block = static_cast<char*>(
-        detail::allocate(alloc, bytes, std::max<size_t>(spec.row_align, kPoolAlign)));
+    const size_t ids_at =
+        aligned(parents_at + parents_n * sizeof(BakedTable::ParentEntry), alignof(RecordId));
+    const size_t idx_at = aligned(ids_at + ids_n * sizeof(RecordId), alignof(BakedTable::IdEntry));
+    const size_t bytes = idx_at + ids_n * sizeof(BakedTable::IdEntry);
+    char* block = static_cast<char*>(detail::allocate(alloc, bytes, row_align));
     std::memset(block, 0, bytes);
+    if (rows_bytes) std::memcpy(block + rows_at, read_rows.data, rows_bytes);
     BakedTable* table = BakedTable::Layout::place(block, bytes, alloc);
     auto* tags = reinterpret_cast<Symbol*>(block + tags_at);
-    auto* ids = reinterpret_cast<RecordId*>(block + ids_at);
+    auto* ids = spec.by_id ? reinterpret_cast<RecordId*>(block + ids_at) : nullptr;
     auto* keys = reinterpret_cast<BakedTable::KeyEntry*>(block + keys_at);
     auto* idx = reinterpret_cast<BakedTable::IdEntry*>(block + idx_at);
     auto* parents = reinterpret_cast<BakedTable::ParentEntry*>(block + parents_at);
 
-    // Pass 2: the rows in place, relocated into the pool; the tags, ids and keys.
+    // The rows, relocated into the pool in place; the tags, ids and keys.
     Pool pool(block + pool_at);
-    Relocator r{pool, elem_temp};
+    Relocator r{pool, strings, elem_temp};
     uint32_t key_count = 0, id_count = 0;
     for (uint32_t i = 0; i < rows; ++i) {
         const Record& rec = records[i];
-        char* row = block + rows_at + size_t{i} * spec.row_size;
-        spec.init(row);
-        Error err;
-        if (!spec.read(*rec.array, row, &err)) {
-            const Symbol* wild_tags = wild.data() + found[rec.governed].first_tag;
-            err.set_path(record_path(at, wild_tags, rec.array->tag()).view());
-            slot.errors.push_back(err);
-            if (warn) warn(err);
-        }
-        r.run(row, spec.fixups);
+        r.run(block + rows_at + size_t{i} * spec.row_size, spec.fixups);
         Symbol* row_tags = tags + size_t{i} * (wildcards + 1);
         for (uint32_t k = 0; k < wildcards; ++k)
             row_tags[k] = wild[found[rec.governed].first_tag + k];
         row_tags[wildcards] = rec.array->tag();
-        new (ids + i) RecordId(rec.array->record_id());
-        if (!ids[i].empty() && ids[i].valid()) idx[id_count++] = {ids[i], i};
+        if (ids) {
+            new (ids + i) RecordId(rec.array->record_id());
+            if (!ids[i].empty() && ids[i].valid()) idx[id_count++] = {ids[i], i, 0};
+        }
         keys[key_count++] = {hash_tags(row_tags, wildcards + 1), Symbol(), i, 0};
         if (rec.array->meta_first())
             if (const Array* aka = rec.array->meta(aka_tag()))
@@ -498,15 +602,33 @@ namespace baker {
 
 namespace {
 
-// A section: digest u64, row_size u32, rows u32, fixups u64, block u32, wildcards u32,
-// the block's layout as offsets (rows, tags, ids, keys, key_count, idx, id_count, parents,
-// parent_count: u32 each), then the names (u32 count; u32 length + bytes, each padded to 8),
-// then the block's bytes (padded to 8), then the relocations (u32 count; u32 offset, u32
-// kind, u32 value each).
-enum class RelocKind : uint32_t { Pointer, String, Curve, Symbol };
-struct Reloc {
-    uint32_t offset, kind, value;
+// A section: digest u64, fixups u64, then u32 each: row_size, rows, block,
+// wildcards, by_id, and the block's layout as offsets (rows, tags, ids, keys, key_count,
+// idx, id_count, parents, parent_count); then the names (u32 count; u32 length + bytes,
+// each padded to 8); then the block's bytes, padded to 8. In the block, the header is zero
+// and every slot that holds a pointer or a symbol holds its file form instead: an offset
+// into the block, or a name's index. The reader finds those slots as the writer did,
+// through the view's fix-up list and the indices, so the section carries no list of them.
+constexpr uintptr_t kNowhere = UINTPTR_MAX;  // a pointer that was null
+struct FileString {                          // a std::string_view
+    uintptr_t offset, size;
 };
+struct FileList {  // a ListView: RawList's layout
+    uintptr_t offset;
+    uint32_t size, packed;
+};
+struct FileCurve {  // a Curve's points, count and modes; no padding, so no stray bytes
+    uintptr_t offset;
+    uint32_t size;
+    uint8_t mode, extend;
+    uint16_t zero;
+};
+// A symbol is a uintptr_t: 0 for the empty one, else 1 + its index in the names.
+static_assert(sizeof(FileString) == sizeof(std::string_view));
+static_assert(sizeof(FileList) == sizeof(RawList));
+static_assert(sizeof(FileCurve) <= sizeof(Curve));
+static_assert(sizeof(FileCurve) == sizeof(uintptr_t) + 8);
+static_assert(sizeof(uintptr_t) == sizeof(Symbol));
 
 template <class T>
 void put(Str& out, const T& v) {
@@ -533,28 +655,46 @@ uint64_t fixups_hash(std::span<const ViewFixup> fixups, uint64_t h = 14695981039
     return h;
 }
 
-// Collects the block's relocations: every pointer into the block and every symbol, as the
-// fix-ups and the indices say where they are.
-struct Collector {
-    const char* base;
-    size_t bytes;
-    Vec<Reloc>& relocs;
+// A fix-up of one list element, as a member at offset 0: what a list of strings or curves
+// walks per element.
+constexpr ViewFixup element_fixup(ViewFixupKind kind) noexcept {
+    return {0, kind, ViewFixup::Element::Int32, 0, nullptr, 0, nullptr, nullptr};
+}
+constexpr ViewFixup kStringElement = element_fixup(ViewFixupKind::String);
+constexpr ViewFixup kCurveElement = element_fixup(ViewFixupKind::Curve);
+
+// The writer's walk: each slot of the block in memory, written in its file form into the
+// block's copy in the section.
+struct Encoder {
+    const char* base;  // the block in memory
+    char* out;         // its copy in the section
+    HashMap<Symbol, uint32_t>& index;
     Vec<Symbol>& names;
 
-    [[nodiscard]] uint32_t name_of(Symbol s) {
-        if (s.empty()) return UINT32_MAX;
-        for (uint32_t i = 0; i < names.size(); ++i)
-            if (names[i] == s) return i;
-        names.push_back(s);
-        return static_cast<uint32_t>(names.size() - 1);
+    [[nodiscard]] uintptr_t offset_of(const void* p) const noexcept {
+        return p ? static_cast<uintptr_t>(static_cast<const char*>(p) - base) : kNowhere;
     }
-    [[nodiscard]] uint32_t offset_of(const void* p) const noexcept {
-        return static_cast<uint32_t>(static_cast<const char*>(p) - base);
+    template <class T>
+    void put_at(const char* at, const T& v, size_t slot) {
+        char* o = out + (at - base);
+        std::memset(o, 0, slot);
+        std::memcpy(o, &v, sizeof v);
     }
     void symbol(const char* at) {
         Symbol s;
         std::memcpy(&s, at, sizeof(Symbol));
-        relocs.push_back({offset_of(at), static_cast<uint32_t>(RelocKind::Symbol), name_of(s)});
+        uintptr_t v = 0;
+        if (!s.empty()) {
+            const auto it = index.find(s);
+            if (it != index.end()) {
+                v = it->second + 1;
+            } else {
+                index.emplace(s, static_cast<uint32_t>(names.size()));
+                names.push_back(s);
+                v = names.size();
+            }
+        }
+        put_at(at, v, sizeof(Symbol));
     }
     void run(const char* row, std::span<const ViewFixup> fixups) {
         for (const ViewFixup& f : fixups) {
@@ -564,63 +704,144 @@ struct Collector {
                 case ViewFixupKind::String: {
                     std::string_view s;
                     std::memcpy(&s, at, sizeof(std::string_view));
-                    if (s.data())
-                        relocs.push_back({offset_of(at), static_cast<uint32_t>(RelocKind::String),
-                                          offset_of(s.data())});
+                    put_at(at, FileString{offset_of(s.data()), s.size()}, sizeof(std::string_view));
                     break;
                 }
                 case ViewFixupKind::Curve: {
                     Curve c;
                     std::memcpy(&c, at, sizeof(Curve));
-                    if (!c.empty())
-                        relocs.push_back(
-                            {offset_of(at), static_cast<uint32_t>(RelocKind::Curve), 0});
+                    put_at(at,
+                           FileCurve{
+                               offset_of(CurveReader::points(c)), static_cast<uint32_t>(c.size()),
+                               static_cast<uint8_t>(c.mode()), static_cast<uint8_t>(c.extend()), 0},
+                           sizeof(Curve));
                     break;
                 }
                 case ViewFixupKind::Struct: run(at, f.nested_fixups()); break;
-                case ViewFixupKind::List: {
-                    RawList raw{};
-                    std::memcpy(&raw, at, sizeof(RawList));
-                    if (!raw.packed || !raw.data) break;
-                    relocs.push_back({offset_of(at), static_cast<uint32_t>(RelocKind::Pointer),
-                                      offset_of(raw.data)});
-                    const auto* elements = static_cast<const char*>(raw.data);
-                    for (uint32_t i = 0; i < raw.size; ++i) {
-                        const char* e = elements + size_t{i} * f.element_size;
-                        switch (f.element) {
-                            case ViewFixup::Element::Symbol: symbol(e); break;
-                            case ViewFixup::Element::String: {
-                                const ViewFixup one{0,
-                                                    ViewFixupKind::String,
-                                                    ViewFixup::Element::Int32,
-                                                    0,
-                                                    nullptr,
-                                                    0,
-                                                    nullptr,
-                                                    nullptr};
-                                run(e, std::span<const ViewFixup>(&one, 1));
-                                break;
-                            }
-                            case ViewFixup::Element::Curve: {
-                                const ViewFixup one{0,
-                                                    ViewFixupKind::Curve,
-                                                    ViewFixup::Element::Int32,
-                                                    0,
-                                                    nullptr,
-                                                    0,
-                                                    nullptr,
-                                                    nullptr};
-                                run(e, std::span<const ViewFixup>(&one, 1));
-                                break;
-                            }
-                            case ViewFixup::Element::Struct: run(e, f.nested_fixups()); break;
-                            default: break;
-                        }
-                    }
-                    break;
-                }
+                case ViewFixupKind::List: list(at, f); break;
             }
         }
+    }
+    void list(const char* at, const ViewFixup& f) {
+        RawList raw{};
+        std::memcpy(&raw, at, sizeof(RawList));
+        if (!raw.packed || !raw.data) {
+            put_at(at, FileList{kNowhere, 0, 0}, sizeof(RawList));
+            return;
+        }
+        put_at(at, FileList{offset_of(raw.data), raw.size, 1}, sizeof(RawList));
+        const auto* elements = static_cast<const char*>(raw.data);
+        for (uint32_t i = 0; i < raw.size; ++i) {
+            const char* e = elements + size_t{i} * f.element_size;
+            switch (f.element) {
+                case ViewFixup::Element::Symbol: symbol(e); break;
+                case ViewFixup::Element::String: run(e, {&kStringElement, 1}); break;
+                case ViewFixup::Element::Curve: run(e, {&kCurveElement, 1}); break;
+                case ViewFixup::Element::Struct: run(e, f.nested_fixups()); break;
+                default: break;
+            }
+        }
+    }
+};
+
+// The reader's walk: each slot of the copied block from its file form back to a pointer or
+// a symbol, every offset checked against the block. `ok` turns false at the first that is
+// not, and the walk then writes nothing more.
+struct Decoder {
+    char* block = nullptr;
+    size_t bytes = 0;
+    const Vec<Symbol>& names;
+    bool ok = true;
+
+    [[nodiscard]] bool within(uintptr_t offset, size_t n, size_t align) noexcept {
+        if (offset <= bytes && n <= bytes - offset && offset % align == 0) return true;
+        ok = false;
+        return false;
+    }
+    void symbol(char* at) {
+        uintptr_t v = 0;
+        std::memcpy(&v, at, sizeof v);
+        Symbol s;
+        if (v > names.size()) {
+            ok = false;
+            return;
+        }
+        if (v) s = names[v - 1];
+        std::memcpy(at, &s, sizeof(Symbol));
+    }
+    void run(char* row, std::span<const ViewFixup> fixups) {
+        for (const ViewFixup& f : fixups) {
+            if (!ok) return;
+            char* at = row + f.offset;
+            switch (f.kind) {
+                case ViewFixupKind::Symbol: symbol(at); break;
+                case ViewFixupKind::String: string(at); break;
+                case ViewFixupKind::Curve: curve(at); break;
+                case ViewFixupKind::Struct: run(at, f.nested_fixups()); break;
+                case ViewFixupKind::List: list(at, f); break;
+            }
+        }
+    }
+    void string(char* at) {
+        FileString fs{};
+        std::memcpy(&fs, at, sizeof fs);
+        std::string_view s;
+        if (fs.offset != kNowhere) {
+            if (!within(fs.offset, fs.size, 1)) return;
+            s = std::string_view(block + fs.offset, fs.size);
+        } else if (fs.size) {
+            ok = false;
+            return;
+        }
+        std::memcpy(at, &s, sizeof(std::string_view));
+    }
+    void curve(char* at) {
+        FileCurve fc{};
+        std::memcpy(&fc, at, sizeof fc);
+        if (fc.mode > static_cast<uint8_t>(CurveMode::Constant) ||
+            fc.extend > static_cast<uint8_t>(CurveExtend::Loop)) {
+            ok = false;
+            return;
+        }
+        const CurvePoint* points = nullptr;
+        if (fc.offset != kNowhere) {
+            if (!within(fc.offset, size_t{fc.size} * sizeof(CurvePoint), alignof(CurvePoint)))
+                return;
+            points = reinterpret_cast<const CurvePoint*>(block + fc.offset);
+        } else if (fc.size) {
+            ok = false;
+            return;
+        }
+        alignas(Curve) unsigned char moved[sizeof(Curve)] = {};
+        new (moved) Curve(std::span<const CurvePoint>(points, fc.size),
+                          static_cast<CurveMode>(fc.mode), static_cast<CurveExtend>(fc.extend));
+        std::memcpy(at, moved, sizeof(Curve));
+    }
+    void list(char* at, const ViewFixup& f) {
+        FileList fl{};
+        std::memcpy(&fl, at, sizeof fl);
+        if (!fl.packed) {
+            if (fl.offset != kNowhere || fl.size) ok = false;
+            const RawList empty{};
+            std::memcpy(at, &empty, sizeof empty);
+            return;
+        }
+        if (fl.packed != 1 || f.element_size == 0 ||
+            !within(fl.offset, size_t{fl.size} * f.element_size, element_align(f.element_size)))
+            return;
+        char* elements = block + fl.offset;
+        for (uint32_t i = 0; i < fl.size && ok; ++i) {
+            char* e = elements + size_t{i} * f.element_size;
+            switch (f.element) {
+                case ViewFixup::Element::Symbol: symbol(e); break;
+                case ViewFixup::Element::String: string(e); break;
+                case ViewFixup::Element::Curve: curve(e); break;
+                case ViewFixup::Element::Struct: run(e, f.nested_fixups()); break;
+                default: break;
+            }
+        }
+        const RawList moved{elements, fl.size, 1};
+        std::memcpy(at, &moved, sizeof moved);
     }
 };
 
@@ -633,65 +854,58 @@ void record_table_sources(TableSlot& slot, const Array& root, const Allocator& a
     Vec<Symbol> tags(alloc);
     Walker w{{slot.at.data(), slot.at.size()}, found, tags, Vec<Symbol>(alloc)};
     w.walk(root, 0);
-    slot.sources.clear();
-    for (const Governed& g : found) slot.sources.push_back(g.parent);
+    keep_sources(slot, found, tags);
 }
 
 Expected<void> write_table(const BakedTable& table, const TableSpec& spec, Str& out) {
     const auto* base = reinterpret_cast<const char*>(&table);
     const BakedTable::Layout::Fields f = BakedTable::Layout::fields(table);
-    Vec<Reloc> relocs;
+    const auto offset_of = [&](const void* p) {
+        return p ? static_cast<uint32_t>(static_cast<const char*>(p) - base) : 0;
+    };
+    // The block's copy, its header zeroed (the reader places its own), then each slot that
+    // points or names in its file form.
+    Str block(std::string_view(base, table.block_bytes()));
+    std::memset(block.data(), 0, sizeof(BakedTable));
+    HashMap<Symbol, uint32_t> index;
     Vec<Symbol> names;
-    Collector c{base, table.block_bytes(), relocs, names};
-    // The rows through the fix-ups, with a curve's points found through the reader.
+    Encoder e{base, block.data(), index, names};
     for (uint32_t i = 0; i < table.size(); ++i)
-        c.run(static_cast<const char*>(table.row(i)), spec.fixups);
-    for (Reloc& r : relocs)
-        if (r.kind == static_cast<uint32_t>(RelocKind::Curve)) {
-            Curve curve;
-            std::memcpy(&curve, base + r.offset, sizeof(Curve));
-            r.value = c.offset_of(CurveReader::points(curve));
-        }
-    // The indices' symbols.
+        e.run(static_cast<const char*>(table.row(i)), spec.fixups);
     const size_t per_row = size_t{table.wildcards()} + 1;
     for (size_t i = 0; i < size_t{table.size()} * per_row; ++i)
-        c.symbol(reinterpret_cast<const char*>(f.tags + i));
+        e.symbol(reinterpret_cast<const char*>(f.tags + i));
     for (uint32_t i = 0; i < f.key_count; ++i)
-        c.symbol(reinterpret_cast<const char*>(&f.keys[i].key));
+        e.symbol(reinterpret_cast<const char*>(&f.keys[i].key));
     for (uint32_t i = 0; i < f.parent_count; ++i)
-        c.symbol(reinterpret_cast<const char*>(&f.parents[i].tag));
+        e.symbol(reinterpret_cast<const char*>(&f.parents[i].tag));
 
     out.clear();
     put(out, spec.digest);
-    put(out, spec.row_size);
-    put(out, table.size());
     put(out, fixups_hash(spec.fixups));
-    put(out, static_cast<uint32_t>(table.block_bytes()));
-    put(out, table.wildcards());
-    const uint32_t offsets[] = {c.offset_of(table.row(0)),
-                                c.offset_of(f.tags),
-                                c.offset_of(f.ids),
-                                c.offset_of(f.keys),
-                                f.key_count,
-                                c.offset_of(f.idx),
-                                f.id_count,
-                                c.offset_of(f.parents),
-                                f.parent_count};
-    for (const uint32_t o : offsets) put(out, o);
+    const uint32_t head[] = {spec.row_size,
+                             table.size(),
+                             static_cast<uint32_t>(table.block_bytes()),
+                             table.wildcards(),
+                             table.by_id() ? 1U : 0U,
+                             offset_of(table.row(0)),
+                             offset_of(f.tags),
+                             offset_of(f.ids),
+                             offset_of(f.keys),
+                             f.key_count,
+                             offset_of(f.idx),
+                             f.id_count,
+                             offset_of(f.parents),
+                             f.parent_count};
+    for (const uint32_t h : head) put(out, h);
     put(out, static_cast<uint32_t>(names.size()));
     for (const Symbol s : names) {
         put(out, static_cast<uint32_t>(s.str().size()));
         out.append(s.str());
         out.resize(aligned(out.size(), 8));
     }
-    out.append(std::string_view(base, table.block_bytes()));
+    out.append(block.view());
     out.resize(aligned(out.size(), 8));
-    put(out, static_cast<uint32_t>(relocs.size()));
-    for (const Reloc& r : relocs) {
-        put(out, r.offset);
-        put(out, r.kind);
-        put(out, r.value);
-    }
     return {};
 }
 
@@ -701,87 +915,79 @@ Ref<const BakedTable> read_table(std::string_view in, const TableSpec& spec, con
         why = make_error(ErrorCode::Refused, what);
         return Ref<const BakedTable>();
     };
+    constexpr std::string_view kDamaged = "a damaged table section";
     size_t at = 0;
     uint64_t digest = 0, fixups = 0;
-    uint32_t row_size = 0, rows = 0, block_bytes = 0, wildcards = 0, offsets[9] = {},
-             name_count = 0;
-    if (!get(in, at, digest) || !get(in, at, row_size) || !get(in, at, rows) ||
-        !get(in, at, fixups) || !get(in, at, block_bytes) || !get(in, at, wildcards))
-        return refuse("a damaged table section");
+    uint32_t head[14] = {};
+    if (!get(in, at, digest) || !get(in, at, fixups)) return refuse(kDamaged);
+    for (uint32_t& h : head)
+        if (!get(in, at, h)) return refuse(kDamaged);
+    const uint32_t row_size = head[0], rows = head[1], block_bytes = head[2], wildcards = head[3],
+                   by_id = head[4], rows_at = head[5], tags_at = head[6], ids_at = head[7],
+                   keys_at = head[8], key_count = head[9], idx_at = head[10], id_count = head[11],
+                   parents_at = head[12], parent_count = head[13];
     if (digest != spec.digest) return refuse("another view's table");
     if (row_size != spec.row_size) return refuse("the view's size differs");
     if (fixups != fixups_hash(spec.fixups)) return refuse("the view's fix-up list differs");
-    for (uint32_t& o : offsets)
-        if (!get(in, at, o)) return refuse("a damaged table section");
-    if (!get(in, at, name_count)) return refuse("a damaged table section");
+    if ((by_id != 0) != spec.by_id) return refuse("the view's lookup by ID differs");
+    uint32_t name_count = 0;
+    if (!get(in, at, name_count)) return refuse(kDamaged);
     Vec<Symbol> names(alloc);
     for (uint32_t i = 0; i < name_count; ++i) {
         uint32_t len = 0;
-        if (!get(in, at, len) || in.size() - at < len) return refuse("a damaged table section");
+        if (!get(in, at, len) || in.size() - at < len) return refuse(kDamaged);
         names.emplace_back(in.substr(at, len));
         at = aligned(at + len, 8);
     }
-    if (in.size() - at < block_bytes) return refuse("a damaged table section");
-    const std::string_view block_bytes_in = in.substr(at, block_bytes);
-    at = aligned(at + block_bytes, 8);
-    uint32_t reloc_count = 0;
-    if (!get(in, at, reloc_count) || (in.size() - at) / sizeof(Reloc) < reloc_count)
-        return refuse("a damaged table section");
+    if (in.size() < at || in.size() - at < block_bytes) return refuse(kDamaged);
+    // Every array the header places must lie in the block, aligned, past the header.
     const size_t align = std::max<size_t>(spec.row_align, kPoolAlign);
-    for (const uint32_t o : offsets)
-        if (o > block_bytes) return refuse("a damaged table section");
+    const auto fits = [&](size_t offset, size_t n, size_t size, size_t a) {
+        return offset >= sizeof(BakedTable) && offset <= block_bytes && offset % a == 0 &&
+               (size == 0 || n <= (block_bytes - offset) / size);
+    };
+    if (wildcards >= Path::kMaxSegments || !fits(rows_at, rows, row_size, align) ||
+        !fits(tags_at, size_t{rows} * (wildcards + 1), sizeof(Symbol), alignof(Symbol)) ||
+        !fits(keys_at, key_count, sizeof(BakedTable::KeyEntry), alignof(BakedTable::KeyEntry)) ||
+        !fits(parents_at, parent_count, sizeof(BakedTable::ParentEntry),
+              alignof(BakedTable::ParentEntry)) ||
+        (by_id &&
+         (!fits(ids_at, rows, sizeof(RecordId), alignof(RecordId)) || id_count > rows ||
+          !fits(idx_at, id_count, sizeof(BakedTable::IdEntry), alignof(BakedTable::IdEntry)))) ||
+        (!by_id && id_count != 0))
+        return refuse(kDamaged);
     char* block = static_cast<char*>(detail::allocate(alloc, block_bytes, align));
-    std::memcpy(block, block_bytes_in.data(), block_bytes);
+    std::memcpy(block, in.data() + at, block_bytes);
     BakedTable* table = BakedTable::Layout::place(block, block_bytes, alloc);
-    BakedTable::Layout::set(
-        *table, rows, row_size, wildcards, digest, block + offsets[0],
-        reinterpret_cast<const Symbol*>(block + offsets[1]),
-        reinterpret_cast<const RecordId*>(block + offsets[2]),
-        reinterpret_cast<const BakedTable::KeyEntry*>(block + offsets[3]), offsets[4],
-        reinterpret_cast<const BakedTable::IdEntry*>(block + offsets[5]), offsets[6],
-        reinterpret_cast<const BakedTable::ParentEntry*>(block + offsets[7]), offsets[8]);
+    const auto* keys = reinterpret_cast<const BakedTable::KeyEntry*>(block + keys_at);
+    const auto* idx = reinterpret_cast<const BakedTable::IdEntry*>(block + idx_at);
+    const auto* parents = reinterpret_cast<const BakedTable::ParentEntry*>(block + parents_at);
+    BakedTable::Layout::set(*table, rows, row_size, wildcards, digest, block + rows_at,
+                            reinterpret_cast<const Symbol*>(block + tags_at),
+                            by_id ? reinterpret_cast<const RecordId*>(block + ids_at) : nullptr,
+                            keys, key_count, by_id ? idx : nullptr, id_count, parents,
+                            parent_count);
     Ref<const BakedTable> ref = Ref<const BakedTable>::adopt(table);
-    for (uint32_t i = 0; i < reloc_count; ++i) {
-        Reloc r{};
-        if (!get(in, at, r)) return refuse("a damaged table section");
-        if (r.offset + 8 > block_bytes) return refuse("a damaged table section");
-        char* slot = block + r.offset;
-        switch (static_cast<RelocKind>(r.kind)) {
-            case RelocKind::Pointer: {
-                if (r.value > block_bytes) return refuse("a damaged table section");
-                const void* p = block + r.value;
-                std::memcpy(slot, &p, sizeof p);
-                break;
-            }
-            case RelocKind::String: {
-                std::string_view s;
-                std::memcpy(&s, slot, sizeof(std::string_view));
-                if (r.value > block_bytes) return refuse("a damaged table section");
-                const std::string_view moved(block + r.value, s.size());
-                std::memcpy(slot, &moved, sizeof(std::string_view));
-                break;
-            }
-            case RelocKind::Curve: {
-                Curve curve;
-                std::memcpy(&curve, slot, sizeof(Curve));
-                if (r.value > block_bytes) return refuse("a damaged table section");
-                CurveReader::set_points(curve,
-                                        reinterpret_cast<const CurvePoint*>(block + r.value));
-                std::memcpy(slot, &curve, sizeof(Curve));
-                break;
-            }
-            case RelocKind::Symbol: {
-                const Symbol s = r.value == UINT32_MAX    ? Symbol()
-                                 : r.value < names.size() ? names[r.value]
-                                                          : Symbol();
-                if (r.value != UINT32_MAX && r.value >= names.size())
-                    return refuse("a damaged table section");
-                std::memcpy(slot, &s, sizeof(Symbol));
-                break;
-            }
-            default: return refuse("a damaged table section");
-        }
+    // The rows through the fix-ups, then the indices' symbols, each slot to its pointer.
+    Decoder d{block, block_bytes, names};
+    for (uint32_t i = 0; i < rows && d.ok; ++i)
+        d.run(block + rows_at + size_t{i} * row_size, spec.fixups);
+    const size_t tags_n = size_t{rows} * (wildcards + 1);
+    for (size_t i = 0; i < tags_n && d.ok; ++i) d.symbol(block + tags_at + i * sizeof(Symbol));
+    for (uint32_t i = 0; i < key_count && d.ok; ++i) {
+        if (keys[i].row >= rows) return refuse(kDamaged);
+        d.symbol(block + keys_at + size_t{i} * sizeof(BakedTable::KeyEntry) +
+                 offsetof(BakedTable::KeyEntry, key));
     }
+    for (uint32_t i = 0; i < parent_count && d.ok; ++i) {
+        if (parents[i].first > rows || parents[i].count > rows - parents[i].first)
+            return refuse(kDamaged);
+        d.symbol(block + parents_at + size_t{i} * sizeof(BakedTable::ParentEntry) +
+                 offsetof(BakedTable::ParentEntry, tag));
+    }
+    for (uint32_t i = 0; i < id_count; ++i)
+        if (idx[i].row >= rows) return refuse(kDamaged);
+    if (!d.ok) return refuse(kDamaged);
     return ref;
 }
 

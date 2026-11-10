@@ -1,5 +1,6 @@
 // Console (host/console.hpp): lines in, replies out, on 127.0.0.1.
 
+#include <baker/clock.hpp>
 #include <baker/host/console.hpp>
 
 #include "common/containers.hpp"
@@ -7,6 +8,7 @@
 #include "host/sockets.hpp"
 
 #include <atomic>
+#include <utility>
 
 namespace baker::host {
 namespace {
@@ -41,7 +43,7 @@ struct Console::Impl {
         Str out;  // replies not yet sent
     };
 
-    explicit Impl(Context& c) : ctx(c) {}
+    Impl(Context& c, ConsoleOptions o) : ctx(c), options(std::move(o)) {}
     Impl(const Impl&) = delete;
     Impl& operator=(const Impl&) = delete;
     ~Impl() {
@@ -70,28 +72,48 @@ struct Console::Impl {
         return error;
     }
 
-    // Reads what the client sent, answers its complete lines, and sends what it can. False
-    // once the client has gone.
-    bool serve(Client& c) {
+    // Reads what the client sent. False once the client has gone, or holds more than the
+    // cap of unanswered input.
+    bool receive(Client& c) const {
         char buffer[512];
         for (;;) {
+            if (options.max_bytes != 0 && c.in.size() > options.max_bytes) {
+                if (options.log)
+                    options.log(
+                        make_error(ErrorCode::Limit,
+                                   "the console dropped a client holding more than " +
+                                       detail::decimal(static_cast<int64_t>(options.max_bytes)) +
+                                       " bytes of unanswered input"));
+                return false;
+            }
             const auto n = recv(c.socket, buffer, static_cast<int>(sizeof buffer), 0);
             if (n == 0) return false;  // closed
-            if (n < 0) {
-                if (!net::would_block()) return false;
-                break;
-            }
+            if (n < 0) return net::would_block();
             c.in.append(std::string_view(buffer, static_cast<size_t>(n)));
         }
+    }
+
+    // Answers the client's complete lines, oldest first, until the poll's budget is spent or
+    // more than the cap of its replies waits unsent. False once the budget is spent.
+    bool answer_lines(Client& c) {
         size_t from = 0;
+        bool more = true;
         for (size_t end; (end = c.in.find('\n', from)) != Str::npos; from = end + 1) {
+            if (options.max_bytes != 0 && c.out.size() > options.max_bytes) break;
+            if (options.budget_ns != 0 && deadline == 0)
+                deadline = steady_now() + options.budget_ns;
             std::string_view line(c.in.data() + from, end - from);
             if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
             c.out += answer(line);
             c.out += "\n\n";  // a reply is its lines, then an empty line
+            if (deadline != 0 && steady_now() >= deadline) {
+                more = false;  // spent: what is left waits for the next poll
+                from = end + 1;
+                break;
+            }
         }
         if (from > 0) c.in.erase(0, from);
-        return flush(c);
+        return more;
     }
 
     // Sends as much of the client's pending replies as the socket takes now.
@@ -110,14 +132,23 @@ struct Console::Impl {
         return true;
     }
 
+    // Closes and forgets clients[i].
+    void drop(size_t i) {
+        net::close_socket(clients[i].socket);
+        clients.erase(clients.begin() + static_cast<std::ptrdiff_t>(i));
+    }
+
     Context& ctx;
+    ConsoleOptions options;
     net::socket_t listener = net::kNoSocket;
     uint16_t port = 0;
     Vec<Client> clients;
+    size_t turn = 0;        // the client whose lines the next poll answers first
+    uint64_t deadline = 0;  // when this poll's budget is spent; 0 until it answers a line
 };
 
-Console::Console(Context& ctx)
-    : impl_(detail::create<Impl>(default_allocator(MemoryKind::Tools), ctx)) {}
+Console::Console(Context& ctx, const ConsoleOptions& options)
+    : impl_(detail::create<Impl>(default_allocator(MemoryKind::Tools), ctx, options)) {}
 
 Console::~Console() {
     detail::destroy(default_allocator(MemoryKind::Tools), impl_);
@@ -159,25 +190,30 @@ size_t Console::clients() const noexcept {
 }
 
 void Console::poll() {
-    Impl& im = *impl_;
-    if (im.listener == net::kNoSocket) return;
-    for (net::socket_t s; (s = accept(im.listener, nullptr, nullptr)) != net::kNoSocket;) {
-        if (!net::set_nonblocking(s)) {
-            net::close_socket(s);
-            continue;
+    if constexpr (!kShipping) {  // shipping: never listening, and none of this is linked
+        Impl& im = *impl_;
+        if (im.listener == net::kNoSocket) return;
+        for (net::socket_t s; (s = accept(im.listener, nullptr, nullptr)) != net::kNoSocket;) {
+            if (!net::set_nonblocking(s)) {
+                net::close_socket(s);
+                continue;
+            }
+            // A frame's replies are one write; the next frame's must not wait on the
+            // client's acknowledgement of it, or a tool's many requests take 40 ms a frame.
+            net::set_nodelay(s);
+            im.clients.push_back({s, {}, {}});
         }
-        // A frame's replies are one write; the next frame's must not wait on the client's
-        // acknowledgement of it, or a tool's many requests take 40 ms a frame.
-        net::set_nodelay(s);
-        im.clients.push_back({s, {}, {}});
-    }
-    for (size_t i = 0; i < im.clients.size();) {
-        if (im.serve(im.clients[i])) {
-            ++i;
-        } else {
-            net::close_socket(im.clients[i].socket);
-            im.clients.erase(im.clients.begin() + static_cast<std::ptrdiff_t>(i));
-        }
+        for (size_t i = im.clients.size(); i-- > 0;)
+            if (!im.receive(im.clients[i])) im.drop(i);
+        // The budget is the poll's, shared by every client; each poll a different client goes
+        // first, so a busy one cannot keep the others waiting.
+        im.deadline = 0;
+        const size_t n = im.clients.size();
+        for (size_t k = 0; k < n; ++k)
+            if (!im.answer_lines(im.clients[(im.turn + k) % n])) break;
+        if (n != 0) im.turn = (im.turn + 1) % n;
+        for (size_t i = im.clients.size(); i-- > 0;)
+            if (!Impl::flush(im.clients[i])) im.drop(i);
     }
 }
 

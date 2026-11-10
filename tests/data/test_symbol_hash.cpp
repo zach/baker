@@ -3,7 +3,9 @@
 #include <baker/parse.hpp>
 #include <baker/symbol.hpp>
 
+#include <cstdio>
 #include <string>
+#include <vector>
 #include "ok.hpp"
 
 using namespace baker;
@@ -58,5 +60,27 @@ TEST_CASE("the hash is the same at compile time, at run time, and on the Symbol"
     for (int i = 0; i < 1000; ++i) {
         const std::string name = "n" + std::to_string(i * 7919);
         CHECK(Symbol(name).hash() == symbol_hash(name));
+    }
+}
+
+TEST_CASE("names chosen to share their hash's low bits intern as any names do") {
+    // Names whose public hash shares its low 12 bits: each its own symbol, found again, with
+    // the hash it promises. Before the table's homes were seeded, they all started their
+    // probe at one slot.
+    std::vector<std::string> names;
+    char buf[32];
+    for (uint64_t i = 0; names.size() < 300; ++i) {
+        const int n =
+            std::snprintf(buf, sizeof buf, "d312_%llx", static_cast<unsigned long long>(i));
+        const std::string_view s(buf, static_cast<size_t>(n));
+        if ((symbol_hash(s) & 0xFFF) == 0xABC) names.emplace_back(s);
+    }
+    std::vector<Symbol> syms;
+    for (const std::string& s : names) syms.emplace_back(s);
+    for (size_t i = 0; i < names.size(); ++i) {
+        CHECK(Symbol(names[i]) == syms[i]);
+        CHECK(syms[i].str() == names[i]);
+        CHECK(syms[i].hash() == symbol_hash(names[i]));
+        if (i > 0) CHECK(syms[i] != syms[i - 1]);
     }
 }

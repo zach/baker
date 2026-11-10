@@ -1,10 +1,14 @@
-// Curves: reading one from a key's values, and sampling it.
+// Curves: reading one from a key's values, and sampling it; the baked copies a
+// load keeps of the curves sampled from it.
 
 #include <baker/curve.hpp>
 
+#include "arena.hpp"
 #include "curve_access.hpp"
 
+#include <atomic>
 #include <cmath>
+#include <cstdint>
 
 namespace baker {
 
@@ -78,6 +82,22 @@ CurveProblem read_curve(const Values& values, Curve& out) noexcept {
     }
     const size_t first = i;
     if (first == values.size()) return {"has no points", first};
+    const auto count = static_cast<uint32_t>(values.size() - first);
+    // Values that are an array's own can be baked by its load; a copy already baked was
+    // checked when it was made, and the load's arrays have not changed since.
+    const Array* source = values.source();
+    if (source &&
+        reinterpret_cast<uintptr_t>(values.begin()) >=
+            reinterpret_cast<uintptr_t>(source->begin()) &&
+        reinterpret_cast<uintptr_t>(values.end()) <= reinterpret_cast<uintptr_t>(source->end())) {
+        if (const CurvePoint* baked =
+                detail::baked_curve(*source, values.begin() + first, count, false)) {
+            out = Curve(std::span<const CurvePoint>(baked, count), mode, extend);
+            return {};
+        }
+    } else {
+        source = nullptr;
+    }
     double last = 0;
     for (; i < values.size(); ++i) {
         CurvePoint p;
@@ -85,20 +105,19 @@ CurveProblem read_curve(const Values& values, Curve& out) noexcept {
         if (i > first && !(p.x > last)) return {"is not after the point before it in x", i};
         last = p.x;
     }
-    CurveReader::set(out, values.nodes().data() + first,
-                     static_cast<uint32_t>(values.size() - first), mode, extend);
+    CurveReader::set(out, values.begin() + first, count, mode, extend, source);
     return {};
 }
 
 CurvePoint Curve::point(size_t i) const noexcept {
-    if (points_) return points_[i];
+    if (!nodes_) return points_[i];
     CurvePoint p;
     (void)point_of(nodes_[i], p);  // read_curve checked it
     return p;
 }
 
 double Curve::x_at(size_t i) const noexcept {
-    if (points_) return points_[i].x;
+    if (!nodes_) return points_[i].x;
     return (*nodes_[i].try_array())[0].try_float().value_or(0);  // read_curve checked it
 }
 
@@ -168,6 +187,11 @@ double Curve::end_slope(size_t i) const noexcept {
 }
 
 double Curve::sample(double x) const noexcept {
+    if (sourced_) {
+        // Read from a load: sample its baked copy, made by the first sample.
+        if (const CurvePoint* baked = detail::baked_curve(*source_, nodes_, size_, true))
+            return Curve(std::span<const CurvePoint>(baked, size_), mode_, extend_).sample(x);
+    }
     if (size_ == 0) return 0;
     const CurvePoint first = point(0), last = point(size_ - 1);
     if (x >= first.x && x <= last.x) return within(x);
@@ -186,6 +210,127 @@ double Curve::sample(double x) const noexcept {
     }
     return 0;
 }
+
+namespace detail {
+
+// The baked curves of one load, made at the first sample of a curve read from it and
+// freed with it. A fixed table of slots, each filled once by a compare-and-swap and never
+// emptied until the load is freed, so a reader finds a copy with acquire loads alone and
+// no copy is freed while a Curve may view it. Bounded: at most kMaxEntries copies and
+// kMaxPoints points; a curve past either samples from its nodes.
+struct CurveEntry {
+    const Node* nodes;  // the key: the first point's node, and the count
+    uint32_t size;
+    uint32_t epoch;  // the cache's epoch when baked; a copy of another is stale
+    // CurvePoint points[size] follows.
+    [[nodiscard]] CurvePoint* points() noexcept { return reinterpret_cast<CurvePoint*>(this + 1); }
+    [[nodiscard]] static size_t bytes(uint32_t size) noexcept {
+        return sizeof(CurveEntry) + size_t{size} * sizeof(CurvePoint);
+    }
+};
+static_assert(sizeof(CurveEntry) % alignof(CurvePoint) == 0);
+
+struct CurveCache {
+    static constexpr uint32_t kSlots = 128;  // twice the entries, so a probe stays short
+    static constexpr uint32_t kMaxEntries = 64;
+    static constexpr uint32_t kMaxPoints = 8192;
+    std::atomic<uint32_t> epoch{0};  // moved by Array::set on the load's arrays
+    std::atomic<uint32_t> entries{0};
+    std::atomic<uint32_t> points{0};
+    std::atomic<CurveEntry*> slots[kSlots] = {};
+};
+
+namespace {
+
+uint32_t slot_of(const Node* nodes) noexcept {
+    const auto p = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(nodes));
+    return static_cast<uint32_t>((p >> 4) * 0x9E3779B97F4A7C15ull >> 57);  // 7 bits: 128
+}
+static_assert(CurveCache::kSlots == 128);
+
+// Takes `n` from `count` if it stays within `max`.
+bool reserve(std::atomic<uint32_t>& count, uint32_t n, uint32_t max) noexcept {
+    uint32_t now = count.load(std::memory_order_relaxed);
+    do {
+        if (n > max - now) return false;
+    } while (!count.compare_exchange_weak(now, now + n, std::memory_order_relaxed));
+    return true;
+}
+
+}  // namespace
+
+const CurvePoint* baked_curve(const Array& source, const Node* nodes, uint32_t size,
+                              bool bake) noexcept {
+    Owner& owner = owner_of(&source);
+    if (owner.kind != kArena) return nullptr;
+    std::atomic<CurveCache*>& home = Arena::of(owner).curves();
+    CurveCache* cache = home.load(std::memory_order_acquire);
+    if (!cache) {
+        if (!bake) return nullptr;
+        auto* made =
+            ::new (default_alloc(sizeof(CurveCache), alignof(CurveCache), MemoryKind::Trees))
+                CurveCache;
+        if (home.compare_exchange_strong(cache, made, std::memory_order_acq_rel,
+                                         std::memory_order_acquire)) {
+            cache = made;
+        } else {  // another thread made it first: `cache` is now its
+            made->~CurveCache();
+            default_free(made, sizeof(CurveCache), MemoryKind::Trees);
+        }
+    }
+    const uint32_t epoch = cache->epoch.load(std::memory_order_relaxed);
+    for (;;) {
+        uint32_t empty = CurveCache::kSlots;
+        uint32_t at = slot_of(nodes);
+        for (uint32_t probe = 0; probe < CurveCache::kSlots; ++probe) {
+            CurveEntry* e = cache->slots[at].load(std::memory_order_acquire);
+            if (!e) {
+                empty = at;
+                break;
+            }
+            if (e->nodes == nodes && e->size == size && e->epoch == epoch) return e->points();
+            at = (at + 1) % CurveCache::kSlots;
+        }
+        if (!bake || empty == CurveCache::kSlots) return nullptr;
+        if (!reserve(cache->entries, 1, CurveCache::kMaxEntries)) return nullptr;
+        if (!reserve(cache->points, size, CurveCache::kMaxPoints)) {
+            cache->entries.fetch_sub(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        auto* e = static_cast<CurveEntry*>(
+            default_alloc(CurveEntry::bytes(size), alignof(CurveEntry), MemoryKind::Trees));
+        e->nodes = nodes;
+        e->size = size;
+        e->epoch = epoch;
+        CurvePoint* p = e->points();
+        for (uint32_t i = 0; i < size; ++i) {
+            ::new (p + i) CurvePoint;
+            (void)point_of(nodes[i], p[i]);  // read_curve checked them
+        }
+        CurveEntry* expected = nullptr;
+        if (cache->slots[empty].compare_exchange_strong(expected, e, std::memory_order_acq_rel,
+                                                        std::memory_order_acquire))
+            return p;
+        // Another thread filled the slot first, perhaps with this curve: probe again.
+        default_free(e, CurveEntry::bytes(size), MemoryKind::Trees);
+        cache->entries.fetch_sub(1, std::memory_order_relaxed);
+        cache->points.fetch_sub(size, std::memory_order_relaxed);
+    }
+}
+
+void curves_changed(CurveCache& cache) noexcept {
+    cache.epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+void free_curves(CurveCache* cache) noexcept {
+    for (std::atomic<CurveEntry*>& slot : cache->slots)
+        if (CurveEntry* e = slot.load(std::memory_order_relaxed))
+            default_free(e, CurveEntry::bytes(e->size), MemoryKind::Trees);
+    cache->~CurveCache();
+    default_free(cache, sizeof(CurveCache), MemoryKind::Trees);
+}
+
+}  // namespace detail
 
 void Convert<Curve>::to(const Curve& c, ValueList& out) {
     const CurveNames& n = curve_names();

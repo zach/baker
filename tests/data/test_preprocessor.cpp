@@ -666,3 +666,58 @@ TEST_CASE("names a host's Reader interns are not the read's") {
     fs.session.limits.max_new_symbols = 8;
     CHECK(fs.load("host_main.dta") == "((x 1))");
 }
+
+TEST_CASE("max_macro_nodes counts each use of a macro, at the limit and one past") {
+    LoadSession s;
+    s.limits.max_macro_nodes = 6;
+    REQUIRE(read_string("[THREE 1 2 3]\n(x THREE THREE)\n", "m.dta", s));
+    s.limits.max_macro_nodes = 5;
+    const auto r = read_string("[THREE 1 2 3]\n(x THREE THREE)\n", "m.dta", s);
+    REQUIRE_FALSE(r);
+    CHECK(r.error().code() == ErrorCode::Limit);
+    CHECK(r.error().message() ==
+          "macro 'THREE' takes the read past 5 nodes from macros (ParseLimits::max_macro_nodes)");
+    CHECK(r.error().line() == 2);
+}
+
+TEST_CASE("max_macro_nodes counts what shared arrays hold, at every level") {
+    // PAIR is 7 nodes: its array and THREE twice. QUAD uses PAIR twice in its body, 14 nodes;
+    // so the read takes 6 + 14 + 14 = 34 from macros.
+    const char* text = "[THREE 1 2 3]\n[PAIR (THREE THREE)]\n[QUAD PAIR PAIR]\n(x QUAD)\n";
+    LoadSession s;
+    s.limits.max_macro_nodes = 34;
+    REQUIRE(read_string(text, "m.dta", s));
+    s.limits.max_macro_nodes = 33;
+    CHECK(read_string(text, "m.dta", s).error().code() == ErrorCode::Limit);
+
+    // A host's macro is counted at its first use: its one array, the two inside, and their
+    // four numbers, 7 a use.
+    LoadSession h;
+    auto body = read_string("((1 2) (3 4))", "body.dta", h);
+    REQUIRE(body);
+    h.define(Symbol("HOSTED"), *body);
+    h.limits.max_macro_nodes = 14;
+    REQUIRE(read_string("(x HOSTED HOSTED)", "m.dta", h));
+    h.limits.max_macro_nodes = 13;
+    CHECK(read_string("(x HOSTED HOSTED)", "m.dta", h).error().code() == ErrorCode::Limit);
+}
+
+TEST_CASE("a macro bomb is refused before it builds") {
+    // Each level uses the one below ten times: ten levels ask for 10^10 nodes, copied in the
+    // first text and shared in the second.
+    std::string copied = "[L0 0 0 0 0 0 0 0 0 0 0]\n", shared = copied;
+    for (int i = 1; i < 10; ++i) {
+        const std::string below = " L" + std::to_string(i - 1);
+        std::string uses;
+        for (int k = 0; k < 10; ++k) uses += below;
+        copied += "[L" + std::to_string(i) + uses + "]\n";
+        shared += "[L" + std::to_string(i) + " (" + uses.substr(1) + ")]\n";
+    }
+    for (const std::string& text : {copied + "(x L9)\n", shared + "(x L9)\n"}) {
+        LoadSession s;
+        const auto r = read_string(text, "bomb.dta", s);
+        REQUIRE_FALSE(r);
+        CHECK(r.error().code() == ErrorCode::Limit);
+        CHECK(r.error().message().find("ParseLimits::max_macro_nodes") != std::string::npos);
+    }
+}

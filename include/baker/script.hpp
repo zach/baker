@@ -684,11 +684,19 @@ public:
         if constexpr (!kShipping) set_doc(text);
         return *this;
     }
+    // How a special form is written, for the reference in place of the signature its
+    // parameters give (`Args`, `Raw`): the whole call, a line a form, "{wait_for seconds}".
+    // Dropped in shipping, as doc() is.
+    FuncRef& usage(std::string_view text) {
+        if constexpr (!kShipping) set_usage(text);
+        return *this;
+    }
     // `replacement` names what to use instead of a Deprecated function.
     FuncRef& status(Status status, Symbol replacement = {});
 
 private:
     void set_doc(std::string_view text);
+    void set_usage(std::string_view text);
     void* f_;
 };
 
@@ -915,7 +923,9 @@ public:
     template <class T>
     void add_type();
     // Sends {object method args...}: script handlers, then native methods, then the
-    // methods every object has (object.hpp).
+    // methods every object has (object.hpp). With up to 8 arguments, a message's most
+    // fields, the command comes from the Context's own, reused once warm; with more, each
+    // call allocates one.
     [[nodiscard]] Expected<Node> call(const Node& object, Symbol method,
                                       std::span<const Node> args = {});
     template <class... A>

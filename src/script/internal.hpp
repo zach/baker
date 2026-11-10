@@ -80,7 +80,7 @@ struct Counters {
 };
 
 struct Function : FuncRecord {
-    explicit Function(const Allocator& a) : doc(a), overloads(a) {}
+    explicit Function(const Allocator& a) : doc(a), usage(a), overloads(a) {}
 
     // Hot: what a call reads, first, beside the name. A function with one overload
     // is called from these without touching the overload list.
@@ -95,6 +95,7 @@ struct Function : FuncRecord {
     Status status = Status::Normal;
     Symbol replacement;  // for Deprecated
     Str doc;
+    Str usage;  // FuncRef::usage: how a special form is written, a line a form
     Vec<detail::Overload> overloads;
     Symbol file;  // where a script function is defined
     int32_t line = 0;
@@ -376,6 +377,12 @@ struct Context::Impl {
     Vec<std::pair<Node*, Node>> saved{alloc};  // values shadowed by bind()
     Vec<Node> kept{alloc};                     // evaluated values a call refers to
     Vec<Global> globals{alloc};
+    // A bit for each global, by Symbol::index(): which names a task does not capture.
+    Vec<uint64_t> global_bits{alloc};
+    [[nodiscard]] bool is_global(Symbol name) const noexcept {
+        const uint32_t i = name.index();
+        return i / 64 < global_bits.size() && (global_bits[i / 64] >> (i % 64) & 1u) != 0;
+    }
     Vec<Slot> slots{alloc};
     Vec<uint32_t> free_slots{alloc};
     Vec<ObjectHandle> by_name{alloc};  // by Symbol::index()
@@ -456,9 +463,10 @@ struct Context::Impl {
     Vec<SavedClass> autorun_classes{alloc};
     bool in_autorun = false;
 
-    // Context::call's commands, {object method args...}, one per size below kCallSizes,
-    // reused while nothing else holds them: a C++ call into script allocates nothing.
-    static constexpr size_t kCallSizes = 8;
+    // Context::call's commands, {object method args...}, one for each argument count up
+    // to a message's most fields, reused while nothing else holds them: a C++ call into
+    // script, or a message sent to it, allocates nothing.
+    static constexpr size_t kCallSizes = detail::kMaxMessageFields + 1;
     Ref<Array> call_arrays[kCallSizes];
 };
 

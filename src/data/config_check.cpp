@@ -365,14 +365,18 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
         return std::nullopt;
     };
     Vec<Node> below;
-    for (const Leaf& leaf : leaves_of(tree)) {
+    const Vec<Leaf> leaves = leaves_of(tree);
+    size_t chars = 0;
+    for (const Leaf& leaf : leaves) chars += leaf.path.size();
+    ReportTexts text(leaves.size(), chars);  // the entries' paths, interned never
+    for (const Leaf& leaf : leaves) {
         const Path path(leaf.path);
         const bool removal = detail::is_removal(*leaf.holder);
         const bool verb = detail::composes(*leaf.holder);
         const bool exists =
             verb ? finder.list(stack, path, below) : finder.values(stack, path, below);
         LayerEffectEntry e{};
-        e.path = Symbol(leaf.path);
+        e.path = text(leaf.path);
         e.values = RowValues({leaf.values.data(), leaf.values.size()});
         e.folded = leaf.folded;
         e.op = op_of(*leaf.holder);
@@ -419,7 +423,7 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
     declarations_of(session, tree.file(), {}, decls);
     for (const Declaration& d : decls) {
         LayerEffectEntry e{};
-        e.path = d.name;
+        e.path = text(d.name.str());
         e.values = RowValues({&d.form, 1});
         e.declares = d.directive;
         e.source = Source{layer, d.file, d.line};
@@ -438,7 +442,7 @@ LayerReport run_check(const Basis& b, std::string_view name, const Ref<Array>& c
     Vec<Ref<Array>> layers(alloc);
     layers.assign(b.layers.data(), b.layers.data() + b.layers.size());
     layers.push_back(candidate);
-    const ValidatorStack with{*merged, {layers.data(), layers.size()}, session};
+    const ValidatorStack with{*merged, {layers.data(), layers.size()}, session, &tree};
     for (const Config::Validator* v : b.validators)
         (*v)(with, [&warnings](const Error& e) { warnings.push_back(e); });
 
@@ -498,7 +502,7 @@ LayerReport Config::Impl::check_left_out(const Config& c, const Ref<Array>& cand
                                          const LayerPolicy& policy) const {
     const Ref<Array> merged =
         detail::merge(*c.root(), *candidate, MergePolicy::Overwrite, merge_scratch);
-    const ValidatorStack with{*merged, stack_layers(candidate), session};
+    const ValidatorStack with{*merged, stack_layers(candidate), session, candidate.get()};
     Vec<Error> warnings(alloc);
     for (const Check& v : validators)
         if (!v.options.any_thread)

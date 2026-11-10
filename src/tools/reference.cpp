@@ -242,10 +242,20 @@ Str reference_text(const Context& ctx, const LoadSession* packs) {
         "`values...` takes the rest of the arguments.\n\n## Functions\n";
     for (const Function* f : fs) {
         out += "\n### `" + Str(f->name.str()) + "`\n\n";
-        for (const detail::Overload& o : f->overloads) {
-            Str sig = signature_text(o);
-            sig = sig.size() > 2 ? " " + sig.substr(1, sig.size() - 2) : "";
-            out += "- `{" + Str(f->name.str()) + sig + "}` → " + Str(o.result) + "\n";
+        if (!f->usage.empty()) {  // a special form: as it is written, a line a form
+            const std::string_view u = f->usage.view();
+            for (size_t at = 0; at <= u.size();) {
+                const size_t nl = std::min(u.find('\n', at), u.size());
+                const std::string_view line = u.substr(at, nl - at);
+                out += "- `" + Str(line) + "` → " + Str(f->overloads[0].result) + "\n";
+                at = nl + 1;
+            }
+        } else {
+            for (const detail::Overload& o : f->overloads) {
+                Str sig = signature_text(o);
+                sig = sig.size() > 2 ? " " + sig.substr(1, sig.size() - 2) : "";
+                out += "- `{" + Str(f->name.str()) + sig + "}` → " + Str(o.result) + "\n";
+            }
         }
         out += "\n";
         out += f->tier == Tier::Native ? "*Native" : "*Script";
@@ -319,7 +329,7 @@ Str reference_text(const Context& ctx, const LoadSession* packs) {
     return out;
 }
 
-// --- The reference as JSON (baker.reference/1.5, docs/reference-json.md) ---
+// --- The reference as JSON (baker.reference/1.6, docs/reference-json.md) ---
 
 const char* param_kind_name(detail::ParamKind k) {
     switch (k) {
@@ -388,7 +398,7 @@ void json_status(Str& out, Status status, Symbol replacement, std::string_view d
 
 Str reference_json(const Context& ctx, const LoadSession* packs) {
     const Context::Impl& impl = ctx.impl();
-    Str out = "{\n  \"schema\": \"baker.reference/1.5\",\n  \"functions\": [";
+    Str out = "{\n  \"schema\": \"baker.reference/1.6\",\n  \"functions\": [";
     Vec<const Function*> fs;
     for (const auto& f : impl.functions)
         if (!f->overloads.empty()) fs.push_back(f.get());
@@ -402,7 +412,17 @@ Str reference_json(const Context& ctx, const LoadSession* packs) {
         json_string(out, f.tier == Tier::Native ? "native" : "script");
         out += ", ";
         json_status(out, f.status, f.replacement, f.doc);
-        out += ", \"file\": ";
+        out += ", \"usage\": [";  // a special form's, a line a form (1.6)
+        if (!f.usage.empty()) {
+            const std::string_view u = f.usage.view();
+            for (size_t at = 0; at <= u.size();) {
+                const size_t nl = std::min(u.find('\n', at), u.size());
+                if (at) out += ", ";
+                json_string(out, u.substr(at, nl - at));
+                at = nl + 1;
+            }
+        }
+        out += "], \"file\": ";
         json_string(out, f.file.str());
         out += ", \"line\": " + detail::decimal(f.line) + ", ";
         json_overloads(out, f.overloads);

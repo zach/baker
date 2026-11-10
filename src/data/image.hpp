@@ -25,6 +25,10 @@ struct LoadedImage {
 
 // Reads the image at `path` through the session's reader (or the disk), checking its
 // header and hash.
+// A layer section of an image read_image accepted: read as read_cache_bytes reads a cache,
+// without the cache's own checksum, which the image's covered.
+[[nodiscard]] Expected<Ref<Array>> read_image_layer(std::string_view bytes, std::string_view name,
+                                                    LoadSession& session);
 [[nodiscard]] Expected<LoadedImage> read_image(std::string_view path, const LoadSession& session,
                                                const Allocator& alloc);
 

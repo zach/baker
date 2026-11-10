@@ -14,7 +14,8 @@
 //   for (uint32_t i : moves.children_of("kestrel"_sym)) ... // one parent's records
 //
 // A table is one block from the Config's allocator: the rows, a pool its strings, lists
-// and curves point into, and three indices (keys and aliases, IDs, parents). It is
+// and curves point into (each distinct string once), and the indices: keys and aliases,
+// parents, and, for a view marked (@view by_id), the records' IDs. It is
 // refcounted: a Table<T> handle keeps its block while it is held, so a reload that
 // rebuilds the table takes nothing from a reader. Rows are in the merged tree's order,
 // grouped by parent; an index is stable across a reload while the table's set of records
@@ -76,6 +77,7 @@ struct TableSpec {
     uint32_t row_size = 0;   // sizeof(T)
     uint32_t row_align = 0;  // alignof(T)
     std::span<const ViewFixup> fixups;
+    bool by_id = false;                 // T::kById: keep an ID column and index
     void (*init)(void* row) = nullptr;  // new (row) T{}
     ViewRead read = nullptr;            // ViewReader<T>::read
 };
@@ -93,9 +95,12 @@ public:
     }
     [[nodiscard]] uint32_t row_size() const noexcept { return row_size_; }
     [[nodiscard]] uint64_t digest() const noexcept { return digest_; }
-    // The record's key, and its (@id ...) or an empty one.
+    // The record's key, and its (@id ...) or an empty one. A table keeps the IDs only when
+    // its view is (@view by_id): without, id_of is always empty.
     [[nodiscard]] Symbol key_of(uint32_t i) const noexcept;
     [[nodiscard]] RecordId id_of(uint32_t i) const noexcept;
+    // Whether the table keeps an ID column and index: its view's kById.
+    [[nodiscard]] bool by_id() const noexcept { return ids_ != nullptr; }
     // The row keyed `key` in a table whose shape's (@at ...) has no `*`; a key that is a
     // record's (@aka ...) resolves to it.
     [[nodiscard]] std::optional<uint32_t> index_of(Symbol key) const noexcept;
@@ -108,6 +113,7 @@ public:
         return index_of(std::string_view(path));
     }
     [[nodiscard]] std::optional<uint32_t> index_of(const Path& path) const noexcept;
+    // The row whose (@id ...) is `id`; nullopt in a table whose view is not (@view by_id).
     [[nodiscard]] std::optional<uint32_t> index_of(RecordId id) const noexcept;
     // The rows under the parent tagged `parent` (the shape's last `*`), contiguous; empty
     // for none, or for a table with no `*`.
@@ -129,6 +135,7 @@ public:
     struct IdEntry {
         RecordId id;
         uint32_t row = 0;
+        uint32_t zero = 0;  // no padding: an image of the same data is the same bytes
     };
     struct ParentEntry {
         Symbol tag;
@@ -148,7 +155,8 @@ private:
     uint64_t digest_ = 0;
     size_t block_bytes_ = 0;
     const void* rows_at_ = nullptr;
-    // Per row: its wildcards() ancestor tags, then its key; and its ID.
+    // Per row: its wildcards() ancestor tags, then its key; and its ID, or null without
+    // (@view by_id).
     const Symbol* tags_ = nullptr;
     const RecordId* ids_ = nullptr;
     const KeyEntry* keys_ = nullptr;
@@ -220,6 +228,7 @@ Expected<void> add_table(Config& cfg) {
         .row_size = sizeof(T),
         .row_align = alignof(T),
         .fixups = T::fixups(),
+        .by_id = T::kById,
         .init = [](void* row) { new (row) T{}; },
         .read = &view_detail::read_erased<T>,
     });

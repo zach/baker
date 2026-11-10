@@ -8,6 +8,8 @@
 #include "image.hpp"
 
 #include <algorithm>
+#include <functional>
+#include <optional>
 
 #if defined(_MSC_VER)
 #define BAKER_INLINE __forceinline
@@ -148,6 +150,341 @@ void Config::Impl::log_edit(ScratchEntry& owner, const Node* before, uint32_t be
     }
 }
 
+// --- The change log ---
+
+void Config::Impl::begin_change(Symbol name) {
+    if (changes.open++ == 0) {
+        changes.name = name;
+        changes.time_ns = now();
+        changes.pending.clear();
+        changes.pending_written.clear();
+    }
+}
+
+void Config::Impl::add_change(ChangeRecord record) {
+    changes.pending.push_back(std::move(record));
+}
+
+void Config::Impl::close_change() {
+    if (changes.open == 0) return;
+    --changes.open;
+    if (changes.open != 0) return;
+    if (changes.pending.empty() && changes.pending_written.empty()) return;
+    Transaction t;
+    t.id = ++changes.count;
+    t.name = changes.name;
+    t.time_ns = changes.time_ns;
+    t.records = List<ChangeRecord>({changes.pending.data(), changes.pending.size()});
+    t.written = List<WrittenLine>({changes.pending_written.data(), changes.pending_written.size()});
+    changes.pending.clear();
+    changes.pending_written.clear();
+    // The state before this transaction is the state after the last applied one (every
+    // change in between was recorded), or the one the log began at; a new transaction
+    // after an undo drops the undone ones.
+    ConfigSnapshot before = changes.done > 0       ? changes.ring[changes.done - 1].after
+                            : changes.ring.empty() ? changes.origin
+                                                   : changes.ring[0].before;
+    changes.ring.erase(changes.ring.begin() + static_cast<ptrdiff_t>(changes.done),
+                       changes.ring.end());
+    changes.ring.push_back({std::move(t), before, snapshot()});
+    if (changes.ring.size() > changes.cap) changes.ring.erase(changes.ring.begin());
+    changes.done = changes.ring.size();
+}
+
+void Config::Impl::record_set(const Path& path, std::span<const Node> before,
+                              std::span<const Node> after, const Source& source, Symbol layer) {
+    if (!logging()) return;
+    ChangeRecord r;
+    r.kind = ChangeKind::Set;
+    Str dotted(alloc);
+    path.write(detail::str_out(dotted), path.size(), '.');
+    r.path = Symbol(dotted.view());
+    // make_from takes a mutable span: copied, as scratch copies.
+    const auto tree = [this](std::span<const Node> nodes) {
+        if (nodes.empty()) return Ref<Array>();
+        Vec<Node> copy(alloc);
+        copy.assign(nodes.data(), nodes.data() + nodes.size());  // EASTL: pointers
+        return Array::make_from(copy);
+    };
+    r.before = tree(before);
+    r.after = tree(after);
+    r.layer = layer;
+    r.source = source;
+    r.time_ns = now();
+    const bool own = changes.open == 0;
+    if (own) begin_change(Symbol("set"));
+    add_change(std::move(r));
+    if (own) close_change();
+}
+
+// The walk of two merged roots: where a subtree is the same object in both (the
+// merge shares what it did not change), nothing changed below it. A keyed child in one
+// root alone is a record added or removed, with its whole subtree; one in both with other
+// values is a Set at its path; a parent whose common keys come in another order is a
+// Reorder; a removed and an added child that share an ID, or whose new one's (@aka ...)
+// names the old key, are one Rename. A list a layer row grew or shrank with #append or
+// #drop is Append or Drop with the row's operand.
+namespace {
+
+Symbol dotted_path(const Str& path, Symbol tag) {
+    Str p = path;
+    if (!p.empty()) p += '.';
+    p += tag.str();
+    return Symbol(p.view());
+}
+
+Ref<Array> whole(const Array& a) {
+    return Ref<Array>(const_cast<Array*>(&a));
+}
+
+// An array's own values: its nodes that are not keyed children.
+Ref<Array> values_tree(const Array& a, const Allocator& alloc) {
+    Vec<Node> own(alloc);
+    config_internal::leaf_values(a, own);
+    if (own.empty()) return nullptr;
+    return Array::make_from(own);
+}
+
+bool same_values(const Array& a, const Array& b, const Allocator& alloc) {
+    Vec<Node> x(alloc), y(alloc);
+    config_internal::leaf_values(a, x);
+    config_internal::leaf_values(b, y);
+    return config_internal::same_nodes({x.data(), x.size()}, {y.data(), y.size()});
+}
+
+bool alias_names(const Array& record, Symbol key) {
+    if (!record.meta_first()) return false;
+    const Array* aka = record.meta(detail::aka_tag());
+    if (!aka) return false;
+    for (const Node& n : aka->values())
+        if (n.is(key)) return true;
+    return false;
+}
+
+}  // namespace
+
+void Config::Impl::record_commit(const Config& c, const Array& before, const Array& after,
+                                 Symbol trigger) {
+    const bool own = changes.open == 0;
+    if (own) begin_change(trigger);
+    walk_changes(c, before, after, Symbol());
+    if (own) close_change();
+}
+
+// `fixed`: every record's layer, for a layer's own tree; empty for the merged tree, where
+// the layer that supplies each value is found.
+void Config::Impl::walk_changes(const Config& c, const Array& before, const Array& after,
+                                Symbol fixed) {
+    struct Half {  // an added or removed child at one parent, for the rename match
+        const Array* array;
+        bool added;
+        size_t record;  // its record's index in pending
+    };
+    const uint64_t time = now();
+    // The layer that wrote a path's value now: the highest enabled one composing it, with
+    // its row (for the verb), else the one its source names.
+    const auto writer_of = [&](Symbol path, const Array*& row) -> Symbol {
+        row = nullptr;
+        if (!fixed.empty()) return fixed;
+        const Path p(path.str());
+        for (size_t i = layers.size(); i-- > 0;)
+            if (layers[i].options.enabled && composes_at(i, p)) {
+                row = config_internal::row_at(*layers[i].root, p, alias_root());
+                return Symbol(layers[i].name.view());
+            }
+        const auto s = c.source(p);
+        return s ? s->layer : Symbol();
+    };
+    auto walk = [&](auto&& self, const Array& a, const Array& b, const Str& path) -> void {
+        if (&a == &b) return;
+        Vec<Half> here(alloc);
+        Vec<Symbol> order_a(alloc), order_b(alloc);
+        const uint32_t fa = a.tag().empty() ? 0 : 1, fb = b.tag().empty() ? 0 : 1;
+        for (uint32_t i = fb; i < b.size(); ++i)
+            if (const Array* cb = b[i].try_array();
+                cb && !cb->tag().empty() && !cb->tag().is_meta())
+                order_b.push_back(cb->tag());
+        for (uint32_t i = fa; i < a.size(); ++i) {
+            const Array* ca = a[i].try_array();
+            if (!ca || ca->tag().empty() || ca->tag().is_meta()) continue;
+            const Symbol tag = ca->tag();
+            if (std::find(order_a.begin(), order_a.end(), tag) != order_a.end()) continue;
+            order_a.push_back(tag);
+            const Array* cb = b.try_find(tag);
+            const Symbol child_path = dotted_path(path, tag);
+            if (!cb) {
+                ChangeRecord r;
+                r.kind = ChangeKind::Remove;
+                r.path = child_path;
+                r.id = ca->record_id();
+                r.before = whole(*ca);
+                r.time_ns = time;
+                if (!fixed.empty()) r.source = Source{fixed};
+                here.push_back({ca, false, changes.pending.size()});
+                add_change(std::move(r));
+                continue;
+            }
+            if (ca == cb) continue;
+            if (!same_values(*ca, *cb, alloc)) {
+                ChangeRecord r;
+                r.kind = ChangeKind::Set;
+                r.path = child_path;
+                r.id = cb->record_id();
+                r.before = values_tree(*ca, alloc);
+                r.after = values_tree(*cb, alloc);
+                r.time_ns = time;
+                if (!fixed.empty()) r.source = Source{fixed};
+                const Array* row = nullptr;
+                r.layer = writer_of(child_path, row);
+                if (row) {
+                    const detail::Marker m = detail::verb_of(*row);
+                    if (m == detail::Marker::Append || m == detail::Marker::Drop) {
+                        r.kind =
+                            m == detail::Marker::Append ? ChangeKind::Append : ChangeKind::Drop;
+                        Vec<Node> operand(alloc);
+                        config_internal::leaf_values(*row, operand);
+                        r.after = operand.empty() ? Ref<Array>() : Array::make_from(operand);
+                    }
+                }
+                add_change(std::move(r));
+            }
+            self(self, *ca, *cb, Str(child_path.str()));
+        }
+        for (uint32_t i = fb; i < b.size(); ++i) {
+            const Array* cb = b[i].try_array();
+            if (!cb || cb->tag().empty() || cb->tag().is_meta()) continue;
+            if (a.try_find(cb->tag())) continue;
+            if (std::any_of(here.begin(), here.end(),
+                            [&](const Half& p) { return p.added && p.array->tag() == cb->tag(); }))
+                continue;
+            ChangeRecord r;
+            r.kind = ChangeKind::Add;
+            r.path = dotted_path(path, cb->tag());
+            r.id = cb->record_id();
+            r.after = whole(*cb);
+            r.time_ns = time;
+            const Array* row = nullptr;
+            r.layer = writer_of(r.path, row);
+            here.push_back({cb, true, changes.pending.size()});
+            add_change(std::move(r));
+        }
+        // A removed and an added child that are one record: by ID, or by the alias.
+        for (const Half& gone : here) {
+            if (gone.added) continue;
+            for (const Half& came : here) {
+                if (!came.added) continue;
+                const RecordId id = gone.array->record_id();
+                const bool same = (!id.empty() && id == came.array->record_id()) ||
+                                  alias_names(*came.array, gone.array->tag());
+                if (!same) continue;
+                ChangeRecord& r = changes.pending[came.record];
+                r.kind = ChangeKind::Rename;
+                r.renamed_from = gone.array->tag();
+                r.before = whole(*gone.array);
+                changes.pending[gone.record].kind = ChangeKind::Reorder;  // marked, dropped below
+                changes.pending[gone.record].path = Symbol();
+                break;
+            }
+        }
+        // The common keys in another order, a renamed one under its new name: a Reorder.
+        Vec<Symbol> common_a(alloc), common_b(alloc);
+        for (Symbol t : order_a) {
+            for (const Half& gone : here)
+                if (!gone.added && gone.array->tag() == t) {
+                    const ChangeRecord& r = changes.pending[gone.record];
+                    if (r.kind == ChangeKind::Reorder && r.path.empty())  // renamed
+                        for (const Half& came : here)
+                            if (came.added && changes.pending[came.record].renamed_from == t)
+                                t = came.array->tag();
+                    break;
+                }
+            if (std::find(order_b.begin(), order_b.end(), t) != order_b.end())
+                common_a.push_back(t);
+        }
+        for (const Symbol t : order_b)
+            if (std::find(common_a.begin(), common_a.end(), t) != common_a.end())
+                common_b.push_back(t);
+        if (common_a.size() == common_b.size() &&
+            !std::equal(common_a.begin(), common_a.end(), common_b.begin())) {
+            ChangeRecord r;
+            r.kind = ChangeKind::Reorder;
+            r.path = path.empty() ? Symbol() : Symbol(path.view());
+            r.before = whole(a);
+            r.after = whole(b);
+            r.time_ns = time;
+            add_change(std::move(r));
+        }
+    };
+    walk(walk, before, after, Str(alloc));
+    // The renames' dropped halves.
+    changes.pending.erase(std::remove_if(changes.pending.begin(), changes.pending.end(),
+                                         [](const ChangeRecord& r) {
+                                             return r.kind == ChangeKind::Reorder &&
+                                                    r.path.empty() && r.before && !r.after;
+                                         }),
+                          changes.pending.end());
+}
+
+void Config::set_change_history(size_t capacity) {
+    if constexpr (kShipping) return;
+    impl_->changes.ring = Vec<Impl::Kept>(impl_->alloc);
+    impl_->changes.cap = capacity;
+    impl_->changes.count = 0;
+    impl_->changes.done = 0;
+    impl_->changes.origin = capacity ? impl_->snapshot() : ConfigSnapshot();
+    if (capacity) impl_->changes.ring.reserve(capacity + 1);
+}
+
+size_t Config::change_history() const noexcept {
+    return impl_->changes.cap;
+}
+
+size_t Config::transaction_count() const noexcept {
+    return impl_->changes.ring.size();
+}
+
+const Transaction& Config::transaction_at(size_t i) const noexcept {
+    return impl_->changes.ring[i].t;
+}
+
+// Undo and redo: a restore to the kept state, not recorded as a change.
+Expected<void> Config::undo() {
+    if constexpr (kShipping) return Unexpected(shipping("undo()"));
+    auto& ch = impl_->changes;
+    if (!impl_->logging()) return Unexpected(refused("the change log is off: nothing to undo"));
+    if (ch.done == 0) return Unexpected(make_error(ErrorCode::NotFound, "nothing to undo"));
+    ch.quiet = true;
+    auto r = restore(ch.ring[ch.done - 1].before);
+    ch.quiet = false;
+    if (!r) return r;
+    ch.ring[--ch.done].t.undone = true;
+    return {};
+}
+
+Expected<void> Config::redo() {
+    if constexpr (kShipping) return Unexpected(shipping("redo()"));
+    auto& ch = impl_->changes;
+    if (!impl_->logging()) return Unexpected(refused("the change log is off: nothing to redo"));
+    if (ch.done == ch.ring.size())
+        return Unexpected(make_error(ErrorCode::NotFound, "nothing to redo"));
+    ch.quiet = true;
+    auto r = restore(ch.ring[ch.done].after);
+    ch.quiet = false;
+    if (!r) return r;
+    ch.ring[ch.done++].t.undone = false;
+    return {};
+}
+
+void Config::begin_transaction(std::string_view name) {
+    if (!impl_->logging()) return;
+    impl_->begin_change(Symbol(name));
+}
+
+void Config::end_transaction() {
+    if (!impl_->logging()) return;
+    impl_->close_change();
+}
+
 Expected<Ref<Array>> Config::Impl::read_through_cache(std::string_view path, const Str& cache,
                                                       LoadSession& session, bool from_disk) const {
     if constexpr (kShipping) {  // a cache for this session, else the text; writes none
@@ -190,7 +527,8 @@ void Config::Impl::refresh_files() {
     ++stack_files_epoch;
 }
 
-Expected<void> Config::Impl::read(LayerState& layer, const LoadSession& before, uint64_t* read_ns,
+Expected<void> Config::Impl::read(const ReadContext& io, LayerState& layer,
+                                  const LoadSession& before, uint64_t* read_ns,
                                   Vec<Error>* warnings) const {
     auto session = Rc<LoadSession>::make(alloc, before);
     session->clear_autorun();
@@ -221,6 +559,7 @@ Expected<void> Config::Impl::read(LayerState& layer, const LoadSession& before, 
         }
         // A directory a load lists (#include_dir) is one of its files too.
         const LoadSession::Lister& lister = before.lister();
+        const LoadSession::Stamper& stamper = before.stamper();
         session->set_lister(
             [&](std::string_view dir, const Callback<void(std::string_view)>& entry) {
                 Vec<Str> entries(alloc);
@@ -233,11 +572,12 @@ Expected<void> Config::Impl::read(LayerState& layer, const LoadSession& before, 
             const uint64_t t0 = read_ns ? now() : 0;
             // Into the Config's buffer, which the parser copies from before it reads an
             // include through here again: a file read allocates only the parser's copy.
-            const bool ok = detail::read_with(reader, p, scan);
+            const bool ok = detail::read_with(reader, p, io.scan);
             if (read_ns) *read_ns += now() - t0;
             if (p != cache.view())
-                deps.push_back({Str(p, alloc), ok, ok ? detail::content_hash(scan) : 0});
-            if (ok) out(scan);
+                deps.push_back({Str(p, alloc), ok, ok ? detail::content_hash(io.scan) : 0, false,
+                                stamper ? stamper(p) : 0});
+            if (ok) out(io.scan);
             return ok;
         });
         root = cache.empty() ? read_file(layer.path, *session)
@@ -251,7 +591,7 @@ Expected<void> Config::Impl::read(LayerState& layer, const LoadSession& before, 
     // handler.
     const auto all = session->warnings();
     for (const Error& w : all.subspan(std::min(before.warnings().size(), all.size()))) {
-        if (warn) warn(w);
+        tell(io, w);
         if (warnings) warnings->push_back(w);
     }
     session->clear_warnings();
@@ -280,27 +620,33 @@ Expected<void> Config::Impl::read(LayerState& layer, const LoadSession& before, 
     return {};
 }
 
-bool Config::Impl::changed(const LayerState& layer, Symbol& first) const {
+bool Config::Impl::changed(const ReadContext& io, const LayerState& layer, Symbol& first) const {
     for (const Dep& d : layer.deps) {
         if (d.directory) {
-            const uint64_t listing = detail::list_with(base.lister(), d.path, listed, alloc);
+            const uint64_t listing = detail::list_with(io.base.lister(), d.path, io.listed, alloc);
             if ((listing != 0) != d.present || listing != d.hash) {
                 first = Symbol(d.path);
                 return true;
             }
             continue;
         }
-        const bool ok = detail::read_with(base.reader(), d.path, scan);
-        if (ok != d.present || (ok && detail::content_hash(scan) != d.hash)) {
+        // The same stamp: unchanged, and not opened. Otherwise read and hashed, so a
+        // save of the same text changes nothing, and the stamp it has now is kept for the
+        // next scan.
+        const uint64_t stamp = io.base.stamper() ? io.base.stamper()(d.path) : 0;
+        if (stamp != 0 && stamp == d.stamp) continue;
+        const bool ok = detail::read_with(io.base.reader(), d.path, io.scan);
+        if (ok != d.present || (ok && detail::content_hash(io.scan) != d.hash)) {
             first = Symbol(d.path);
             return true;
         }
+        d.stamp = stamp;
     }
     return false;
 }
 
-bool Config::Impl::stale(const LayerState& layer, Symbol& first) const {
-    return (!layer.path.empty() || !layer.dir.empty()) && changed(layer, first);
+bool Config::Impl::stale(const ReadContext& io, const LayerState& layer, Symbol& first) const {
+    return (!layer.path.empty() || !layer.dir.empty()) && changed(io, layer, first);
 }
 
 // --- Directories of layers ---
@@ -319,11 +665,12 @@ bool is_dta(std::string_view name) noexcept {
 
 }  // namespace
 
-Expected<void> Config::Impl::list_dir(LayerState& marker, Vec<Found>& found) const {
+Expected<void> Config::Impl::list_dir(const ReadContext& io, LayerState& marker,
+                                      Vec<Found>& found) const {
     found.clear();
     marker.deps.clear();
     Vec<Str> entries(alloc);
-    const uint64_t listing = detail::list_with(base.lister(), marker.dir, entries, alloc);
+    const uint64_t listing = detail::list_with(io.base.lister(), marker.dir, entries, alloc);
     marker.missing = listing == 0;
     marker.deps.push_back({marker.dir, !marker.missing, listing, true});
     if (marker.missing) {
@@ -333,7 +680,7 @@ Expected<void> Config::Impl::list_dir(LayerState& marker, Vec<Found>& found) con
     }
     const Str order = detail::join_path(marker.dir, "order.dta");
     Str text(alloc);
-    const bool ordered = detail::read_with(base.reader(), order, text);
+    const bool ordered = detail::read_with(io.base.reader(), order, text);
     marker.deps.push_back({order, ordered, ordered ? detail::content_hash(text) : 0});
     Vec<Found> named(alloc);
     for (const Str& e : entries) {
@@ -345,7 +692,7 @@ Expected<void> Config::Impl::list_dir(LayerState& marker, Vec<Found>& found) con
             // A subdirectory, if it holds a layer.dta; else watched for one. A name with an
             // extension is a file, and not looked into.
             Str inner = detail::join_path(e, "layer.dta");
-            if (detail::read_with(base.reader(), inner, scan))
+            if (detail::read_with(io.base.reader(), inner, io.scan))
                 named.push_back({Str(leaf, alloc), std::move(inner)});
             else
                 marker.deps.push_back({std::move(inner), false, 0});
@@ -365,15 +712,14 @@ Expected<void> Config::Impl::list_dir(LayerState& marker, Vec<Found>& found) con
             detail::directory_order(text, order, {names.data(), names.size()}, order_of, warnings);
         !r)
         return r;
-    if (warn)
-        for (const Error& w : warnings) warn(w);
+    for (const Error& w : warnings) tell(io, w);
     for (const uint32_t i : order_of) found.push_back(std::move(named[i]));
     return {};
 }
 
-Expected<size_t> Config::Impl::relist(Vec<LayerState>& ls, size_t at) const {
+Expected<size_t> Config::Impl::relist(const ReadContext& io, Vec<LayerState>& ls, size_t at) const {
     Vec<Found> found(alloc);
-    if (auto r = list_dir(ls[at], found); !r) return Unexpected(std::move(r).error());
+    if (auto r = list_dir(io, ls[at], found); !r) return Unexpected(std::move(r).error());
     const LayerState& marker = ls[at];
     const size_t old = members(ls, at);
     Vec<LayerState> next(alloc);
@@ -384,10 +730,9 @@ Expected<size_t> Config::Impl::relist(Vec<LayerState>& ls, size_t at) const {
             taken = (i <= at || i > at + old) && ls[i].name == f.name;
         for (const LayerState& n : next) taken = taken || n.name == f.name;
         if (taken) {
-            if (warn)
-                warn(refused(
-                    "'" + f.path + "' is not read: there is already a layer named '" + f.name + "'",
-                    Symbol(f.path)));
+            tell(io, refused("'" + f.path + "' is not read: there is already a layer named '" +
+                                 f.name + "'",
+                             Symbol(f.path)));
             continue;
         }
         const LayerState* was = nullptr;
@@ -412,21 +757,21 @@ Expected<size_t> Config::Impl::relist(Vec<LayerState>& ls, size_t at) const {
     return next.size();
 }
 
-Expected<void> Config::Impl::reread(Vec<LayerState>& ls, size_t from, uint64_t* read_ns,
-                                    uint32_t* files) const {
+Expected<void> Config::Impl::reread(const ReadContext& io, Vec<LayerState>& ls, size_t from,
+                                    uint64_t* read_ns, uint32_t* files) const {
     Vec<LayerState> fresh;
     for (size_t i = from; i < ls.size(); ++i) {
         LayerState l = ls[i];
-        const auto before = fresh.empty() ? session_below(ls, from) : fresh.back().after;
+        const auto before = fresh.empty() ? session_below(io, ls, from) : fresh.back().after;
         if (l.path.empty()) {
             l.after = before;
         } else {
             l.broken = false;
-            if (auto r = read(l, *before, read_ns); !r) {
+            if (auto r = read(io, l, *before, read_ns); !r) {
                 if (l.group.empty()) return r;
                 // A layer found in a directory that does not read is empty, and the rest
                 // stand; it is read again when its files change.
-                if (warn) warn(r.error());
+                tell(io, r.error());
                 l.root = Array::make(0, Symbol(l.file), 1);
                 l.map = nullptr;
                 l.after = before;
@@ -441,8 +786,103 @@ Expected<void> Config::Impl::reread(Vec<LayerState>& ls, size_t from, uint64_t* 
     return {};
 }
 
+namespace {
+
+// Whether merging `e` as (p0 (p1 ... (last values...))) only sets the values at its path: no
+// value is a key (a tagged array), nothing holds a verb or a pin, and no segment is
+// metadata. Then the merges of scratch's entries, one after another, give a tree that
+// one pass builds (ScratchTree).
+bool sets_values_only(const ScratchEntry& e) noexcept {
+    if (e.values->has_marker()) return false;  // sticky in set(): at worst, the fold
+    for (size_t i = 1; i < e.values->size(); ++i)
+        if (is_tagged((*e.values)[i])) return false;
+    for (size_t i = 0; i < e.path.size(); ++i)
+        if (e.path[i].name.is_meta()) return false;
+    return true;
+}
+
+// Scratch's overlay as the merges of its entries in order give it, when every entry sets
+// values only, in one pass. An array's children are its values, then its keys in
+// the order their paths first appear in scratch; its values are those of the last entry for
+// its path that has any, as Overwrite replaces values and an empty run changes nothing.
+// The entries sorted by path group each array's; each key is placed by the first entry
+// below it. The arrays are scratch's copies: set() changes an entry's own in place.
+class ScratchTree {
+public:
+    ScratchTree(const Vec<ScratchEntry>& scratch, const Allocator& alloc)
+        : s_(scratch), order_(alloc), keys_(alloc), nodes_(alloc) {}
+
+    Ref<Array> build() {
+        order_.resize(s_.size());
+        for (uint32_t i = 0; i < order_.size(); ++i) order_[i] = i;
+        std::sort(order_.begin(), order_.end(), [this](uint32_t a, uint32_t b) {
+            const Path& x = s_[a].path;
+            const Path& y = s_[b].path;
+            for (size_t i = 0; i < x.size() && i < y.size(); ++i)
+                if (x[i].name != y[i].name) return std::less<>()(x[i].name.id(), y[i].name.id());
+            return x.size() != y.size() ? x.size() < y.size() : a < b;  // a parent first
+        });
+        return array_at(0, static_cast<uint32_t>(order_.size()), 0);
+    }
+
+private:
+    struct Key {
+        uint32_t lo, hi;  // its entries, in order_
+        uint32_t first;   // the earliest of them in scratch
+    };
+
+    // The array at depth `depth` of the entries order_[lo, hi), which share their first
+    // `depth` segments: the overlay itself at depth 0.
+    Ref<Array> array_at(uint32_t lo, uint32_t hi, size_t depth) {
+        const size_t at = nodes_.size();  // this array's nodes, past its parents'
+        const ScratchEntry& any = s_[order_[lo]];
+        if (depth > 0) nodes_.emplace_back(any.path[depth - 1].name);
+        // The entries for this path itself sort first, in scratch's order. Paths are
+        // distinct, but a later entry with values would win over an earlier one, as in the
+        // fold.
+        const ScratchEntry* own = nullptr;
+        uint32_t i = lo;
+        for (; i < hi && s_[order_[i]].path.size() == depth; ++i)
+            if (!own || s_[order_[i]].values->size() > 1) own = &s_[order_[i]];
+        if (own)
+            for (size_t v = 1; v < own->values->size(); ++v) nodes_.push_back((*own->values)[v]);
+        // The keys below, each a run of the entries sharing its segment.
+        const size_t keys_at = keys_.size();
+        while (i < hi) {
+            const Symbol name = s_[order_[i]].path[depth].name;
+            Key k{i, i, order_[i]};
+            for (; k.hi < hi && s_[order_[k.hi]].path[depth].name == name; ++k.hi)
+                k.first = std::min(k.first, order_[k.hi]);
+            keys_.push_back(k);
+            i = k.hi;
+        }
+        std::sort(keys_.begin() + static_cast<ptrdiff_t>(keys_at), keys_.end(),
+                  [](const Key& a, const Key& b) { return a.first < b.first; });
+        for (size_t k = keys_at; k < keys_.size(); ++k) {
+            const Key key = keys_[k];  // by value: the call below grows keys_
+            Ref<Array> child = array_at(key.lo, key.hi, depth + 1);
+            nodes_.emplace_back(std::move(child));
+        }
+        keys_.resize(keys_at);
+        Ref<Array> made = Array::make_from(std::span<Node>(nodes_.data() + at, nodes_.size() - at));
+        nodes_.resize(at);
+        return made;
+    }
+
+    const Vec<ScratchEntry>& s_;
+    Vec<uint32_t> order_;
+    Vec<Key> keys_;
+    Vec<Node> nodes_;
+};
+
+}  // namespace
+
 Ref<Array> Config::Impl::scratch_root() const {
     if (scratch.empty()) return nullptr;
+    if (std::all_of(scratch.begin(), scratch.end(), sets_values_only))
+        return ScratchTree(scratch, alloc).build();
+    // A value that is a key, a verb or a pin merges as a layer's would: the entries merge
+    // one at a time, quadratic in them; set() makes such an entry only for a tagged value.
     Ref<Array> overlay = Array::make(0);
     for (const ScratchEntry& e : scratch) {
         Ref<Array> nest = Array::make_copy(e.values->nodes());
@@ -489,6 +929,7 @@ BAKER_INLINE void Config::Impl::retune(const ScratchEntry& e) const {
         t.bound_ = e.values;
         t.first_ = first;
         t.count_ = static_cast<uint32_t>(v.size());
+        tweak_index.touched(*options.tweaks, t);  // the next commit binds it to the merge
         if (n < 16) {
             few[n++] = &t;
         } else {
@@ -506,20 +947,24 @@ void Config::Impl::put(Config& c, const Path& target, std::span<const Node> valu
     ScratchEntry* found = nullptr;
     for (ScratchEntry& e : scratch)
         if (e.path == target) found = &e;
-    // The journal: the old value, from scratch or else from the stack.
+    // The journal: the old value, from scratch or else from the stack; the change
+    // log keeps the whole of it.
     Node before[4];
     uint32_t before_count = 0;
     Source source{scratch_name()};
+    std::optional<Vec<Node>> whole_before;  // made only with the log on: the fast path's cost
     if constexpr (!kShipping) {
         if (found) {
             const Values v = found->values->values();
             before_count = static_cast<uint32_t>(v.size());
             std::copy_n(v.begin(), std::min<uint32_t>(before_count, 4), before);
-        } else if (journal_cap) {
+            if (logging()) whole_before.emplace(alloc).assign(v.begin(), v.end());
+        } else if (journal_cap || logging()) {
             Vec<Node> now;
             if (value_nodes(*c.root_, target, now)) {
                 before_count = static_cast<uint32_t>(now.size());
                 std::copy_n(now.data(), std::min<uint32_t>(before_count, 4), before);
+                if (logging()) whole_before.emplace(alloc) = now;
             }
             auto s = c.source(target);
             source = s ? *s : Source{};
@@ -541,6 +986,14 @@ void Config::Impl::put(Config& c, const Path& target, std::span<const Node> valu
     c.scratch_dirty_ = true;
     ++c.epoch_;  // a live edit, though not a merge
     retune(*found);
+    if (logging()) {
+        record_set(target,
+                   whole_before ? std::span<const Node>(*whole_before) : std::span<const Node>(),
+                   values, source, scratch_name());
+        // The root holds the edit at once, so the next commit's walk starts from what the
+        // stack read.
+        c.apply_edits();
+    }
 }
 
 Ref<Array> Config::Impl::merged() const {
@@ -571,24 +1024,27 @@ void Config::Impl::refresh_read() {
 
 void Config::Impl::commit(Config& c, ReloadRecord& rec, uint64_t& t) {
     ++generation;
+    ++commits;
     const Ref<Array> before = std::move(c.root_);
     c.root_ = merged();
+    pending_merge = nullptr;  // the full merge has the edits
     merged_root = c.root_;
     c.scratch_dirty_ = false;
     refresh_read();
     if (!tables.empty() && !hold_tables) build_tables(*c.root_, false);
+    if (logging() && before) record_commit(c, *before, *c.root_, rec.trigger);
     if (!validators.empty()) {
-        const ValidatorStack stack{*c.root_, stack_layers(), as_read};
-        for (const Check& v : validators) v.fn(stack, warn);
+        const ValidatorStack stack{*c.root_, stack_layers(), as_read, pushed};
+        for (const Check& v : validators)
+            // A held report's check ran the any_thread ones over this stack.
+            if (!v.options.checks_only && !(pushed_held && v.options.any_thread)) v.fn(stack, warn);
     }
     lap(rec.merge_ns, t);
     ++c.epoch_;
     Vec<TweakBase*> moved;
     if (options.tweaks) {
         options.tweaks->begin_change();  // read_consistent waits until every tweak is set
-        options.tweaks->each([&](TweakBase& tw) {
-            if (tw.bind(*c.root_, warn)) moved.push_back(&tw);
-        });
+        tweak_index.rebind(*options.tweaks, c.root_, warn, moved);  // what changed
         options.tweaks->end_change();
     }
     rec.tweaks_changed = static_cast<uint32_t>(moved.size());
@@ -613,6 +1069,14 @@ void Config::Impl::change(Config& c, Symbol trigger) {
     uint64_t t = rec.start_ns;
     commit(c, rec, t);
     finish(c, rec, t);
+}
+
+void Config::Impl::change_pushed(Config& c, const Array* tree, bool held) {
+    pushed = tree;
+    pushed_held = held;
+    change(c, trigger_name("layer"));
+    pushed = nullptr;
+    pushed_held = false;
 }
 
 Expected<void> Config::Impl::may_change(const Config& c) const {
@@ -729,8 +1193,10 @@ Expected<size_t> Config::Impl::placement(LayerOptions& opts) const {
 Expected<void> Config::Impl::admit(const Config& c, const LayerOptions& opts, std::string_view name,
                                    const Ref<Array>& tree, uint64_t subject, bool on_top,
                                    std::span<const Node> commands, const LoadSession& session,
-                                   std::span<const Error> read_warnings) const {
-    switch (subject ? c.holds(opts, subject, on_top) : Holding::No) {
+                                   std::span<const Error> read_warnings, bool* held) const {
+    const Holding holding = subject ? c.holds(opts, subject, on_top) : Holding::No;
+    if (held) *held = holding != Holding::No;
+    switch (holding) {
         case Holding::Yes: return refuse_unless(*opts.checked);  // its verdict
         case Holding::LeftOut: return refuse_unless(check_left_out(c, tree, session, *opts.policy));
         case Holding::No: break;
@@ -817,14 +1283,18 @@ Expected<void> Config::Impl::push_read(Config& c, LayerState&& layer, LayerOptio
             for (const Error& w : found) warn(w);
         }
     }
+    bool held = false;
     if (opts.policy) {
         // A file has no report that holds: no check reads by path.
         const uint64_t subject = layer.text ? text_subject(layer.name, *layer.text) : 0;
         if (auto r = admit(c, opts, layer.name, layer.root, subject, *at == layers.size(),
-                           layer.after->autorun(), *layer.after, read_warnings);
+                           layer.after->autorun(), *layer.after, read_warnings, &held);
             !r)
             return r;
     }
+    // On top, what changed is the layer's own tree; placed lower, the layers above
+    // read again, and may change anywhere.
+    const Array* tree = layer.root.get();
     if (*at == layers.size()) {
         layers.push_back(std::move(layer));
     } else {
@@ -833,8 +1303,9 @@ Expected<void> Config::Impl::push_read(Config& c, LayerState&& layer, LayerOptio
         placed.insert(placed.begin() + static_cast<ptrdiff_t>(*at), std::move(layer));
         if (auto r = reread(placed, *at + 1); !r) return r;
         layers = std::move(placed);
+        tree = nullptr;
     }
-    change(c, trigger_name("layer"));
+    change_pushed(c, tree, held);
     return {};
 }
 
@@ -925,19 +1396,25 @@ Expected<void> Config::push_layer(std::string_view name, Ref<Array> overlay, Lay
         return Unexpected(refused("there is already a layer named '" + Str(name) + "'"));
     const auto at = impl_->placement(options);
     if (!at) return Unexpected(at.error());
+    bool held = false;
     if (options.policy)
         if (auto r = impl_->admit(*this, options, name, overlay, tree_subject(name, overlay.get()),
-                                  *at == impl_->layers.size(), {}, impl_->as_read, {});
+                                  *at == impl_->layers.size(), {}, impl_->as_read, {}, &held);
             !r)
             return r;
     LayerState layer(impl_->alloc);
     layer.name.assign(name);
     if (auto r = impl_->take_options(layer, options); !r) return r;
+    // A tree was not parsed here, so nothing counted its aliases and IDs: one walk, with an
+    // early exit, says whether the merge must resolve by them; an image's
+    // section carries the count, so its load walks nothing.
+    layer.aliases = !impl_->from_image && detail::has_identity(*overlay);
     layer.root = std::move(overlay);
     // An overlay adds no macros, so the layers above need no re-read.
     layer.after = impl_->session_below(impl_->layers, *at);
+    const Array* tree = layer.root.get();
     impl_->layers.insert(impl_->layers.begin() + static_cast<ptrdiff_t>(*at), std::move(layer));
-    impl_->change(*this, trigger_name("layer"));
+    impl_->change_pushed(*this, tree, held);
     return {};
 }
 
@@ -1139,12 +1616,18 @@ bool Config::edits_beneath(const Path& path) const noexcept {
 }
 
 Ref<Array> Config::with_edits() const {
-    return impl_->merged();
+    Impl& im = *impl_;
+    if (!im.pending_merge || im.pending_epoch != epoch_) {
+        im.pending_merge = im.merged();
+        im.pending_epoch = epoch_;
+    }
+    return im.pending_merge;
 }
 
 void Config::apply_edits() {
     if (!scratch_dirty_) return;
-    root_ = impl_->merged();
+    root_ = with_edits();  // the reads' merge, if they made one since the last edit
+    impl_->pending_merge = nullptr;
     impl_->merged_root = root_;
     scratch_dirty_ = false;
     if (!impl_->tables.empty() && !impl_->hold_tables) impl_->build_tables(*root_, false);
@@ -1165,12 +1648,13 @@ Expected<uint32_t> Config::push_image_layers(std::span<const ProjectLayer> layer
     };
     // The leading layers the image holds, pushed from it.
     impl_->hold_tables = true;
+    impl_->from_image = true;
     uint32_t taken = 0;
     for (const ProjectLayer& l : layers) {
         const detail::ImageSection* s =
             section_named(detail::ImageSection::Kind::Layer, l.name.str());
         if (!s) break;
-        auto tree = read_cache_bytes(s->bytes, l.name.str(), impl_->base);
+        auto tree = detail::read_image_layer(s->bytes, l.name.str(), impl_->base);
         if (!tree) {
             impl_->hold_tables = false;
             return Unexpected(std::move(tree).error());
@@ -1178,11 +1662,17 @@ Expected<uint32_t> Config::push_image_layers(std::span<const ProjectLayer> layer
         const LayerOptions o{.optional = l.optional, .enabled = l.enabled, .when = l.when.str()};
         if (auto r = push_layer(l.name.str(), std::move(*tree), o); !r) {
             impl_->hold_tables = false;
+            impl_->from_image = false;
             return Unexpected(std::move(r).error());
         }
+        // The section's record says whether the layer carries aliases or IDs:
+        // the merge resolves by them only when some layer does.
+        if (const auto li = impl_->find_layer(l.name.str()))
+            impl_->layers[*li].aliases = detail::SessionAccess::aliases(impl_->base) > 0;
         ++taken;
     }
     impl_->hold_tables = false;
+    impl_->from_image = false;
     // The tables: the image's block where it matches the registered view, else built.
     for (detail::TableSlot& slot : impl_->tables) {
         Ref<const BakedTable> block;
@@ -1295,6 +1785,127 @@ Expected<Source> Config::source(const Path& path) const {
 
 // --- Reload and telemetry ---
 
+// --- Reload in parts ---
+
+struct ReloadJob::State {
+    State(const Config::Impl& im, const ReloadRecord& r)
+        : impl(&im),
+          layers(im.layers),
+          base(im.base),
+          scan(im.alloc),
+          listed(im.alloc),
+          warnings(im.alloc),
+          rec(r),
+          commits(im.commits) {}
+    const Config::Impl* impl;
+    Vec<LayerState> layers;  // the stack at begin_reload, its trees shared; re-read in place
+    LoadSession base;        // the session at begin_reload
+    Str scan;
+    Vec<Str> listed;
+    Vec<Error> warnings;  // given to the warning handler at finish_reload
+    ReloadRecord rec;
+    uint64_t commits;  // the Config's at begin_reload
+    uint64_t t = 0;    // the end of the last stage run
+    bool ran = false;
+    bool any = false;  // a layer's files changed
+    std::optional<Error> error;
+};
+
+ReloadJob& ReloadJob::operator=(ReloadJob&& other) noexcept {
+    if (this != &other) {
+        ReloadJob dropped(std::move(*this));
+        state_ = other.state_;
+        other.state_ = nullptr;
+    }
+    return *this;
+}
+
+ReloadJob::~ReloadJob() {
+    if (state_) detail::destroy(state_->impl->alloc, state_);
+}
+
+bool ReloadJob::ran() const noexcept {
+    return state_ && state_->ran;
+}
+
+void ReloadJob::run() {
+    if (!state_ || state_->ran) return;
+    State& j = *state_;
+    const Config::Impl& im = *j.impl;
+    j.ran = true;
+    const ReadContext io{j.base, j.scan, j.listed, &j.warnings};
+    Vec<LayerState>& ls = j.layers;
+    uint64_t& t = j.t;
+    t = j.rec.start_ns;
+    size_t from = ls.size();
+    for (size_t i = 0; i < ls.size() && from == ls.size(); ++i)
+        if (im.stale(io, ls[i], j.rec.first_file)) from = i;
+    // A directory at or above the change is listed again if it changed.
+    for (size_t i = from; i < ls.size(); ++i) {
+        Symbol unused;
+        if (ls[i].dir.empty() || (i != from && !im.stale(io, ls[i], unused))) continue;
+        if (auto n = im.relist(io, ls, i); !n) {
+            im.lap(j.rec.scan_ns, t);
+            j.rec.layer = Symbol(ls[i].name);
+            j.rec.outcome = ReloadOutcome::ParseError;
+            j.error = std::move(n).error();
+            return;
+        }
+    }
+    im.lap(j.rec.scan_ns, t);
+    if (from == ls.size()) return;  // nothing changed
+    j.any = true;
+    j.rec.layer = Symbol(ls[from].name);
+    if (auto r = im.reread_stages(io, j.rec, ls, from, t); !r) j.error = std::move(r).error();
+}
+
+ReloadJob Config::begin_reload(const ReloadRequest& request) {
+    ReloadJob job;
+    if constexpr (kShipping) return job;
+    const ReloadRecord rec = impl_->begin(
+        request.trigger.empty() ? trigger_name("reload") : request.trigger, request.origin_ns);
+    job.state_ = detail::create<ReloadJob::State>(impl_->alloc, *impl_, rec);
+    return job;
+}
+
+Expected<ReloadOutcome> Config::finish_reload(ReloadJob job) {
+    if constexpr (kShipping) return ReloadOutcome::Refused;
+    if (job.empty()) return ReloadOutcome::Refused;
+    ReloadJob::State& j = *job.state_;
+    Impl& im = *impl_;
+    // Another Config's job, or one begun before a change to the stack: its reads are of
+    // a stack that is gone.
+    if (j.impl != impl_ || j.commits != im.commits) {
+        j.rec.outcome = ReloadOutcome::Refused;
+        if (j.impl == impl_) im.feed(*this, j.rec, im.finish(*this, j.rec, im.now()));
+        return ReloadOutcome::Refused;
+    }
+    job.run();
+    for (const Error& w : j.warnings)
+        if (im.warn) im.warn(w);
+    uint64_t t = j.t;
+    if (frozen_ && !im.options.live_layers) {
+        j.rec.outcome = ReloadOutcome::Refused;
+        im.feed(*this, j.rec, im.finish(*this, j.rec, t));
+        return ReloadOutcome::Refused;
+    }
+    if (j.error) {
+        im.feed(*this, j.rec, im.finish(*this, j.rec, t));
+        return Unexpected(std::move(*j.error));
+    }
+    if (!j.any) {
+        j.rec.outcome = ReloadOutcome::Unchanged;
+        im.feed(*this, j.rec, im.finish(*this, j.rec, t));
+        return ReloadOutcome::Unchanged;
+    }
+    im.layers = std::move(j.layers);
+    im.commit(*this, j.rec, t);
+    im.feed(*this, j.rec, im.finish(*this, j.rec, t));
+    return ReloadOutcome::Ok;
+}
+
+// In place, on this thread: a reload that finds nothing changed allocates nothing, where a
+// ReloadJob copies the stack it reads against.
 Expected<bool> Config::reload(const ReloadRequest& request) {
     if constexpr (kShipping) return false;
     ReloadRecord rec = impl_->begin(
@@ -1409,6 +2020,12 @@ Expected<void> Config::set(std::string_view path, const Node& value) {
             ++impl_->generation;
             ++epoch_;
             impl_->retune(e);
+            if (impl_->logging()) {  // one test with the log off
+                impl_->record_set(e.path, std::span<const Node>(&before, 1),
+                                  std::span<const Node>(&value, 1), Source{scratch_name()},
+                                  scratch_name());
+                apply_edits();
+            }
             return {};
         }
     }
@@ -1421,6 +2038,11 @@ Expected<void> Config::clear_scratch(std::string_view path) {
     auto& s = impl_->scratch;
     for (const ScratchEntry& e : s)
         if (path.empty() || e.path.matches(path)) impl_->settle(e, EditFate::Reverted, {});
+    // The log: the commit's walk records each dropped edit's value giving way
+    // to the files'; the old values were scratch's own.
+    const bool own = impl_->logging() && impl_->changes.open == 0;
+    if (own) impl_->begin_change(Symbol("clear_scratch"));
+    const size_t first = impl_->changes.pending.size();
     if (path.empty())
         s.clear();
     else
@@ -1428,6 +2050,9 @@ Expected<void> Config::clear_scratch(std::string_view path) {
                                [&](const ScratchEntry& e) { return e.path.matches(path); }),
                 s.end());
     impl_->change(*this, trigger_name("layer"));
+    for (size_t i = first; i < impl_->changes.pending.size(); ++i)
+        impl_->changes.pending[i].source = Source{scratch_name()};
+    if (own) impl_->close_change();
     return {};
 }
 
@@ -1457,14 +2082,18 @@ List<Symbol> Config::unsaved() const {
 
 // --- Snapshots ---
 
-ConfigSnapshot Config::snapshot() const {
-    auto* state = detail::create<ConfigSnapshot::State>(impl_->alloc, impl_->alloc);
-    state->layers = impl_->layers;
-    state->scratch = copy_scratch(impl_->scratch);
-    state->scratch_enabled = impl_->scratch_enabled;
+ConfigSnapshot Config::Impl::snapshot() const {
+    auto* state = detail::create<ConfigSnapshot::State>(alloc, alloc);
+    state->layers = layers;
+    state->scratch = copy_scratch(scratch);
+    state->scratch_enabled = scratch_enabled;
     ConfigSnapshot s;
     s.state_ = state;
     return s;
+}
+
+ConfigSnapshot Config::snapshot() const {
+    return impl_->snapshot();
 }
 
 Expected<void> Config::restore(const ConfigSnapshot& snapshot) {

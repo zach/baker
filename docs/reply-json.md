@@ -72,5 +72,5 @@ matters, read `text`.
 
 - One reply is one line, ending in a newline. Strings escape `"`, `\` and control
   characters (`\n`, `\t`, `\u00XX`); other characters are written as they are.
-- Versioning follows `check`'s (`check-json.md`): a field is only added with a new minor
+- Versioning follows [`check`'s](check-json.md#stability): a field is only added with a new minor
   version, and removed, renamed or changed only with a new major version.

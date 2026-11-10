@@ -6,9 +6,13 @@
 #include <baker/std_interop.hpp>
 #include <baker/tweak.hpp>
 
+#include <atomic>
 #include <bit>
 #include <cstdint>
 #include <string>
+#include <thread>
+#include <vector>
+#include "curve_access.hpp"
 #include "ok.hpp"
 
 using namespace baker;
@@ -206,5 +210,138 @@ TEST_CASE("a curve samples to the same bits on every compiler and platform") {
         CAPTURE(g.x);
         const Read r(g.curve);
         CHECK(std::bit_cast<uint64_t>(r.curve.sample(g.x)) == g.bits);
+    }
+}
+
+namespace {
+
+// Whether `c` samples a baked copy, not the tree's nodes.
+bool baked(const Curve& c) {
+    return CurveReader::points(c) != nullptr;
+}
+
+// The curve the first key of `tree` holds, read again as a frame reads it.
+Curve read_first(const Array& tree) {
+    Curve c;
+    REQUIRE_FALSE(read_curve(tree[0].try_array()->values(), c));
+    return c;
+}
+
+// The same curve read from its nodes with no array to bake it: the tree's own arithmetic.
+Curve unbaked(const Array& tree) {
+    const Values v = tree[0].try_array()->values();
+    Curve c;
+    REQUIRE_FALSE(read_curve(Values(v.nodes(), nullptr), c));
+    REQUIRE_FALSE(baked(c));
+    return c;
+}
+
+}  // namespace
+
+TEST_CASE("a curve read from a load bakes at its first sample, to the same bits") {
+    for (const char* text : {"(c (0 0.1) (1.3 2.7) (2.9 0.3) (4.1 3.3))",
+                             "(c catmull-rom loop (0 0.1) (1.3 2.7) (2.9 0.3) (4.1 3.3))",
+                             "(c linear extrapolate (0 0.1) (1.3 2.7 0.7 -1.9) (2.9 0.3))",
+                             "(c constant (0 1) (2 5) (3 -1))"}) {
+        CAPTURE(text);
+        const Read r(text);
+        const Curve tree = unbaked(*r.tree);
+        CHECK_FALSE(baked(r.curve));
+        CHECK_FALSE(baked(read_first(*r.tree)));  // reading alone bakes nothing
+        std::vector<CurvePoint> points;
+        for (size_t i = 0; i < tree.size(); ++i) points.push_back(tree.point(i));
+        const Curve host(points, tree.mode(), tree.extend());
+        for (int i = -20; i <= 70; ++i) {
+            const double x = i * 0.0731;
+            const auto bits = std::bit_cast<uint64_t>(tree.sample(x));
+            CHECK(std::bit_cast<uint64_t>(r.curve.sample(x)) == bits);  // the first bakes
+            CHECK(std::bit_cast<uint64_t>(host.sample(x)) == bits);
+        }
+        // A later read views the copy, with the same mode, extension and points.
+        const Curve again = read_first(*r.tree);
+        REQUIRE(baked(again));
+        CHECK(again.mode() == tree.mode());
+        CHECK(again.extend() == tree.extend());
+        REQUIRE(again.size() == tree.size());
+        for (size_t i = 0; i < tree.size(); ++i) {
+            CHECK(again.point(i).x == tree.point(i).x);
+            CHECK(again.point(i).y == tree.point(i).y);
+            CHECK(again.point(i).sloped == tree.point(i).sloped);
+        }
+        for (int i = -20; i <= 70; ++i)
+            CHECK(again.sample(i * 0.0731) == r.curve.sample(i * 0.0731));
+    }
+}
+
+TEST_CASE("a changed curve bakes again; one outside a load samples its nodes") {
+    // A new tree is new arrays, baked at their own first sample.
+    const Read first("(c (0 0) (10 10))");
+    CHECK(first.curve.sample(5) == 5);
+    const Read second("(c (0 0) (10 20))");
+    CHECK(second.curve.sample(5) == 10);
+    CHECK(read_first(*first.tree).sample(5) == 5);
+    // Array::set on a load's array: its curves bake again at their next sample.
+    REQUIRE(baked(read_first(*first.tree)));
+    auto* key = const_cast<Array*>((*first.tree)[0].try_array());  // NOLINT: a test edits it
+    key->set(2, Node(array(10, 30)));
+    const Curve edited = read_first(*first.tree);
+    CHECK_FALSE(baked(edited));
+    CHECK(edited.sample(5) == 15);
+    CHECK(baked(read_first(*first.tree)));
+    CHECK(read_first(*first.tree).sample(5) == 15);
+    // An array built outside a load has nowhere to keep a copy.
+    const Ref<Array> solo = Array::make_copy(key->nodes());
+    Curve built;
+    REQUIRE_FALSE(read_curve(solo->values(), built));
+    CHECK(built.sample(5) == 15);
+    REQUIRE_FALSE(read_curve(solo->values(), built));
+    CHECK_FALSE(baked(built));
+}
+
+TEST_CASE("a load bakes at most 64 curves; the rest sample their nodes") {
+    std::string text;
+    for (int i = 0; i < 70; ++i)
+        text += "(c" + std::to_string(i) + " (0 0) (10 " + std::to_string(i) + "))\n";
+    const auto tree = ok(read_string(text, "t.dta"));
+    int copies = 0;
+    for (int i = 0; i < 70; ++i) {
+        Curve c;
+        REQUIRE_FALSE(read_curve((*tree)[static_cast<size_t>(i)].try_array()->values(), c));
+        CHECK(c.sample(10) == i);
+        REQUIRE_FALSE(read_curve((*tree)[static_cast<size_t>(i)].try_array()->values(), c));
+        copies += baked(c) ? 1 : 0;
+        CHECK(c.sample(5) == doctest::Approx(i / 2.0));
+    }
+    CHECK(copies == 64);
+}
+
+TEST_CASE("threads read and sample one load's curves at once") {
+    // Run under ThreadSanitizer in CI: the first samples race to bake each curve.
+    std::string text;
+    for (int i = 0; i < 8; ++i)
+        text += "(c" + std::to_string(i) + " (0 0) (4 " + std::to_string(i) + ") (8 0))\n";
+    for (int round = 0; round < 4; ++round) {
+        const auto tree = ok(read_string(text, "t.dta"));
+        std::vector<double> want;
+        for (int i = 0; i < 8; ++i) {
+            Curve c;
+            REQUIRE_FALSE(read_curve(
+                Values((*tree)[static_cast<size_t>(i)].try_array()->values().nodes(), nullptr), c));
+            want.push_back(c.sample(3));
+        }
+        std::atomic<int> wrong{0};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < 4; ++t)
+            threads.emplace_back([&, t] {
+                for (int k = 0; k < 400; ++k) {
+                    const auto i = static_cast<size_t>((k + t) % 8);
+                    Curve c;
+                    if (read_curve((*tree)[i].try_array()->values(), c) || c.sample(3) != want[i])
+                        wrong.fetch_add(1);
+                }
+            });
+        for (std::thread& t : threads) t.join();
+        CHECK(wrong.load() == 0);
+        CHECK(baked(read_first(*tree)));
     }
 }

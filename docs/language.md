@@ -1,17 +1,59 @@
 # The Baker language
 
 This guide is the language as the person writing `.dta` files meets it: data, the
-preprocessor, packs and levels, shapes, script, and errors. The C++ side appears where
-it explains the data. Every built-in function is listed, with its signature, in the
-generated [script reference](script-reference.md); the patterns that put the pieces
-together are in the [cookbook](cookbook.md).
+preprocessor, packs and levels, layers, shapes, script, and errors. The C++ side appears where
+it explains the data; the C++ structs and tables generated from shapes are in
+[Baker from C++](cpp.md). Every built-in function is listed, with its signature, in the
+generated [script reference](script-reference.md); the patterns that put the pieces together
+are in the [cookbook](cookbook.md).
 
 - [Data](#data)
+  - [Nodes](#nodes)
+  - [Tags and lookup](#tags-and-lookup)
+  - [Metadata](#metadata)
+  - [Curves](#curves)
+  - [Data from before 0.7.0](#data-from-before-070)
 - [The preprocessor](#the-preprocessor)
+  - [A directory as a table: `#include_dir`](#a-directory-as-a-table-include_dir)
+  - [Macros](#macros)
+  - [Platforms and builds](#platforms-and-builds)
+  - [`#require`](#require)
 - [Packs and levels](#packs-and-levels)
+  - [Requires and versions](#requires-and-versions)
+  - [Harness metadata](#harness-metadata)
+  - [The one-way rule](#the-one-way-rule)
+  - [Generated files: `#origin`](#generated-files-origin)
+- [Layers](#layers)
+  - [Merging](#merging)
+  - [A list of records that repeats a tag](#a-list-of-records-that-repeats-a-tag)
+  - [Removing a key: `#remove`](#removing-a-key-remove)
+  - [Adding to and dropping from a list: `#append` and `#drop`](#adding-to-and-dropping-from-a-list-append-and-drop)
+  - [Pinning what a row was written against: `@was`](#pinning-what-a-row-was-written-against-was)
+  - [Rows: a key by its path](#rows-a-key-by-its-path)
+  - [Identity](#identity)
 - [Shapes](#shapes)
+  - [Field types](#field-types)
+  - [Lists and counts](#lists-and-counts)
+  - [Field metadata](#field-metadata)
+  - [What a shape governs: `@at`](#what-a-shape-governs-at)
+  - [Keyed children: `@keyed`](#keyed-children-keyed)
+  - [A shape that governs nothing](#a-shape-that-governs-nothing)
+  - [Keys of a table: `key_of`](#keys-of-a-table-key_of)
+  - [Assets](#assets)
+  - [Shapes in layers](#shapes-in-layers)
+  - [Checking against shapes](#checking-against-shapes)
+  - [Rules between values](#rules-between-values)
+  - [Views and tables](#views-and-tables)
 - [Script](#script)
+  - [Evaluation is lazy](#evaluation-is-lazy)
+  - [Operators, and braces written infix](#operators-and-braces-written-infix)
+  - [Variables](#variables)
+  - [Functions](#functions)
+  - [Objects and classes](#objects-and-classes)
+  - [Tasks](#tasks)
+  - [Checking before running](#checking-before-running)
 - [Errors](#errors)
+  - [Fatal errors](#fatal-errors)
 
 ## Data
 
@@ -78,8 +120,8 @@ auto cals = eggs->find_int("calories");                       // one level, by t
 A key written as text (`find_int("calories")`) is interned on every call; in a loop,
 write it as a literal, `find_int("calories"_sym)` (after `using namespace baker::literals;`),
 which interns once, or hold a `Symbol`. A name's hash, `Symbol::hash()` or `"calories"_hash`,
-is the same in every process and on every platform, for a save file or a `switch`
-(docs/cookbook.md, "Stable IDs for names").
+is the same in every process and on every platform, for a save file or a `switch` (see the
+cookbook's [Stable IDs for names](cookbook.md#stable-ids-for-names)).
 `Convert<T>` teaches lookups your own types; vectors, fixed arrays, and
 `std::string` (with `<baker/std_interop.hpp>`) are built in. When an array has several
 children with the same tag, lookup finds the first; `subarrays()` visits them all.
@@ -100,9 +142,11 @@ follows, and is never part of it.
 `player.speed` is `4.5` to every reader, and `player.tint` three numbers, so
 `get<std::array<float, 3>>("player.tint")` reads them; `values()` ends at the first
 metadata child, and `metadata()` lists the metadata. Baker's own readers use `@range`,
-`@step`, `@desc`, `@note`, `@kind`, `@group` and `@one_of` (tweaks and tuning panels), `@was` (a layer's pin, Merging),
-`@id` and `@aka` (a record's identity, Identity below) and the shape words below; `check` warns on any other `@` word, so a misspelt
-`(@rnage 0 10)` is found. A path reaches metadata like any child: `player.speed.@desc`.
+`@step`, `@desc`, `@note`, `@kind`, `@group` and `@one_of` (tweaks and tuning panels),
+`@was` (a layer's pin, [Pinning](#pinning-what-a-row-was-written-against-was)), `@id` and
+`@aka` (a record's identity, [Identity](#identity)) and the [shape](#shapes) words; `check`
+warns on any other `@` word, so a misspelt `(@rnage 0 10)` is found. A path reaches metadata
+like any child: `player.speed.@desc`.
 
 - **Metadata comes after the value.** `(x (@range 0 1) 5)` is an error at the array.
   Fields may come before, between and after metadata, so a record can carry its own
@@ -110,177 +154,6 @@ metadata child, and `metadata()` lists the metadata. Baker's own readers use `@r
 - **A field may have any name.** Without the `@`, `(kind ball)` is a field, wherever it
   sits: `(ball (kind ball) (pos -6 6.5))` is two fields.
 - **A lone `@`** is an ordinary symbol, so `('@' ...)` keys a record by the `@` key.
-- **Before the sigil**, metadata was told apart by its words and its place. `check` warns
-  where an array holds a value and a child tagged `range`, `step`, `desc`, `note`, `kind`,
-  `group` or `one_of`, which now reads as a field; `baker_migrate` (in `tools/`) rewrites
-  such files, inserting the `@` and changing nothing else, and `tools::migrate_text` gives
-  each such place with its fix.
-
-### Merging
-
-Two trees merge by tag, which is how a Config stacks layers and how `#merge` works. For
-each tagged array of the upper tree, the array with the same tag below is merged into
-recursively; everything else (the values) replaces what was below. So
-`(width 3)` over `(width 2 (@range 0 10))` gives `(width 3 (@range 0 10))`: a layer changes
-a value without restating its metadata. A tag the lower tree lacks is added.
-
-**A list of records that repeats a tag.** `(opening (build infantry) (build infantry) (build
-tank))` reads whole, as written, in the layer that writes it. A layer over it merges by tag,
-so its `(build ...)` merges into the first of the three, and a layer that restates the list,
-`(opening (build tank) (build infantry) (build infantry))`, folds all its rows into that one
-record: the stack reads the old list. A list a layer may change is written as plain values,
-`(opening infantry infantry tank)`, which a layer restates whole or extends with `#append`
-and `#drop`. A check of the layer warns at its row, naming the path and the tag,
-`layer_effect` gives the row's `folded` count (its later rows of the same tag), and `diff`
-tells two layers apart by their folded rows too. Quiet: a key new to the stack (added
-whole), and a table split across rows, `(items (bow 2))` and `(items (axe 3))`, whose keys
-merge one by one as written.
-
-**Removing a key.** In a Config layer, `(key #remove)` removes `key`, and everything under it,
-from the layers below:
-
-```dta
-(menu (debug_menu #remove))
-(enemies (exploit_boss #remove))
-```
-
-The marker is the key's only value; metadata may follow it. Anything else, such as
-`(a #remove 1)` or a bare `#remove`, is an error at load. A key the layers below lack
-removes nothing, a layer above may set the key again, and removing the layer brings the
-key back. The merged tree never holds a marker, and `#merge` ignores one (it only fills in
-what is missing). `layer_effect` lists a removal with the value `#remove`, and what it
-removed in `below`.
-
-**Adding to and dropping from a list.** A layer that restates a list replaces it, so two
-packages that each add an item leave only the top one's. `#append` and `#drop` change the
-list below instead:
-
-```dta
-; dlc_a.dta and dlc_b.dta, over (items climbing_gloves glider lamp_oil spyglass)
-(items #append rope)
-(items #append torch)          ; merged: ... spyglass rope torch
-; a patch: one tuple out, one in, the rest of the list untouched
-(households (cottage (things #drop (phone -2 4.6 180))
-                     (things #append (lamp -2 4 0))))
-```
-
-The verb is the key's first value, and what follows it, up to any metadata, is what it
-adds or drops: numbers, symbols, strings, or whole arrays, which here are elements and not
-keys (`(lamp -2 4 0)`). `#append` adds its operands after the values below, before their
-metadata; layers that append to one list apply in stack order, so their placement orders
-the list. `#drop` removes, for each operand, the first value below that is equal to it, a
-tuple restated as written. A key with two verbs takes two rows, which apply in order. A
-key the layers below lack is made from an `#append`'s operands, and a `#drop` of it does
-nothing. As with `#remove`, the merged tree never holds a verb, `#merge` skips one, and a
-verb anywhere but a key's first value is an error at load. A verb is never written inside
-a `#shape`: a shape is declared whole.
-
-A composing row supplies no value of its own: `source()` names the layer whose list it
-changes, `explain` shows it as `Composes` with its verb, and `layer_effect`'s `op` names the
-verb. Its `values` are the operands, one node each (a record is one), and its `below` is the
-list the verb changes, every element of it, records too, with the source of the row that
-wrote that list: `(moves (jab ...) (heavy ...))` below `(moves #append (jab2 ...))` is two
-elements, and the merged list three. A `(@was ...)` pin on the row names that list. A check
-warns at the row when an `#append` adds a value already there (a layer left behind after its
-promotion would add it twice) or a `#drop` names one that is not. Writing a value back into
-a layer at or below a row that composes it is refused, since the verb would apply again over
-what is written; `promote` writes the list the verb makes.
-
-**Pinning what a row was written against.** `(@was v...)` is metadata on a layer's row: the
-value below the layer when the row was written.
-
-```dta
-; agent.dta
-(cpu (easy (reaction 26 (@was 30) (@note "easy blocked the first low kick too often"))))
-```
-
-When the layers below move, a check of the layer says so at the row: `'cpu.easy.reaction'
-was 30 when this row was written; the stack has 32`, which a policy with `warnings_refuse`
-turns into a refusal, and pushing the layer sends the same warning to the warning handler.
-`write_back_to(path, layer, true)` writes the pin, and `write_back` keeps the one a row
-has. A pin is metadata, so every reader of the value reads past it.
-
-### Identity
-
-A record may carry an identity, `(@id ...)`: 32 lowercase hex digits, the first `a` to `f`,
-minted by a tool when the record is made (the kit's `format --baker-mint-ids`) and written
-inside the record, so it travels with the data and survives a rename of the key:
-
-```dta
-(weapons (laser (@id b3c9a7e5f214d68a1e2c3b4d5e6f7081) (damage 3)))
-```
-
-References keep naming keys (`key_of`); the ID is for tools, change records and renames.
-`Array::record_id()` reads one; `find_by_id(root, id, &path)` finds the record that carries
-it, by a walk of the tree. `baker::id_validator()`, added with `add_validator`, reports two
-records that share an ID (a copied record) and a malformed one, as errors to the warning
-handler at every merge; the host kit's loop and `check` add it. A shipped cache written
-without metadata keeps `@id` and `@aka`: they are identity, not tool text.
-
-A renamed record keeps answering to its old key with `(@aka old)`, which the kit's
-`rename OLD NEW` writes, with the new key and every `key_of` reference: a layer
-that retunes `(weapons (laser ...))` merges into the record now named `plasma`, and a
-`(key_of weapons)` naming `laser` resolves to it (a key wins over an alias). A key that is also a sibling's alias is an error from `id_validator`. Aliases stay
-until someone removes them, since a shipped overlay may still name one; `check` lists an
-alias that no layer and no `key_of` names, as a finding. A stack with no alias pays
-nothing for them.
-
-A renamed field is the shape's to remember: `(hp int (@renamed_from health))` says `hp`
-was `health`. A record spelling the old name is checked as the field, with a
-warning from `check` saying so; a record with both names is an error, since the old one
-reaches no reader. The generated view reads either spelling, and `format` rewrites the old
-name to the new in every file of the stack, so a shipped overlay that still says `health`
-keeps working until it is next formatted. Nothing is renamed at load: `get<T>` reads the
-tree as written, and the migration happens once, in the text.
-
-IDs are minted by `format --baker-mint-ids TABLE`: every record of the table without one,
-or repeating another's (a copied record), gets a fresh one in the layer that declares it,
-written after its key. The library has no random source and mints none.
-
-### Rows: a key by its path
-
-A layer usually changes a few values deep in the tree. A **row** names each by its path, as
-`diff`, errors and the console print it: a parenthesized form at a file's top level whose
-first atom is a `/`-led path.
-
-```dta
-; agent.dta: one line a value
-(/fighters.kestrel.health 1100)
-(/fighters.kestrel.walk_back 1.7)          ; a row's own comment
-(/cpu.easy.reaction 26)
-(/menu.debug_menu #remove)
-(/shapes.boss_phase.enter_at float (@range 0 2))
-```
-
-reads as the tree `(fighters (kestrel (health 1100) (walk_back 1.7))) (cpu (easy (reaction
-26))) ...`: the rows sharing a prefix fold into one array a key, and below the parser
-nothing knows rows were written. The key is written as a path is (Tags and lookup):
-segments separated by `.` or `/`, a `'quoted'` one for a name holding either,
-`(/menu.'v1.2'.price 3)`, at most 16 segments. What follows the key is what follows a tag:
-values, metadata, children, or a verb: `#remove`, `#append` or `#drop`. A key's verb rows
-stay apart, in the order written, where its other rows fold.
-
-- **A file with rows holds each key once.** A value written twice, by two rows or by a row
-  and a nested array, is an error at the second, where a file without rows keeps the first
-  (Merging). So a list of records that repeats a tag, a file of `(scenario ...)` forms, is
-  written without rows.
-- **Only at the top level.** `(a (/b 1))` is an error; a key is never a macro, and the
-  body expands as any body does.
-- **Not a row:** a quoted `('/x' 1)`, a lone `/`, and a `/`-led symbol anywhere but the
-  head of a top-level array, such as `(path /usr/share)`. The printer quotes a `/`-led
-  head, so its text reads back as the same tree.
-- **Not an element.** `(/fighters.0.health 5)` is an error: rows name keys, and a list is
-  written whole.
-- **Writing.** `write_back` replaces a row's value in place, its comment kept.
-  `write_back_to` adds a key to a file of rows as a row beside the rows of its prefix, and
-  creates an absent layer file as rows; a nested file stays nested. `promote` writes a
-  layer of rows into a nested base as it writes a nested layer, and carries a removal:
-  the key's array is deleted from the target.
-- **The kit:** `diff --baker-rows` prints a layer's changes as rows, which paste into a
-  layer file.
-
-Rows are for layers: a value changed is a line, its key named. A base file of records
-stays nested, where a path repeated on every line would only add bytes.
 
 ### Curves
 
@@ -306,7 +179,17 @@ falloff by distance. It is a key's values: points `(x y)` in ascending x.
 - **In C++,** `get<Curve>(path)` and `Tweak<Curve>` read one (`<baker/curve.hpp>`), and
   `sample(x)` gives its value. **In script,** `{curve.sample path x}`.
 - **A layer replaces a whole curve,** points, interpolation and extension together, as it
-  replaces any key's values.
+  replaces any key's values ([Merging](#merging)).
+
+### Data from before 0.7.0
+
+This is for upgrading data written for a Baker before 0.7.0. Before the `@` sigil, metadata
+was told apart by its words and its place. `check` warns where an array holds a value and a
+child tagged `range`, `step`, `desc`, `note`, `kind`, `group` or `one_of`, which now reads as
+a field; `baker_migrate` (in `tools/`) rewrites such files, inserting the `@` and changing
+nothing else, and `tools::migrate_text` gives each such place with its fix. The same tool
+rewrites the older declarations `(pack ...)`, `(origin ...)` and `(shapes ...)` as `#pack`,
+`#origin` and `#shape`.
 
 ## The preprocessor
 
@@ -318,7 +201,7 @@ in the order they are read; a Config's layers read in one session, bottom to top
 |---|---|
 | `#include path` | Splice another file's top-level nodes here. |
 | `#include_opt path` | The same; a missing file is not an error. |
-| `#include_dir path` | A child for each `.dta` file of a directory, named by its file and holding its nodes, and for each subdirectory, named by it and holding its own. See below. |
+| `#include_dir path` | A child for each `.dta` file of a directory, named by its file and holding its nodes, and for each subdirectory, named by it and holding its own. See [below](#a-directory-as-a-table-include_dir). |
 | `#require path` | The same, once per session: later `#require`s of that file, from any file, are no-ops. |
 | `#merge path` | Merge another file into the enclosing array, keeping existing keys and adding missing ones. |
 | `#ifdef N`, `#ifndef N`, `#else`, `#endif` | Conditional sections. |
@@ -327,9 +210,9 @@ in the order they are read; a Config's layers read in one session, bottom to top
 | `#undef N` | Remove a flag or macro. |
 | `#autorun {command}` | Collect the command into the session's `autorun()` list, for the host to run after loading. A Config reads each layer with a session of its own: `cfg.autorun()` returns its enabled layers' commands, bottom to top. |
 | `[N node ...]` | At the top level of a file: define macro N. |
-| `#pack (NAME ...)` | Declare the file a pack. See Packs and levels. |
-| `#origin ("source" ...)` | Declare the file generated. See Generated files. |
-| `#shape (NAME ...)` | Declare a shape. See Shapes. |
+| `#pack (NAME ...)` | Declare the file a pack. See [Packs and levels](#packs-and-levels). |
+| `#origin ("source" ...)` | Declare the file generated. See [Generated files](#generated-files-origin). |
+| `#shape (NAME ...)` | Declare a shape. See [Shapes](#shapes). |
 
 Paths may be quoted (`#include "shared/common.dta"`) or bare, and resolve against the
 including file's directory, then the session's include directories
@@ -437,9 +320,8 @@ A *pack* is a file that declares itself one with `#pack`, anywhere at its top le
 [boss.restart_phase {boss_phase_restart}]
 ```
 
-The host names the levels, hardest first; a pack's level is its rank among them (the
-spec calls this its layer; Baker says *level*, because a Config's layers are its stack of
-files):
+The host names the levels, hardest first; a pack's level is its rank among them (Baker says
+*level* rather than layer, because a Config's layers are its stack of files):
 
 ```cpp
 cfg.session().set_pack_levels({"engine", "game", "task"});
@@ -451,7 +333,9 @@ without a level, with a level not in the list, a second `#pack`, or one below th
 is an error at load. A form `(pack ...)` without the `#` is ordinary data, and a layer
 check warns of it.
 
-**Requires and versions.** Once a pack's file is read, each pack it `requires` must be
+### Requires and versions
+
+Once a pack's file is read, each pack it `requires` must be
 loaded, and a required version met; otherwise the load warns, located, and goes on.
 A version is dot-separated integers, compared part by part (`"1.10"` is after
 `"1.2"`), written as a string, a symbol, or an integer, never a float:
@@ -460,7 +344,9 @@ A version is dot-separated integers, compared part by part (`"1.10"` is after
 #pack (frost_dlc (level dlc) (version "1.0") (requires (base_game "1.2") season_pass))
 ```
 
-**Harness metadata.** A pack may also say who keeps it, whom it is for, and how far it has
+### Harness metadata
+
+A pack may also say who keeps it, whom it is for, and how far it has
 evolved, from an idea to a commodity:
 
 ```dta
@@ -472,7 +358,9 @@ evolved, from an idea to a commodity:
 `product`, or `commodity`, and anything else is an error at load. They are kept in the
 `Pack` the session records, for tools and reports; nothing else depends on them.
 
-**The one-way rule.** A harder pack may not depend on a softer one: engine code does not
+### The one-way rule
+
+A harder pack may not depend on a softer one: engine code does not
 reach into one task's harness. Baker warns, never fails, on two kinds of reach:
 
 - **Macros**, while reading: a pack's file expanding a macro that a softer pack defined
@@ -505,6 +393,193 @@ be traced to the spreadsheet it came from. The first value must be a string, and
 declares one origin. A form `(origin ...)` without the `#`, such as `(origin 0 0 0)`, is
 ordinary data.
 
+## Layers
+
+A Config reads its data as a stack of *layers*: files read bottom to top, in one session
+([The preprocessor](#the-preprocessor)), each merged over the ones below it. A base file of
+records is a layer, and so is a mod, a live-ops overlay or an agent's tuning above it. This
+section is what a layer may write: values merged by tag, keys removed, lists added to, pins on
+what a row was written against, rows that name a key by its path, and the identity that lets a
+record be renamed under the layers that name it.
+
+### Merging
+
+Two trees merge by tag, which is how a Config stacks layers and how `#merge` works. For
+each tagged array of the upper tree, the array with the same tag below is merged into
+recursively; everything else (the values) replaces what was below. So
+`(width 3)` over `(width 2 (@range 0 10))` gives `(width 3 (@range 0 10))`: a layer changes
+a value without restating its metadata. A tag the lower tree lacks is added.
+
+### A list of records that repeats a tag
+
+`(opening (build infantry) (build infantry) (build tank))` reads whole, as written, in the layer
+that writes it. A layer over it merges by tag, so its `(build ...)` merges into the first of the
+three, and a layer that restates the list, `(opening (build tank) (build infantry) (build
+infantry))`, folds all its rows into that one record: the stack reads the old list. A list a
+layer may change is written as plain values, `(opening infantry infantry tank)`, which a layer
+restates whole or extends with `#append` and `#drop`. A check of the layer warns at its row,
+naming the path and the tag, `layer_effect` gives the row's `folded` count (its later
+rows of the same tag), and `diff` tells two layers apart by their folded rows too. Quiet: a key
+new to the stack (added whole), and a table split across rows, `(items (bow 2))` and `(items
+(axe 3))`, whose keys merge one by one as written.
+
+### Removing a key: `#remove`
+
+In a Config layer, `(key #remove)` removes `key`, and everything under it, from the layers below:
+
+```dta
+(menu (debug_menu #remove))
+(enemies (exploit_boss #remove))
+```
+
+The marker is the key's only value; metadata may follow it. Anything else, such as
+`(a #remove 1)` or a bare `#remove`, is an error at load. A key the layers below lack
+removes nothing, a layer above may set the key again, and removing the layer brings the
+key back. The merged tree never holds a marker, and `#merge` ignores one (it only fills in
+what is missing). `layer_effect` lists a removal with `#remove` as its `values`, and what it
+removed in `below`.
+
+### Adding to and dropping from a list: `#append` and `#drop`
+
+A layer that restates a list replaces it, so two packages that each add an item leave only the
+top one's. `#append` and `#drop` change the list below instead:
+
+```dta
+; dlc_a.dta and dlc_b.dta, over (items climbing_gloves glider lamp_oil spyglass)
+(items #append rope)
+(items #append torch)          ; merged: ... spyglass rope torch
+; a patch: one tuple out, one in, the rest of the list untouched
+(households (cottage (things #drop (phone -2 4.6 180))
+                     (things #append (lamp -2 4 0))))
+```
+
+The verb is the key's first value, and what follows it, up to any metadata, is what it
+adds or drops: numbers, symbols, strings, or whole arrays, which here are elements and not
+keys (`(lamp -2 4 0)`). `#append` adds its operands after the values below, before their
+metadata; layers that append to one list apply in stack order, so their placement orders
+the list. `#drop` removes, for each operand, the first value below that is equal to it, a
+tuple restated as written. A key with two verbs takes two rows, which apply in order. A
+key the layers below lack is made from an `#append`'s operands, and a `#drop` of it does
+nothing. As with `#remove`, the merged tree never holds a verb, `#merge` skips one, and a
+verb anywhere but a key's first value is an error at load. A verb is never written inside
+a `#shape`: a shape is declared whole.
+
+A composing row supplies no value of its own: `source()` names the layer whose list it
+changes, `explain` shows it as `Composes` with its verb, and `layer_effect`'s `op` names the
+verb. Its `values` are the operands, one node each (a record is one), and its `below` is the
+list the verb changes, every element of it, records too, with the source of the row that
+wrote that list: `(moves (jab ...) (heavy ...))` below `(moves #append (jab2 ...))` is two
+elements, and the merged list three. A `(@was ...)` pin on the row names that list. A check
+warns at the row when an `#append` adds a value already there (a layer left behind after its
+promotion would add it twice) or a `#drop` names one that is not. Writing a value back into
+a layer at or below a row that composes it is refused, since the verb would apply again over
+what is written; `promote` writes the list the verb makes.
+
+### Pinning what a row was written against: `@was`
+
+`(@was v...)` is metadata on a layer's row: the value below the layer when the row was written.
+
+```dta
+; agent.dta
+(cpu (easy (reaction 26 (@was 30) (@note "easy blocked the first low kick too often"))))
+```
+
+When the layers below move, a check of the layer says so at the row: `'cpu.easy.reaction'
+was 30 when this row was written; the stack has 32`, which a policy with `warnings_refuse`
+turns into a refusal, and pushing the layer sends the same warning to the warning handler.
+`write_back_to(path, layer, true)` writes the pin, and `write_back` keeps the one a row
+has. A pin is metadata, so every reader of the value reads past it.
+
+### Rows: a key by its path
+
+A layer usually changes a few values deep in the tree. A **row** names each by its path, as
+`diff`, errors and the console print it: a parenthesized form at a file's top level whose
+first atom is a `/`-led path.
+
+```dta
+; agent.dta: one line a value
+(/fighters.kestrel.health 1100)
+(/fighters.kestrel.walk_back 1.7)          ; a row's own comment
+(/cpu.easy.reaction 26)
+(/menu.debug_menu #remove)
+(/shapes.boss_phase.enter_at float (@range 0 2))
+```
+
+reads as the tree `(fighters (kestrel (health 1100) (walk_back 1.7))) (cpu (easy (reaction 26)))
+...`: the rows sharing a prefix fold into one array a key, and below the parser nothing knows
+rows were written. The key is written as a path is ([Tags and lookup](#tags-and-lookup)):
+segments separated by `.` or `/`, a `'quoted'` one for a name holding either,
+`(/menu.'v1.2'.price 3)`, at most 16 segments. What follows the key is what follows a tag:
+values, metadata, children, or a verb: `#remove`, `#append` or `#drop`. A key's verb rows stay
+apart, in the order written, where its other rows fold.
+
+- **A file with rows holds each key once.** A value written twice, by two rows or by a row
+  and a nested array, is an error at the second, where a file without rows keeps the first
+  ([Merging](#merging)). So a list of records that repeats a tag, a file of `(scenario ...)`
+  forms, is written without rows.
+- **Only at the top level.** `(a (/b 1))` is an error; a key is never a macro, and the
+  body expands as any body does.
+- **Not a row:** a quoted `('/x' 1)`, a lone `/`, and a `/`-led symbol anywhere but the
+  head of a top-level array, such as `(path /usr/share)`. The printer quotes a `/`-led
+  head, so its text reads back as the same tree.
+- **Not an element.** `(/fighters.0.health 5)` is an error: rows name keys, and a list is
+  written whole.
+- **Writing.** `write_back` replaces a row's value in place, its comment kept.
+  `write_back_to` adds a key to a file of rows as a row beside the rows of its prefix, and
+  creates an absent layer file as rows; a nested file stays nested. `promote` writes a
+  layer of rows into a nested base as it writes a nested layer, and carries a removal:
+  the key's array is deleted from the target.
+- **The kit:** `diff --baker-rows` prints a layer's changes as rows, which paste into a
+  layer file.
+
+Rows are for layers: a value changed is a line, its key named. A base file of records
+stays nested, where a path repeated on every line would only add bytes.
+
+### Identity
+
+A record may carry an identity, `(@id ...)`: 32 lowercase hex digits, the first `a` to `f`,
+minted by a tool when the record is made (the kit's `format --baker-mint-ids`) and written
+inside the record, so it travels with the data and survives a rename of the key:
+
+```dta
+(weapons (laser (@id b3c9a7e5f214d68a1e2c3b4d5e6f7081) (damage 3)))
+```
+
+References keep naming keys ([`key_of`](#keys-of-a-table-key_of)); the ID is for tools, change
+records and renames. `Array::record_id()` reads one; `find_by_id(root, id, &path)` finds the
+record that carries it, by a walk of the tree. `baker::id_validator()`, added with
+`add_validator`, reports two records that share an ID (a copied record) and a malformed one, as
+errors to the warning handler at every merge; the host kit's loop and `check` add it. A shipped
+cache written without metadata keeps `@id` and `@aka`: they are identity, not tool text.
+
+IDs are minted by `format --baker-mint-ids TABLE`: every record of the table without one,
+or repeating another's (a copied record), gets a fresh one in the layer that declares it,
+written after its key. The library has no random source and mints none.
+
+#### Renamed records: `@aka`
+
+A renamed record keeps answering to its old key with `(@aka old)`, which the kit's
+`rename OLD NEW` writes, with the new key and every `key_of` reference: a layer that
+retunes `(weapons (laser ...))` merges into the record now named `plasma`, and a `(key_of
+weapons)` naming `laser` resolves to it (a key wins over an alias). A key that is also a
+sibling's alias is an error from `id_validator`. Aliases stay until someone removes them, since
+a shipped overlay may still name one; `check` lists an alias that no layer and no `key_of`
+names, as a finding. A layer may also name a record by its ID: `(weapons
+(a7d2c41e9b06f58a3c1d2e4f60718293 (damage 5)))` merges into the record that carries that `(@id
+...)`, whatever its key is now, so an agent's change set survives a rename it did not see. The
+record keeps its key; a tag that spells an ID no record carries is a new record, as any key is.
+A stack with no alias and no ID pays nothing for either.
+
+#### Renamed fields: `@renamed_from`
+
+A renamed field is the shape's to remember: `(hp int (@renamed_from health))` says `hp`
+was `health`. A record spelling the old name is checked as the field, with a
+warning from `check` saying so; a record with both names is an error, since the old one
+reaches no reader. The generated view reads either spelling, and `format` rewrites the old
+name to the new in every file of the stack, so a shipped overlay that still says `health`
+keeps working until it is next formatted. Nothing is renamed at load: `get<T>` reads the
+tree as written, and the migration happens once, in the text.
+
 ## Shapes
 
 A shape says what an array should look like: its fields, their types, and their ranges.
@@ -518,82 +593,113 @@ name. The session records it, and the tree never holds it:
    (cadence  float (@range 0.2 5) (@optional)))
 ```
 
-- **Types:** `int`, `float`, `bool`, `symbol`, `string`, `any`, `curve`, `(list T)`,
-  `(key_of TABLE)`, `(asset KIND)`, or another shape's name. A `curve` field's values are a curve (see
-  Curves, above), and its `(@range lo hi)` holds every point's y. A list may give its count:
-  `(position (list float 3))` holds exactly three values and `(tags (list symbol 1 4))` one to
-  four, and any other count is an error at the field. A softer pack may narrow the count, never
-  widen it.
-- **Metadata:** `@range`, `@step`, `@kind`, `@desc`, `@note` (as a tweak's), `@optional`,
-  `@renamed_from` (Identity, above), and, for a shape that generates a C++ view (Views,
-  below), `@view`, `@cxx` and `@cxx_name`. A field without `@optional` is required. A word without the `@` after a
-  field's type, or a `@` word the grammar lacks, is an error. A shape may describe itself
-  with its own `(@desc ...)` and `(@note ...)`, and its fields may be named anything,
-  `at` and `desc` included. A `symbol` or `(list symbol)` field may list the
-  symbols it allows, `(button symbol (@one_of light heavy kick special))`, in the order a tool
-  should offer them; a later layer declaring the field again may add to the list.
-- **What a shape governs:** every array tagged with its name, anywhere in the tree. `(at
-  ...)` narrows it to arrays whose ancestors' tags, from the root, are the ones listed;
-  `*` matches any one tag. The example above governs each `(boss_phase ...)` in
-  `(bosses (dragon (phases (boss_phase ...) (boss_phase ...))))`.
-- **Keyed children** are tagged by their own names, as in `(bosses (dragon ...) (golem
-  ...))`, so no shape is named after them. Declare the shape `(@keyed)`, with an `(@at ...)`
-  naming their parent, and it governs every child there, whatever its tag:
+### Field types
 
-  ```dta
-  #shape (move (@at fighters * moves) (@keyed)
-     (startup int (@range 1 60) (@kind frames)))
-  (fighters (kestrel (moves (jab (startup 4)) (heavy (startup 9)))))
-  ```
+A field's type is `int`, `float`, `bool`, `symbol`, `string`, `any`, `curve`, `(list T)`,
+[`(key_of TABLE)`](#keys-of-a-table-key_of), [`(asset KIND)`](#assets), or another shape's
+name. A `curve` field's values are a curve (see [Curves](#curves), above), and its
+`(@range lo hi)` holds every point's y.
 
-  Keyed data is what layers merge by name: a layer above can retune `heavy` alone. Data
-  written `(boss (name dragon) ...)` is governed by name, but repeated tags do not merge
-  one by one.
-- **A shape that governs nothing** checks nothing, silently: `(@at fighters moves)` for
-  `(@at fighters * moves)` is one level off. `shape::unused(tree, shapes, report)` warns of
-  each such shape, located where it is declared ("shape 'move' governs nothing: no array is
-  a child of fighters/moves"), and the kit's `check` runs it. A validator does not, since a
-  stack may lack some content for now.
-- **Keys of a table.** A field `(key_of TABLE)` holds the key of a record in TABLE, a
-  dotted path such as `weapons` or `items.weapons`; `(list (key_of TABLE))` holds several.
-  The table is the nearest one of that path that encloses the record, looked up outward, the
-  root last, so a fighter's move names one of that fighter's moves:
+### Lists and counts
 
-  ```dta
-  #shape (unit (@at units) (@keyed) (weapon (key_of weapons)))
-  #shape (move (@at fighters * moves) (@keyed) (cancel_into (list (key_of moves)) (@optional)))
-  (weapons (laser (damage 3)) (cannon (damage 9)))
-  (units (scout (weapon laser)))
-  (fighters (kestrel (moves (jab) (heavy (cancel_into jab)))))
-  ```
+A `(list T)` field holds values of type T. A list may give its count:
+`(position (list float 3))` holds exactly three values and `(tags (list symbol 1 4))` one to
+four, and any other count is an error at the field. A softer pack may narrow the count, never
+widen it.
 
-  The check runs on the merged tree, so a key a layer adds may be named, and one a layer
-  removes is an error at each record that still names it, with the key it most likely
-  meant: `'lazer' is not a key of weapons (laser?)`. With packs, a harder pack naming a
-  softer pack's key is a warning, as for a call.
-- **Assets.** A field `(asset KIND)` holds the path of a file outside Baker, a string
-  relative to the project file's directory, and `(list (asset KIND))` several. The
-  project file declares the kinds and the extensions each takes:
+### Field metadata
 
-  ```dta
-  (assets (mesh ".glb" ".fbx") (texture ".png" ".tga") (sound))
-  ```
+A field takes the metadata `@range`, `@step`, `@kind`, `@desc`, `@note` (as a tweak's),
+`@optional`, `@renamed_from` ([Renamed fields](#renamed-fields-renamed_from)), and, for a
+shape that generates a C++ view ([Views and tables](#views-and-tables), below), `@view`,
+`@cxx` and `@cxx_name`. A field without `@optional` is required. A word without the `@` after
+a field's type, or a `@` word the grammar lacks, is an error. A shape may describe itself with
+its own `(@desc ...)` and `(@note ...)`, and its fields may be named anything, `at` and `desc`
+included. A `symbol` or `(list symbol)` field may list the symbols it allows,
+`(button symbol (@one_of light heavy kick special))`, in the order a tool should offer them; a
+later layer declaring the field again may add to the list.
 
-  `check` reports a kind the project does not declare, a path whose extension its kind
-  does not list (a kind listing none takes any file), and a file that is not there, found
-  by listing the file's directory once per run through the host's lister. The kit's
-  `assets` command writes every edge of the merged stack as `baker.assets/1` (see [the
-  assets document](assets-json.md)), for a pipeline to index forward or in reverse. A view
-  holds the path as a `std::string_view`. Baker never imports, stores or cooks an asset.
-- **Layers combine shapes by name**: a later layer's `#shape` of the same name adds a
-  field or retunes one field's range, and one of a new name adds a shape. Its form is
-  written whole, never with a layer verb. A layer received under `data_only` or
-  `scalars_only` may not declare one.
+### What a shape governs: `@at`
+
+A shape governs every array tagged with its name, anywhere in the tree. `(@at ...)` narrows it
+to arrays whose ancestors' tags, from the root, are the ones listed; `*` matches any one tag.
+The example above governs each `(boss_phase ...)` in `(bosses (dragon (phases (boss_phase ...)
+(boss_phase ...))))`.
+
+### Keyed children: `@keyed`
+
+Keyed children are tagged by their own names, as in `(bosses (dragon ...) (golem ...))`, so no
+shape is named after them. Declare the shape `(@keyed)`, with an `(@at ...)` naming their
+parent, and it governs every child there, whatever its tag:
+
+```dta
+#shape (move (@at fighters * moves) (@keyed)
+   (startup int (@range 1 60) (@kind frames)))
+(fighters (kestrel (moves (jab (startup 4)) (heavy (startup 9)))))
+```
+
+Keyed data is what layers merge by name: a layer above can retune `heavy` alone. Data
+written `(boss (name dragon) ...)` is governed by name, but repeated tags do not merge
+one by one.
+
+### A shape that governs nothing
+
+A shape that governs nothing checks nothing, silently: `(@at fighters moves)` for
+`(@at fighters * moves)` is one level off. `shape::unused(tree, shapes, report)` warns of
+each such shape, located where it is declared ("shape 'move' governs nothing: no array is
+a child of fighters/moves"), and the kit's `check` runs it. A validator does not, since a
+stack may lack some content for now.
+
+### Keys of a table: `key_of`
+
+A field `(key_of TABLE)` holds the key of a record in TABLE, a dotted path such as `weapons` or
+`items.weapons`; `(list (key_of TABLE))` holds several. The table is the nearest one of that
+path that encloses the record, looked up outward, the root last, so a fighter's move names one
+of that fighter's moves:
+
+```dta
+#shape (unit (@at units) (@keyed) (weapon (key_of weapons)))
+#shape (move (@at fighters * moves) (@keyed) (cancel_into (list (key_of moves)) (@optional)))
+(weapons (laser (damage 3)) (cannon (damage 9)))
+(units (scout (weapon laser)))
+(fighters (kestrel (moves (jab) (heavy (cancel_into jab)))))
+```
+
+The check runs on the merged tree, so a key a layer adds may be named, and one a layer
+removes is an error at each record that still names it, with the key it most likely
+meant: `'lazer' is not a key of weapons (laser?)`. With packs, a harder pack naming a
+softer pack's key is a warning, as for a call.
+
+### Assets
+
+A field `(asset KIND)` holds the path of a file outside Baker, a string relative to the project
+file's directory, and `(list (asset KIND))` several. The project file declares the kinds
+and the extensions each takes:
+
+```dta
+(assets (mesh ".glb" ".fbx") (texture ".png" ".tga") (sound))
+```
+
+`check` reports a kind the project does not declare, a path whose extension its kind
+does not list (a kind listing none takes any file), and a file that is not there, found
+by listing the file's directory once per run through the host's lister. The kit's
+`assets` command writes every edge of the merged stack as `baker.assets/1` (see [the
+assets document](assets-json.md)), for a pipeline to index forward or in reverse. A view
+holds the path as a `std::string_view`. Baker never imports, stores or cooks an asset.
+
+### Shapes in layers
+
+[Layers](#layers) combine shapes by name: a later layer's `#shape` of the same name adds a
+field or retunes one field's range, and one of a new name adds a shape. Its form is
+written whole, never with a layer verb. A layer received under `data_only` or
+`scalars_only` may not declare one.
+
+### Checking against shapes
 
 Checking reports a field of the wrong type, out of range or outside its `one_of`, a key
 its table lacks, or a required field missing, as an error, located by file, line, and
-path. A field the shape does not declare is a warning, so adding data never waits on its shape. Commands and variables are not checked:
-their values are unknown until they run.
+path. A field the shape does not declare is a warning, so adding data never waits on its
+shape. Commands and variables are not checked: their values are unknown until they run.
 
 ```cpp
 // checked at every push, reload, and restore, and in each check of a layer
@@ -601,7 +707,12 @@ cfg.add_validator(baker::shape::validator(), {.any_thread = true});
 ```
 
 Through a Config, violations go to the warning handler; the load itself never fails on a
-shape. Elsewhere, `baker::shape::Set` reads the declarations and `baker::shape::check`
+shape. A check of a layer, and the merge after a push, check only what the layer changes:
+each record it names, whole, with its fields from below, and each record whose key
+field names a record it removes. A layer that declares a `#shape` is checked against the
+whole tree, as is every reload, toggle, restore and removal of a layer. So a warning that
+stands in the base is reported when the base loads, and not again in each overlay's
+report. Elsewhere, `baker::shape::Set` reads the declarations and `baker::shape::check`
 checks a tree; `set.shapes()` enumerates them, with their metadata, for a tool to build
 panels from. Shapes are opt-in, and cost nothing unless checked.
 
@@ -661,7 +772,7 @@ governs:
   half a microsecond for a two-value comparison, so 3,000 cards with two rules each is
   under 3 ms a reload. A shape set with no rules costs nothing more.
 
-### Views: a C++ struct from a shape
+### Views and tables
 
 A shape marked `(@view)` generates a C++ struct the game reads its records into, so the
 layout is written once, in the data, and the code never restates it:
@@ -674,88 +785,27 @@ layout is written once, in the data, and the code never restates it:
    (on_hit      any (@optional) (@view no)))
 ```
 
-```cpp
-#include "move_read.hpp"   // generated: game::Move, its reader and Convert<Move>
-auto jab = baker::read_view<game::Move>(cfg, "fighters.kestrel.moves.jab");
-if (jab) frames = jab->startup;              // uint16_t; damage is a float
-for (baker::Symbol into : jab->cancel_into) ...   // a ListView<Symbol> over the list
-```
+- **`(@view)`** on a shape generates its struct; **`(@view by_id)`** also keeps the records'
+  `(@id ...)` in the shape's table, for looking a row up by its ID. A table without it
+  carries no IDs.
+- **`(@view no)`** on a field keeps it out of the struct; the game reads it from the tree as
+  before. An `any` field must be marked so.
+- **`(@cxx T)`** picks a member's C++ type for an `int` (`int8` to `uint64`) or a `float`
+  (`float`, `double`).
+- **`(@cxx_name N)`** names a member or the struct when the data's name is not a C++ name.
+- **A keyed viewed shape is also a table.** A viewed `(@keyed)` shape's records can be read as
+  one packed array of its struct, built from the merged tree once per change instead of walked
+  per read, and shipped baked in the stack image. A field marked `(@view no)` is never
+  in the table.
 
-- **Members.** `int` is `int32_t`, `float` is `float`, `bool`, `symbol` and `(key_of T)` are
-  `baker::Symbol`, `string` is a `std::string_view`, `curve` a `baker::Curve`, another
-  shape its struct, nested, and `(list T)` a `baker::ListView<V>` over the list, which
-  converts each element as it is read and checks a declared count. `(@cxx int64)` picks a
-  member's C++ type for an `int` (`int8` to `uint64`) or a `float` (`float`, `double`);
-  `(@cxx_name N)` names a member or the struct when the data's name is not a C++ name. A
-  field marked `(@view no)` stays out of the struct and is read from the tree as before; an
-  `any` field must be. An absent `@optional` field reads as zero, `false` or empty: views
-  hold no `std::optional`. Beside the digest, a struct carries `kAt` (its shape's `(@at
-  ...)`, as written), `kKeyed`, and `fixups()`, the members that point outside the struct,
-  which a baked table relocates into its own pool (Tables, below).
-- **Reading.** `read_view<T>(cfg, path)` and `read_view<T>(record)` return an `Expected<T>`:
-  a value of the wrong type, outside its member's range, or a list of the wrong count is a
-  located error naming the field; a required field missing names it too. The generated
-  `Convert<T>` lets `get<T>` read a view as well. A view's strings and lists borrow from the
-  tree: hold the Config's `root()` while they are used, and read after `apply_edits()`.
-- **Generating.** The project file names the contract layers the views come from and the
-  namespace, `(views (layers core content) (namespace game))`; a field a mod or an overlay
-  adds is readable from the tree and never a member. `baker_generate_views(target PROJECT
-  file)` in CMake runs `baker_bake --views` whenever a contract file changes, and a header
-  is rewritten only when its text changed, so a tuning edit rebuilds nothing. A view's
-  shape set is one per build: a `#shape` inside an `#ifdef`, or a `dev_only` or `(when ...)`
-  contract layer, is refused (`docs/cookbook.md`, Views in the build).
-- **Drift.** Each struct carries a digest of its shape's layout (names, types and order,
-  never tuning metadata). `baker::shape::check_views` compares the compiled views with
-  the shapes a running stack declares, and the kit's `check` reports a mismatch as a
-  shape warning, or an error under `--baker-strict-views`.
-- A softer pack may not leave a field out of a view, change its C++ type or rename its
-  member (as it may not loosen a range). Views cost nothing unless generated and read.
+The project file names the contract layers the views come from, `(views (layers core
+content) (namespace game))`; a field a mod or an overlay adds is readable from the tree and
+never a member. A view's shape set is one per build: a `#shape` inside an `#ifdef`, or a
+`dev_only` or `(when ...)` contract layer, is refused. A softer pack may not leave a field out
+of a view, change its C++ type or rename its member (as it may not loosen a range).
 
-### Tables: a keyed shape's records, packed
-
-A viewed `(@keyed)` shape's records can be read as one packed array of its struct, built
-from the merged tree once per change instead of walked per read:
-
-```cpp
-#include "move_read.hpp"
-#include <baker/table.hpp>
-
-baker::add_table<game::Move>(cfg);               // before the load; or register_tables(cfg)
-cfg.push_layer(...);
-baker::Table<game::Move> moves = baker::table<game::Move>(cfg);
-if (auto i = moves.index_of("kestrel.jab")) {   // the path below the table
-    const game::Move& jab = moves[*i];           // one indexed load; at(i) checks
-    for (baker::Symbol into : jab.cancel_into) ...  // a packed list, the table's own
-}
-for (uint32_t i : moves.children_of("kestrel"_sym)) ...   // one parent's records
-```
-
-- **One block.** The rows, in the merged tree's order and grouped by parent, then a pool
-  the rows' strings, lists and curves point into, then the indices: by key (an alias of a
-  renamed record resolves too), by `(@id ...)`, and by parent. A `Table<T>` handle keeps
-  the block it was given: a reload that rebuilds the table takes nothing from a reader
-  holding the old one. The block comes from the Config's allocator.
-- **Finding a row.** `index_of(key)` for a shape whose `(@at ...)` has no `*`;
-  `index_of("kestrel.jab")` or a `Path` for the tags the `*` segments stand for and then
-  the key; `index_of(id)`; `children_of(parent)` is a contiguous range. `key_of(i)` and
-  `id_of(i)` read back. The text form parses and interns on every call: a read that runs
-  every frame holds the `Path`, the `Symbol` or the `RecordId`, or better, the index. An index is stable across a reload while the table's set of
-  records is unchanged; a record added, removed or reordered renumbers what follows it.
-- **Rebuilt by identity.** Every merge, reload and `apply_edits()` rebuilds a table whose
-  governing arrays the new tree does not share, and no other; a Config with no table
-  registered builds none. Registering after the load builds at once.
-- **Literals only.** A view field holding a `{command}`, a `$variable` or a value of the
-  wrong type reads as the member's default, with a located error to the warning handler;
-  the record's other fields still read, and the kit's `check` fails. A field marked
-  `(@view no)` is never in the table.
-- **Shipped as an image.** The kit's `bake --baker-stack game.datb`, run on the game's own
-  binary, writes the contract layers' trees and every registered table as one file;
-  a Config made with `ConfigOptions::stack_image` takes those layers from it in
-  `open_project`, in place of their text, and the tables with them, their pointers fixed
-  up and their symbols interned in one pass. A table the game no longer compiles alike
-  (another digest, size or fix-up list) is skipped with a warning and built from the
-  tree. Layers above the contract (mods, overlays) push as today and rebuild the tables
-  they touch. Development builds never need the file.
+Reading views and tables from C++, generating the headers in the build, catching drift between
+the compiled structs and the data, and the stack image are in [Baker from C++](cpp.md).
 
 ## Script
 
@@ -839,7 +889,7 @@ write-back and promote give that spelling back.
   the printer quotes an operator where the reader would otherwise take a prefix command as
   infix (`{+ '-' 1}`). A macro used between operands, or one that expands to more than one
   node, leaves its brace as written.
-- **Overlays for older builds.** A build of Baker before infix reads `{2 <= $value <= 10}` as
+- **Overlays for older builds.** A Baker before 0.7.0 reads `{2 <= $value <= 10}` as
   a call of 2. Data that a build without it reads, such as a live-ops overlay for a game
   already shipped, stays in the prefix spelling, which every build reads.
 
@@ -881,8 +931,8 @@ A C++ type derived from `baker::Object<T>` binds methods and properties once, in
 script-only; handlers come before native methods, for script and C++ senders alike, so a
 designer can change one type's response without touching its C++. In a handler, `$this` is
 the object, and `[name]` reads its property or loose parameter (`{set [hp] 5}` stores
-one). Loose parameters belong to the object's stay in its Context: removing the object
-drops them. `{new T name (param value) ...}` makes an object of a script class or a bound
+one). An object's loose parameters stay in its Context: removing the object drops
+them. `{new T name (param value) ...}` makes an object of a script class or a bound
 type, and `{delete obj}` removes it when the host's `eval` or `run` returns (during a
 Scheduler's tick, at its end): until then the commands after it still reach the object,
 and a call already running on it finishes safely.

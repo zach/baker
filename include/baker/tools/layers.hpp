@@ -57,4 +57,9 @@ struct ExplainEntry {
 // shape's declarations combine, harder packs' holding.
 [[nodiscard]] Expected<List<ExplainEntry>> explain(const Config& cfg, const Path& path);
 
+// The Config's change log (Config::set_change_history) as `baker.changes/1`
+// (docs/changes-json.md): every kept transaction, oldest first, with its records, the values
+// as Baker text, and the lines it wrote.
+void write_changes_json(const Config& cfg, TextSink out);
+
 }  // namespace baker::tools

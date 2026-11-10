@@ -36,10 +36,10 @@ reads `passed` and shows the lists:
   end. Strings escape `"`, `\`, and control characters (`\n`, `\t`, `\u00XX`); other
   characters are written as they are. Numbers are integers.
 - **Versioning.** `schema` is `baker.check/MAJOR` while the minor version is 0, then
-  `baker.check/MAJOR.MINOR` (now `baker.check/1.5`). A field is only ever added with a new minor version, which old
-  readers can ignore; a field is removed or renamed, or its meaning changed, only with a new
-  major version. 1.5 adds no field: a path to metadata is spelled with its sigil,
-  `box.width.@note`, as the data spells it.
+  `baker.check/MAJOR.MINOR` (now `baker.check/1.5`). A field is only ever added with a new
+  minor version, which old readers can ignore; a field is removed or renamed, or its meaning
+  changed, only with a new major version. 1.5 adds no field: a path to metadata is spelled
+  with its sigil, `box.width.@note`, as the data spells it.
 
 ## The object
 
@@ -58,9 +58,12 @@ reads `passed` and shows the lists:
 | `tweak_errors` | list of problems | the data against the tweaks the Config binds: a value that does not convert to its tweak's type, a number outside its tweak's range, a symbol outside its `one_of`. Filled by `check` of a Config (1.3) |
 | `tweak_warnings` | list of problems | a tweak whose path the data lacks, so it keeps its default; a key beside a group's tweaks that no tweak reads, as a misspelled key looks. Never a failure (1.3) |
 
-Each tweak finding's `path` is its subject: the tweak's path, or for a key no tweak reads, the key's own path (`world.gravty`, the group then the key). A tool groups and locates findings by it rather than by their words.
 | `packs` | list of packs | the session's packs and their harness metadata; empty without a session |
 | `defines` | list of defines | the flags that stood for the read, in the order made: `name`, `origin` (`"host"`, `"project"` or `"file"`), and for a file's `#define` its `file` and `line`; empty without a session (1.4) |
+
+Each tweak finding's `path` is its subject: the tweak's path, or for a key no tweak reads,
+the key's own path (`world.gravty`, the group then the key). A tool groups and locates
+findings by it rather than by their words.
 
 **A problem** (in every list of problems), sorted by `file`, then `line`, then `column`,
 then `message`:

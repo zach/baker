@@ -22,6 +22,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include "dev_only.hpp"
 #include "ok.hpp"
@@ -360,6 +361,120 @@ TEST_CASE("source names a generated file's origin and tool") {
 }
 
 #if !BAKER_SHIPPING  // reload is inert under BAKER_SHIPPING (tested below)
+TEST_CASE("a reload in parts: read and parsed on another thread, merged on this one") {
+    TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer("default", dir.write("default.dta", "(speed 1) (volume 3)\n")));
+    REQUIRE(cfg.push_layer("app", dir.write("app.dta", "(speed 2)\n")));
+    // Nothing changed: Unchanged, and nothing merged.
+    {
+        ReloadJob job = cfg.begin_reload();
+        std::thread([&] { job.run(); }).join();
+        CHECK(job.ran());
+        CHECK(ok(cfg.finish_reload(std::move(job))) == ReloadOutcome::Unchanged);
+    }
+    // A file changed: read on the worker, the game thread's tree untouched until finish.
+    dir.write("app.dta", "(speed 5)\n");
+    const uint64_t epoch = cfg.epoch();
+    ReloadJob job = cfg.begin_reload({.trigger = "worker"});
+    std::thread([&] { job.run(); }).join();
+    CHECK(cfg.get<int>("speed") == 2);
+    CHECK(cfg.epoch() == epoch);
+    // A live edit while the job ran stays: the merge reads scratch as it stands.
+    REQUIRE(cfg.set("volume", 9));
+    CHECK(ok(cfg.finish_reload(std::move(job))) == ReloadOutcome::Ok);
+    CHECK(cfg.get<int>("speed") == 5);
+    CHECK(cfg.get<int>("volume") == 9);
+    CHECK(cfg.last_reload()->trigger == Symbol("worker"));
+    // finish_reload runs a job that was not run.
+    dir.write("app.dta", "(speed 6)\n");
+    CHECK(ok(cfg.finish_reload(cfg.begin_reload())) == ReloadOutcome::Ok);
+    CHECK(cfg.get<int>("speed") == 6);
+}
+
+TEST_CASE("a reload job begun before the stack changed is refused, and nothing changes") {
+    TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer("default", dir.write("default.dta", "(speed 1)\n")));
+    dir.write("default.dta", "(speed 4)\n");
+    ReloadJob job = cfg.begin_reload();
+    job.run();
+    REQUIRE(cfg.push_layer_text("patch", "(volume 2)"));  // the stack changes under it
+    CHECK(ok(cfg.finish_reload(std::move(job))) == ReloadOutcome::Refused);
+    CHECK(cfg.get<int>("speed") == 1);
+    CHECK(cfg.get<int>("volume") == 2);
+    // Begun again, it lands.
+    CHECK(ok(cfg.finish_reload(cfg.begin_reload())) == ReloadOutcome::Ok);
+    CHECK(cfg.get<int>("speed") == 4);
+    CHECK(cfg.get<int>("volume") == 2);
+    // A job of another Config is refused too.
+    Config other({.tweaks = nullptr});
+    CHECK(ok(other.finish_reload(cfg.begin_reload())) == ReloadOutcome::Refused);
+    // An empty job.
+    CHECK(ok(cfg.finish_reload(ReloadJob())) == ReloadOutcome::Refused);
+}
+
+TEST_CASE("a reload job's broken edit changes nothing and says where") {
+    TempDir dir;
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer("default", dir.write("default.dta", "(speed 1)\n")));
+    dir.write("default.dta", "(speed 1\n");
+    ReloadJob job = cfg.begin_reload();
+    std::thread([&] { job.run(); }).join();
+    auto r = cfg.finish_reload(std::move(job));
+    REQUIRE_FALSE(r);
+    CHECK(r.error().file().str().find("default.dta") != std::string_view::npos);
+    CHECK(cfg.get<int>("speed") == 1);
+    CHECK(cfg.last_reload()->outcome == ReloadOutcome::ParseError);
+}
+
+TEST_CASE("with a stamper, a reload opens only the files whose stamp moved") {
+    std::map<std::string, std::string> files{{"a.dta", "(speed 1)\n"}, {"b.dta", "(volume 2)\n"}};
+    std::map<std::string, uint64_t> stamps{{"a.dta", 10}, {"b.dta", 20}};
+    int reads = 0;
+    Config cfg({.tweaks = nullptr});
+    cfg.session().set_reader([&](std::string_view path, TextSink out) {
+        const auto it = files.find(std::string(path));
+        if (it == files.end()) return false;
+        ++reads;
+        out(it->second);
+        return true;
+    });
+    cfg.session().set_stamper([&](std::string_view path) {
+        const auto it = stamps.find(std::string(path));
+        return it == stamps.end() ? uint64_t{0} : it->second;
+    });
+    REQUIRE(cfg.push_layer("a", "a.dta"));
+    REQUIRE(cfg.push_layer("b", "b.dta"));
+    reads = 0;
+    // Nothing moved: no file is opened.
+    CHECK(ok(cfg.reload()) == false);
+    CHECK(reads == 0);
+    // b's stamp moved, its text did not: b alone is read, and nothing changes; the stamp
+    // it has now is kept, so the next scan opens nothing.
+    stamps["b.dta"] = 21;
+    CHECK(ok(cfg.reload()) == false);
+    CHECK(reads == 1);
+    CHECK(ok(cfg.reload()) == false);
+    CHECK(reads == 1);
+    // A file read with no stamp (written moments ago) is read at each scan until it has one.
+    stamps["b.dta"] = 0;
+    CHECK(ok(cfg.reload()) == false);
+    CHECK(reads == 2);
+    stamps["b.dta"] = 22;
+    CHECK(ok(cfg.reload()) == false);
+    CHECK(reads == 3);
+    CHECK(ok(cfg.reload()) == false);
+    CHECK(reads == 3);
+    // a changed: the scan opens it, and the reload reads it and b above it.
+    files["a.dta"] = "(speed 3)\n";
+    stamps["a.dta"] = 11;
+    reads = 0;
+    CHECK(ok(cfg.reload()) == true);
+    CHECK(cfg.get<int>("speed") == 3);
+    CHECK(reads >= 2);
+}
+
 TEST_CASE("reload sees a file changed on disk") {
     TempDir dir;
     Config cfg({.tweaks = nullptr});
@@ -1243,6 +1358,33 @@ BAKER_DEV_TEST_CASE("a read of a record or table above a live edit sees it") {
     // A clear goes back to the files' value everywhere.
     REQUIRE(cfg.clear_scratch("units.tank.price"));
     CHECK(ok(cfg.get<UnitRecord>("units.tank")).price == 40);
+}
+
+BAKER_DEV_TEST_CASE("reads above a live edit share one merge until the next change") {
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(cfg.push_layer(
+        "default", ok(read_string("(units (tank (price 40) (hp 100)) (scout (price 10) (hp 30)))\n",
+                                  "d.dta"))));
+    REQUIRE(cfg.set("units.tank.price", 45));
+    CHECK(ok(cfg.get<UnitRecord>("units.tank")).price == 45);  // the first read merges
+    if (test::counting_allocations()) {
+        const test::AllocationScope scope;
+        for (int i = 0; i < 10; ++i) (void)cfg.get<UnitRecord>("units.tank");
+        CHECK(scope.count() == 0);  // the rest read the merge it kept
+    }
+    // The next edit is seen: the kept merge is for the edits as they were.
+    REQUIRE(cfg.set("units.tank.hp", 120));
+    const UnitRecord tank = ok(cfg.get<UnitRecord>("units.tank"));
+    CHECK(tank.price == 45);
+    CHECK(tank.hp == 120);
+    // A layer change too.
+    REQUIRE(cfg.push_layer("patch", ok(read_string("(units (tank (price 50)))\n", "p.dta"))));
+    REQUIRE(cfg.set("units.tank.hp", 130));
+    CHECK(ok(cfg.get<UnitRecord>("units.tank")).hp == 130);
+    // apply_edits takes the kept merge; root() then holds the edits.
+    cfg.apply_edits();
+    CHECK(cfg.root()->get<int>("units.tank.hp") == 130);
+    CHECK(cfg.root()->get<int>("units.tank.price") == 45);  // scratch above the patch
 }
 
 TEST_CASE("cache_drop_metadata: the caches a bake writes hold no metadata") {

@@ -52,6 +52,7 @@ class Config;
 class TweakRegistry;
 namespace detail {
 struct ToolsAccess;  // baker::tools' way to the internals (src/tools/access.hpp)
+class TweakIndex;    // a Config's rebinding by what changed (src/data/tweak_index.hpp)
 // read_consistent's wait while a change is under way: a spin, then a yield. Out of line, so
 // this header needs no <thread>.
 void wait_a_moment(unsigned tries) noexcept;
@@ -217,6 +218,7 @@ private:
     friend class TweakRegistry;
     friend class Config;
     friend struct detail::ToolsAccess;
+    friend class detail::TweakIndex;
     friend TweakFindings check_tweaks(const Array& root, const TweakRegistry& tweaks);
 
     // Reads the values as T and, if `apply`, stores them; false if they do not convert.
@@ -228,8 +230,9 @@ private:
     [[nodiscard]] virtual ListElement element() const noexcept = 0;
 
     // Rebinds against `root` (a Config's merged tree); true if the value changed. Reports
-    // a value that does not convert through `warn`.
-    bool bind(const Array& root, const Callback<void(const Error&)>& warn);
+    // a value that does not convert, or a malformed path, through `warn`, and then sets
+    // `*warned` if given.
+    bool bind(const Array& root, const Callback<void(const Error&)>& warn, bool* warned = nullptr);
     bool unbind();
     void notify();
     const Path& parsed();
@@ -246,6 +249,7 @@ private:
     Extra* extra_ = nullptr;
     Ref<Array> bound_;                // the array holding the value; null when unbound
     uint32_t first_ = 0, count_ = 0;  // the value's nodes within bound_
+    uint32_t slot_ = 0;               // its place in its Config's TweakIndex, if that is current
 };
 
 // The set of live tweaks, as an intrusive list: adding one allocates nothing. The global
@@ -296,6 +300,7 @@ public:
 private:
     friend class TweakBase;
     friend class Config;
+    friend class detail::TweakIndex;
     void lock() const noexcept;
     void unlock() const noexcept;
     // A change to its tweaks, on the game's thread, for read_consistent: the generation is
@@ -315,6 +320,9 @@ private:
     std::atomic<uint64_t> generation_{0};  // odd while its tweaks are changing
     TweakBase* head_ = nullptr;
     Config* config_ = nullptr;
+    // The TweakIndex that every tweak's binding agrees with, by its id; 0 for none, after a
+    // tweak attaches or detaches. Under the lock.
+    uint64_t binder_ = 0;
 };
 
 // Every tweak in `tweaks` as JSON (schema baker.tweaks/1.6, docs/reference-json.md), sorted by

@@ -10,10 +10,13 @@
 #include <baker/cache.hpp>
 #include <baker/table.hpp>
 
+#include "markers.hpp"
 #include "session.hpp"
 #include "table_build.hpp"
 #include "text.hpp"
 
+#include <bit>
+#include <cstdio>
 #include <cstring>
 
 namespace baker {
@@ -21,7 +24,9 @@ namespace baker {
 namespace {
 
 constexpr char kMagic[10] = {'M', 'O', 'I', 'R', 'A', '.', 'I', 'M', 'G', '1'};
-constexpr uint16_t kVersion = 1;
+// 2: the cache's checksum; 3: a table section walked by its view's fix-ups, with no
+// relocation list, and ID columns only for views that look up by ID
+constexpr uint16_t kVersion = 3;
 constexpr uint32_t kEndian = 0x01020304;
 
 struct Header {
@@ -51,14 +56,14 @@ bool get(std::string_view in, size_t at, T& v) {
     return true;
 }
 
+// The cache's checksum, at memory speed: the header with its hash field zeroed, and the rest.
 uint64_t image_hash(std::string_view bytes) {
-    uint64_t h = 1469598103934665603ULL;
-    for (size_t i = 0; i < bytes.size(); ++i) {
-        const bool hash_field = i >= offsetof(Header, hash) && i < offsetof(Header, hash) + 8;
-        h ^= hash_field ? 0 : static_cast<unsigned char>(bytes[i]);
-        h *= 1099511628211ULL;
-    }
-    return h;
+    if (bytes.size() < sizeof(Header)) return 0;
+    char header[sizeof(Header)];
+    std::memcpy(header, bytes.data(), sizeof header);
+    std::memset(header + offsetof(Header, hash), 0, sizeof(uint64_t));
+    return std::rotl(detail::content_hash({header, sizeof header}), 1) ^
+           detail::content_hash(bytes.substr(sizeof header));
 }
 
 Unexpected bad(std::string_view name, std::string_view why, ErrorCode code = ErrorCode::Syntax) {
@@ -102,6 +107,14 @@ void finish_image(Str& out, uint32_t sections) {
 Expected<LoadedImage> read_image(std::string_view path, const LoadSession& session,
                                  const Allocator& alloc) {
     LoadedImage image(alloc);
+    // Read at its size, so the buffer is not grown and copied as the file arrives.
+    if (SessionAccess::reads_disk(session))
+        if (std::FILE* f = std::fopen(CPath(path).c_str(), "rb")) {
+            if (std::fseek(f, 0, SEEK_END) == 0)
+                if (const long size = std::ftell(f); size > 0)
+                    image.file.reserve(static_cast<size_t>(size));
+            std::fclose(f);
+        }
     if (!read_with(session.reader(), path, image.file))
         return Unexpected(make_error(ErrorCode::Io, "cannot read '" + Str(path) + "'"));
     const std::string_view in = image.file.view();
@@ -147,8 +160,13 @@ Expected<void> write_stack_image(const Config& cfg, std::span<const Symbol> laye
             return Unexpected(make_error(
                 ErrorCode::NotFound,
                 "the stack has no layer '" + Str(layer.str()) + "' to put in the image"));
+        // The section's record says whether the layer carries aliases or IDs, as a cache's
+        // does: the load then needs no walk to know.
+        LoadSession record;
+        detail::SessionAccess::set_recorded(record, true);
+        detail::SessionAccess::set_aliases(record, detail::has_identity(*root) ? 1 : 0);
         Str bytes;
-        if (auto r = write_cache(*root, detail::str_out(bytes)); !r) return r;
+        if (auto r = write_cache(*root, detail::str_out(bytes), &record); !r) return r;
         detail::append_section(image, detail::ImageSection::Kind::Layer, layer.str(), bytes.view());
         ++sections;
     }

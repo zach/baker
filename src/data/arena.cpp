@@ -147,6 +147,7 @@ void Arena::own_release() noexcept {
 }
 
 void Arena::free() noexcept {
+    if (CurveCache* c = curves_.load(std::memory_order_acquire)) free_curves(c);
     for (uint32_t i = 0; i < dep_count_; ++i)
         if (release(deps_[i]->refs)) free_owner(*deps_[i]);
     deallocate(alloc_, deps_, dep_cap_ * sizeof(Owner*));

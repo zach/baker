@@ -115,9 +115,9 @@ inline constexpr baker::ViewFixup kMoveFixups[] = {
     {offsetof(views_test::Move, name), baker::ViewFixupKind::String, baker::ViewFixup::Element::Int32, 0, nullptr, 0, nullptr, nullptr},
     {offsetof(views_test::Move, button), baker::ViewFixupKind::Symbol, baker::ViewFixup::Element::Int32, 0, nullptr, 0, nullptr, nullptr},
     {offsetof(views_test::Move, cancel_into), baker::ViewFixupKind::List, baker::ViewFixup::Element::Symbol, sizeof(baker::Symbol), nullptr, 0, nullptr, nullptr},
-    {offsetof(views_test::Move, hitbox), baker::ViewFixupKind::Struct, baker::ViewFixup::Element::Struct, 0, views_test::Vec2::fixups().data(), static_cast<uint32_t>(views_test::Vec2::fixups().size()), &baker::view_detail::read_erased<views_test::Vec2>, &baker::view_detail::init_erased<views_test::Vec2>},
     {offsetof(views_test::Move, points), baker::ViewFixupKind::List, baker::ViewFixup::Element::Struct, sizeof(views_test::Vec2), views_test::Vec2::fixups().data(), static_cast<uint32_t>(views_test::Vec2::fixups().size()), &baker::view_detail::read_erased<views_test::Vec2>, &baker::view_detail::init_erased<views_test::Vec2>},
     {offsetof(views_test::Move, ramp), baker::ViewFixupKind::Curve, baker::ViewFixup::Element::Int32, 0, nullptr, 0, nullptr, nullptr},
+    {offsetof(views_test::Move, hitbox), baker::ViewFixupKind::Struct, baker::ViewFixup::Element::Struct, 0, views_test::Vec2::fixups().data(), static_cast<uint32_t>(views_test::Vec2::fixups().size()), &baker::view_detail::read_erased<views_test::Vec2>, &baker::view_detail::init_erased<views_test::Vec2>},
 };
 constexpr std::span<const baker::ViewFixup> views_test::Move::fixups() noexcept {
     return kMoveFixups;

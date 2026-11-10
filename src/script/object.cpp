@@ -2,6 +2,7 @@
 // and the {class}, {new} and {delete} built-ins.
 
 #include "common/containers.hpp"
+#include "data/array_fill.hpp"
 #include "internal.hpp"
 
 #include <functional>
@@ -526,21 +527,20 @@ void Context::add_type(const detail::TypeRecord& type) {
 }
 
 Expected<Node> Context::call(const Node& object, Symbol method, std::span<const Node> args) {
-    const size_t size = args.size() + 2;
-    Ref<Array>* cached = size < Impl::kCallSizes ? &impl_->call_arrays[size] : nullptr;
+    Ref<Array>* cached =
+        args.size() < Impl::kCallSizes ? &impl_->call_arrays[args.size()] : nullptr;
     // The cached command is free when the cache's is its only count (a nested call, or a
     // {func} that kept its command, holds another).
     Ref<Array> command = cached && *cached && (*cached)->ref_count() == 1
                              ? *cached
-                             : Array::make(static_cast<uint32_t>(size));
-    command->set(0, object);
-    command->set(1, Node(method));
-    for (size_t i = 0; i < args.size(); ++i) command->set(i + 2, args[i]);
+                             : Array::make(static_cast<uint32_t>(args.size() + 2));
+    // Its nodes are Int 0 and nothing else holds it: filled in place, not through set().
+    detail::ArrayFill::fill(*command, object, Node(method), args);
     Expected<Node> r = eval(Node(command, Type::Command));
     if (cached) {
         if (command->ref_count() == (*cached == command ? 2u : 1u)) {
             // Nothing kept it: empty it, so it holds nothing alive, and keep it for next time.
-            for (size_t i = 0; i < size; ++i) command->set(i, Node());
+            detail::ArrayFill::clear(*command);
             *cached = std::move(command);
         } else if (*cached == command) {
             *cached = nullptr;  // kept by the script: let it go
@@ -684,16 +684,18 @@ void register_object_builtins(Context& ctx) {
     };
     if (auto r = ctx.func("class", define_class))
         r->doc(
-            "`{class Name (method ($params...) body...) ...}`: script handlers. If `Name` is a "
-            "bound C++ type, they apply to its objects and are tried before its C++ methods; "
-            "otherwise `Name` is a script class for `new`. In a handler, `$this` is the "
-            "object and `[name]` its property or parameter.");
+             "`{class Name (method ($params...) body...) ...}`: script handlers. If `Name` is a "
+             "bound C++ type, they apply to its objects and are tried before its C++ methods; "
+             "otherwise `Name` is a script class for `new`. In a handler, `$this` is the "
+             "object and `[name]` its property or parameter.")
+            .usage("{class Name (method ($params...) body...)...}");
     if (auto r = ctx.func("extend", extend_class))
         r->doc(
-            "`{extend Name (method ($params...) body...) ...}`: adds script handlers to a class, "
-            "replacing only those of the same name, so another file (a task pack) can add one. "
-            "`Name` is a `{class}` or a bound C++ type. Run it after the `{class}`: a "
-            "redefinition replaces every handler.");
+             "`{extend Name (method ($params...) body...) ...}`: adds script handlers to a class, "
+             "replacing only those of the same name, so another file (a task pack) can add one. "
+             "`Name` is a `{class}` or a bound C++ type. Run it after the `{class}`: a "
+             "redefinition replaces every handler.")
+            .usage("{extend Name (method ($params...) body...)...}");
 
     // {new Class [name] (param value)...}
     auto make = [](Args a) -> Expected<Node> {
@@ -744,8 +746,9 @@ void register_object_builtins(Context& ctx) {
     };
     if (auto r = ctx.func("new", make))
         r->doc(
-            "`{new Class [name] (param value)...}`: creates an object of a script class or of "
-            "a default-constructible bound type, owned by the Context, and returns it.");
+             "`{new Class [name] (param value)...}`: creates an object of a script class or of "
+             "a default-constructible bound type, owned by the Context, and returns it.")
+            .usage("{new Class [name] (param value)...}");
 
     auto destroy = [](Context& c, Node object) -> Expected<Node> {
         Context::Impl& impl = c.impl();
@@ -762,9 +765,10 @@ void register_object_builtins(Context& ctx) {
     };
     if (auto r = ctx.func("delete", destroy))
         r->doc(
-            "`{delete object}`: removes the object (or the object of that name) when the "
-            "host's eval returns, or at the end of a tick; one `new` created is destroyed. Its "
-            "handles go stale.");
+             "`{delete object}`: removes the object (or the object of that name) when the "
+             "host's eval returns, or at the end of a tick; one `new` created is destroyed. Its "
+             "handles go stale.")
+            .usage("{delete object}");
 }
 
 }  // namespace baker

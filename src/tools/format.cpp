@@ -48,6 +48,7 @@ struct Formatter {
     Vec<Item> items;
     Vec<uint32_t> line_starts;  // byte offset of each line, from line 1
     Vec<uint32_t> trailing;     // pieces: ; comments kept after code on their line
+    Vec<uint64_t> seconds;      // align's scratch: a block's second items, column and padded
     size_t step = 0, width = 0;
 
     [[nodiscard]] std::string_view text_of(const Piece& p) const {
@@ -211,15 +212,18 @@ struct Formatter {
             while (end < parent.kids.size() && member(parent.kids[end]) &&
                    newlines_before(items[parent.kids[end]].piece) == 1)
                 ++end;
-            // Written aligned: two second items at one column, at least one padded.
+            // Written aligned: two second items at one column, at least one padded. Sorted
+            // by column, so a block of any length costs n log n, not a test of every pair.
+            seconds.clear();
+            for (size_t j = k; j < end; ++j) {
+                const uint32_t x = second(parent.kids[j]);
+                const bool padded = pieces[x].begin - pieces[x - 1].end > 1;
+                seconds.push_back((uint64_t{column(pieces[x])} << 1) | (padded ? 1U : 0U));
+            }
+            std::sort(seconds.begin(), seconds.end());
             bool aligned = false;
-            for (size_t a = k; a < end && !aligned; ++a)
-                for (size_t b = a + 1; b < end && !aligned; ++b) {
-                    const uint32_t x = second(parent.kids[a]), y = second(parent.kids[b]);
-                    const bool padded = pieces[x].begin - pieces[x - 1].end > 1 ||
-                                        pieces[y].begin - pieces[y - 1].end > 1;
-                    aligned = padded && column(pieces[x]) == column(pieces[y]);
-                }
+            for (size_t j = 1; j < seconds.size() && !aligned; ++j)
+                aligned = (seconds[j] >> 1) == (seconds[j - 1] >> 1) && (seconds[j] & 1);
             if (aligned) {
                 size_t widest = 0;
                 for (size_t j = k; j < end; ++j)
@@ -309,7 +313,7 @@ Formatted format_text(std::string_view text, TextSink out, const FormatOptions& 
         out(text);
         return {{}, s.errors};
     }
-    Formatter f{text, options.layout, {}, {}, {}, {}, {}, 0, 0};
+    Formatter f{text, options.layout, {}, {}, {}, {}, {}, {}, 0, 0};
     f.step = options.layout.indent > 0 ? static_cast<size_t>(options.layout.indent) : 0;
     f.width = options.layout.width > 0 ? static_cast<size_t>(options.layout.width) : 0;
     // The pieces: tokens and comments, merged in order.

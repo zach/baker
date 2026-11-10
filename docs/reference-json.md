@@ -1,11 +1,11 @@
-# The vocabulary as JSON: `baker.reference/1.5`, `baker.tweaks/1.6`, `baker.shapes/1.8`
+# The vocabulary as JSON: `baker.reference/1.6`, `baker.tweaks/1.6`, `baker.shapes/1.8`
 
 Three documents describe what a program's data and script may say, for editors, agents,
 and other tools that should not scrape the Markdown reference:
 
 | Document | Written by | Library |
 |---|---|---|
-| `baker.reference/1.5` | `baker::tools::write_reference_json(ctx, sink, &session)` | `baker::tools` |
+| `baker.reference/1.6` | `baker::tools::write_reference_json(ctx, sink, &session)` | `baker::tools` |
 | `baker.tweaks/1.6` | `baker::write_json(registry, sink)` | `baker::data` |
 | `baker.shapes/1.8` | `baker::shape::write_json(shapes, sink)` | `baker::shape` |
 
@@ -19,7 +19,7 @@ baker::tools::write_reference_json(ctx, baker::string_out(json), &cfg.read_sessi
 
 ## Stability
 
-They follow `check`'s rules (`check-json.md`):
+They follow [`check`'s rules](check-json.md#stability):
 
 - **Determinism.** Every list is sorted by name or path, so the same program gives the
   same bytes.
@@ -29,11 +29,11 @@ They follow `check`'s rules (`check-json.md`):
   or changed only with a new major version.
 - **Numbers.** Ranges and steps are written as Baker prints floats (`0.5`, `10.0`).
 
-## `baker.reference/1.5`
+## `baker.reference/1.6`
 
 | Field | Contents |
 |---|---|
-| `schema` | `"baker.reference/1.5"` |
+| `schema` | `"baker.reference/1.6"` |
 | `functions` | every function with at least one overload |
 | `types` | every native type made known to the Context |
 | `script_classes` | classes only script defined (`{class Name ...}` with no native type) |
@@ -49,6 +49,8 @@ They follow `check`'s rules (`check-json.md`):
 - `status`: `"normal"`, `"stub"`, `"provisional"` or `"deprecated"`.
 - `replacement`: a deprecated function's replacement.
 - `doc`.
+- `usage`: how a special form is written, one string a form, the whole call
+  (`"{wait_for seconds}"`); `[]` for a function whose parameters say it (1.6).
 - `file` and `line`: where a script function is defined; `""` and `0` for a native one.
 - `overloads`. Each overload has:
   - `params`, each with `type`, `kind` (`"value"`, `"raw"`, `"optional"` or `"rest"`),
@@ -116,7 +118,7 @@ editor, a CI job) can register each function from its overloads with
 | Field | Contents |
 |---|---|
 | `path` | as the tweak was declared: `player.speed` |
-| `type` | the value's type as errors name it: `"float32"`, `"int32"`, `"bool"`, `"curve"` (its `values` then `null`: a curve's points, docs/language.md), or your own (`"vec2"`) |
+| `type` | the value's type as errors name it: `"float32"`, `"int32"`, `"bool"`, `"curve"` (its `values` then `null`: a curve's points, [Curves](language.md#curves)), or your own (`"vec2"`) |
 | `values` | Baker's type of each value: `["float32"]`, or `["float32", "float32"]` for a `vec2` whose `Convert` declares `values`; `null` when the type does not say (added in 1.2) |
 | `count` | how many values it takes, as a parameter's `count`: `"exact"`, `"at_least"` or `"any"` (`["symbol"]` and `"any"` for a `std::vector<Symbol>`); `null` with no `values` (added in 1.4) |
 | `element` | a list's element: `{"type", "values", "count"}`, its type named as `type` names one (`"float32"`, `"vec2"`) and its `values` and `count` as a value's; `null` for a value that is not a list (added in 1.5) |

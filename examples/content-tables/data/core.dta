@@ -1,5 +1,6 @@
-; The moves table: its shape, marked (@view), is what the build generates game::Move from.
-#shape (move (@at fighters * moves) (@keyed) (@view)
+; The moves table: its shape, marked (@view), is what the build generates game::Move from;
+; by_id keeps the records' IDs in the table, for index_of(RecordId) and id_of.
+#shape (move (@at fighters * moves) (@keyed) (@view by_id)
    (startup     int (@range 1 60) (@kind frames) (@desc "Frames before the hit lands")
                 (@renamed_from windup))  ; a record may still say windup; format rewrites it
    (damage      float (@range 0 200))

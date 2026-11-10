@@ -112,7 +112,7 @@ def reference(s):
     code, out, _ = s.run("reference", "--baker-json", agent="")
     r = json.loads(out)
     names = [f["name"] for f in r["reference"]["functions"]]
-    expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.5" and "spawn" in names,
+    expect(code == 0 and r["reference"]["schema"] == "baker.reference/1.6" and "spawn" in names,
            "reference --baker-json: the game's functions")
     expect(r["shapes"]["schema"] == "baker.shapes/1.8" and r["tweaks"]["schema"] == "baker.tweaks/1.6",
            "reference --baker-json: tweaks and shapes")
@@ -147,6 +147,21 @@ def diff_and_promote(s):
     expect(patch.startswith("--- a/data/default.dta\n+++ b/data/default.dta\n@@ ") and
            "-   (speed 3.5)   ; how fast\n+   (speed 4.5)   ; how fast\n" in patch,
            "promote --baker-patch: one line, its comment kept, named from the project's directory")
+    code, out, _ = s.run("promote", "--baker-json")
+    r = json.loads(out)
+    t = r["transactions"][0]
+    expect(code == 0 and r["schema"] == "baker.changes/1" and len(r["transactions"]) == 1 and
+           t["name"] == "promote" and len(t["written"]) == 1 and
+           t["written"][0]["file"].endswith("default.dta") and
+           [(c["kind"], c["path"], c["before"], c["after"], c["layer"]) for c in t["records"]] ==
+           [("set", "player.speed", "(3.5)", "(4.5)", "default")] and
+           (s.dir / "data" / "default.dta").read_text() == before,
+           "promote --baker-json: the transaction it would make, baker.changes/1, nothing written")
+    code, out, _ = s.run("promote", "--baker-write", "--baker-json")
+    r = json.loads(out)
+    expect(code == 0 and r["transactions"][0]["written"][0]["line"] == t["written"][0]["line"] and
+           "(speed 4.5)   ; how fast" in (s.dir / "data" / "default.dta").read_text(),
+           "promote --baker-write --baker-json writes the line and its transaction")
     code, out, _ = s.run("promote", "--baker-write")
     expect(code == 0 and "(speed 4.5)   ; how fast" in (s.dir / "data" / "default.dta").read_text(),
            "promote --baker-write writes the line")

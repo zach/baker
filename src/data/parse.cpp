@@ -27,6 +27,17 @@ namespace baker {
 namespace detail {
 namespace {
 
+// The nodes of `body`, every level counted and a shared array at each place it appears; stops
+// once the count reaches `cap`, so a body of shared arrays costs at most `cap` steps.
+uint64_t count_nodes(const Array& body, uint64_t cap) noexcept {
+    uint64_t n = body.size();
+    for (const Node& k : body) {
+        if (n >= cap) return n;
+        if (const Array* a = k.array()) n += count_nodes(*a, cap - n);
+    }
+    return n;
+}
+
 bool read_disk_file(std::string_view path, TextSink out) {
     std::FILE* f = std::fopen(CPath(path).c_str(), "rb");
     if (!f) return false;
@@ -129,6 +140,7 @@ struct LoadSession::State {
         reader = o.reader;
         disk = o.disk;
         lister = o.lister;
+        stamper = o.stamper;
         include_dirs = o.include_dirs;
         autorun = o.autorun;
         required = o.required;
@@ -164,6 +176,7 @@ struct LoadSession::State {
     Reader reader = detail::read_disk_file;
     bool disk = true;  // `reader` is the default
     Lister lister = detail::list_disk_dir;
+    Stamper stamper;  // none: a reload's scan reads every file
     Vec<Str> include_dirs;
     Vec<Node> autorun;
     Vec<Str> required;                 // the files #require has read, normalized
@@ -178,6 +191,9 @@ struct LoadSession::State {
     Vec<Symbol> tested;   // each name an #ifdef, #ifndef, #define or #undef named, as read
     uint64_t parses = 0;  // the files parsed: a cache's replay parses none
     HashMap<Symbol, uint32_t> macro_pack;  // the pack that defined each macro, by index
+    // Each macro body's nodes, every level counted and shared arrays at each use, for
+    // ParseLimits::max_macro_nodes; a body with arrays only, and only once it is used.
+    HashMap<Symbol, uint64_t> macro_nodes;
     Vec<Error> warnings;
     // What the last top-level read did, if recorded (record_for_cache).
     bool recorded = false;
@@ -192,10 +208,13 @@ struct LoadSession::State {
     // Per top-level read.
     Vec<Str> include_stack;
     uint64_t nodes = 0;
-    bool had_rows = false;           // a file of this read held rows: compact its tree
-    uint32_t aliases = 0;            // arrays with an (@aka ...): the merge resolves by them
+    bool had_rows = false;  // a file of this read held rows: compact its tree
+    uint32_t aliases = 0;   // arrays with an (@aka ...) or an (@id ...): the merge resolves by
+                            // them
     detail::NewSymbols new_symbols;  // counted by the symbol table
     uint32_t includes = 0;
+    uint64_t from_macros = 0;  // nodes taken from macros, against max_macro_nodes
+    uint64_t shared = 0;       // of those, the nodes inside arrays a use shared, not copied
 };
 
 namespace detail {
@@ -393,6 +412,7 @@ private:
         const bool naming_macro = f.kind == Frame::MacroDef && scratch_.size() == f.start;
         if (!t.quoted && !naming_macro && !s_.st_->defines.empty()) {
             if (const Array* body = s_.macro(sym)) {
+                if (!take_macro(sym, *body, t)) return false;
                 if (pack_ >= 0)
                     one_way(sym, t.line);
                 else if (!s_.st_->macro_pack.empty())  // checked if a #pack follows
@@ -407,6 +427,31 @@ private:
         if (t.quoted && odd_slot()) frames_.back().no_infix = true;
         return push(Node(sym), here(t));
     }
+    // Counts a use of macro `name` against ParseLimits::max_macro_nodes, before it is spliced.
+    bool take_macro(Symbol name, const Array& body, const Token& t) {
+        LoadSession::State& st = *s_.st_;
+        uint64_t n = body.size();
+        if (body.height() > 1) {
+            const auto it = st.macro_nodes.find(name);
+            if (it != st.macro_nodes.end()) {
+                n = it->second;
+            } else {  // a host's macro, or one from a cache: counted once, up to the limit
+                const uint64_t limit = s_.limits.max_macro_nodes;
+                n = detail::count_nodes(body, limit == UINT64_MAX ? limit : limit + 1);
+                st.macro_nodes[name] = n;
+            }
+            st.shared += n - body.size();
+        }
+        if (n <= s_.limits.max_macro_nodes - st.from_macros) {  // never more than the limit
+            st.from_macros += n;
+            return true;
+        }
+        return fail(ErrorCode::Limit,
+                    "macro '" + Str(name.str()) + "' takes the read past " +
+                        detail::decimal(static_cast<int64_t>(s_.limits.max_macro_nodes)) +
+                        " nodes from macros (ParseLimits::max_macro_nodes)",
+                    t.line, t.begin);
+    }
     [[nodiscard]] bool odd_slot() const noexcept {
         return ((scratch_.size() - frames_.back().start) & 1) != 0;
     }
@@ -417,6 +462,7 @@ private:
         if (bracket == '{') kind = Frame::Command;
         if (bracket == '[')
             kind = frames_.back().kind == Frame::Root ? Frame::MacroDef : Frame::Property;
+        if (kind == Frame::MacroDef) def_mark_ = s_.st_->nodes + s_.st_->shared;
         frames_.push_back({kind, scratch_.size(), line, {}, bracket, begin});
         return true;
     }
@@ -453,7 +499,11 @@ private:
             record(body, f.start + 1, f.begin, t.end);
             truncate(f.start);
             if (body->height() > s_.limits.max_depth) return too_deep(f.line, f.begin);
+            // Every node read inside the brackets, less the name, and what shared arrays hold.
+            const uint64_t nodes = s_.st_->nodes + s_.st_->shared - def_mark_ - 1;
+            const bool arrays = body->height() > 1;
             s_.define(*name, std::move(body));
+            if (arrays) s_.st_->macro_nodes[*name] = nodes;
             defined(*name, f.line, false);
             return true;
         }
@@ -477,7 +527,8 @@ private:
         // Metadata comes after the value. Inline, so an array without metadata pays one test;
         // a command's and a property's forms are positional and keep their order.
         if (arr->meta_first() && f.kind == Frame::Array && !metadata_placed(*arr, f)) return false;
-        if (arr->meta_first() && arr->meta(detail::aka_tag())) ++s_.st_->aliases;
+        if (arr->meta_first() && (arr->meta(detail::aka_tag()) || arr->meta(detail::id_tag())))
+            ++s_.st_->aliases;
         if (f.verb && !verb_placed(*arr, f)) return false;
         if (f.row) return wrap_row(std::move(arr), f, t.end);
         const SourceSpan span{file_, f.begin, t.end, {}};
@@ -1324,6 +1375,7 @@ private:
     int32_t pack_line_ = 0;       // where it declared it
     bool origin_ = false;         // this file declared its origin
     Vec<Symbol> warned_{alloc_};  // macros this file has been warned about
+    uint64_t def_mark_ = 0;       // nodes and shared at the open of a [NAME ...] definition
     size_t defs_from_ = 0;        // the session's definitions before this file
     Vec<std::pair<Symbol, int32_t>> unpacked_{alloc_};  // macros used before a #pack, and where
     InternSite outer_site_;  // the intern site of the read that included this file
@@ -1404,6 +1456,7 @@ void drop_flag(Vec<ActiveDefine>& flags, Symbol name) {
 
 void LoadSession::define(Symbol name, DefineFrom from) {
     st_->defines[name] = nullptr;
+    st_->macro_nodes.erase(name);
     drop_flag(st_->flags, name);
     st_->flags.push_back({name, from, {}, 0});
 }
@@ -1413,10 +1466,12 @@ void LoadSession::define(Symbol name, Ref<Array> body) {
         return;
     }
     st_->defines[name] = std::move(body);
-    drop_flag(st_->flags, name);  // a macro now, not a flag
+    st_->macro_nodes.erase(name);  // counted at its first use
+    drop_flag(st_->flags, name);   // a macro now, not a flag
 }
 void LoadSession::undefine(Symbol name) {
     st_->defines.erase(name);
+    st_->macro_nodes.erase(name);
     drop_flag(st_->flags, name);
 }
 std::span<const ActiveDefine> LoadSession::active_defines() const noexcept {
@@ -1452,6 +1507,12 @@ void LoadSession::set_lister(Lister lister) {
 }
 const LoadSession::Lister& LoadSession::lister() const noexcept {
     return st_->lister;
+}
+void LoadSession::set_stamper(Stamper stamper) {
+    st_->stamper = std::move(stamper);
+}
+const LoadSession::Stamper& LoadSession::stamper() const noexcept {
+    return st_->stamper;
 }
 void LoadSession::add_include_dir(std::string_view dir) {
     st_->include_dirs.emplace_back(dir);
@@ -1521,6 +1582,9 @@ uint32_t SessionAccess::aliases(const LoadSession& s) noexcept {
 }
 void SessionAccess::set_aliases(LoadSession& s, uint32_t count) noexcept {
     s.st_->aliases = count;
+}
+void SessionAccess::set_recorded(LoadSession& s, bool recorded) noexcept {
+    s.st_->recorded = recorded;
 }
 std::span<const Symbol> SessionAccess::tested(const LoadSession& s) noexcept {
     return {s.st_->tested.data(), s.st_->tested.size()};
@@ -1763,6 +1827,8 @@ Expected<Ref<Array>> read_string(std::string_view text, std::string_view name,
         st.aliases = 0;
         st.new_symbols = {0, session.limits.max_new_symbols, &st.nodes, session.limits.max_nodes};
         st.includes = 0;
+        st.from_macros = 0;
+        st.shared = 0;
         st.recorded = session.record_for_cache;
         st.files.clear();
         st.defines_before.clear();

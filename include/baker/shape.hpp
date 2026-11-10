@@ -60,29 +60,31 @@ namespace baker::shape {
 enum class Type : uint8_t { Any, Int, Float, Bool, Symbol, String, List, Shape, Key, Curve, Asset };
 
 struct Field {
+    // What check() reads at every value comes first, within 64 bytes; the rest is for
+    // messages, tools and generated views.
     baker::Symbol name;
     Type type = Type::Any;
-    Type element = Type::Any;   // a List's elements
-    baker::Symbol shape;        // a Shape's, or a List of shapes', name
-    List<baker::Symbol> table;  // a Key's, or a List of keys', table: a path, as written
-    baker::Symbol asset;        // an Asset's, or a List of assets', kind
+    Type element = Type::Any;  // a List's elements
+    bool optional = false;
+    bool ranged = false;
+    // For a view: whether the field is in the struct ((@view no) leaves it out).
+    bool view = true;
     // How many values a List holds: (list T N) exactly N, (list T N M) N to M; any number
     // when not declared.
     uint32_t min_count = 0, max_count = UINT32_MAX;
-    bool optional = false;
-    bool ranged = false;
     double min = 0, max = 0;
-    double step = 0;  // 0: none
-    baker::Symbol kind;
-    std::string_view desc, note;  // in the declaration, which the Set keeps
     // (@one_of light heavy kick): the symbols a symbol field's value may be, in the order
     // written; a field declared again adds to it. Empty: any symbol.
     List<baker::Symbol> one_of;
-    // For a view: whether the field is in the struct ((@view no) leaves it out), the
-    // member's C++ type when (@cxx T) overrides the default (int8, int16, int32, int64,
-    // uint8, uint16, uint32, uint64 for an int; float, double for a float), and the member's
-    // name when (@cxx_name N) gives one. Empty: the defaults.
-    bool view = true;
+    baker::Symbol shape;        // a Shape's, or a List of shapes', name
+    List<baker::Symbol> table;  // a Key's, or a List of keys', table: a path, as written
+    baker::Symbol asset;        // an Asset's, or a List of assets', kind
+    double step = 0;            // 0: none
+    baker::Symbol kind;
+    std::string_view desc, note;  // in the declaration, which the Set keeps
+    // For a view: the member's C++ type when (@cxx T) overrides the default (int8,
+    // int16, int32, int64, uint8, uint16, uint32, uint64 for an int; float, double for a
+    // float), and the member's name when (@cxx_name N) gives one. Empty: the defaults.
     baker::Symbol cxx;
     baker::Symbol cxx_name;
     // (@renamed_from old ...): the names the field had. check() warns at a record
@@ -109,7 +111,10 @@ struct Shape {
     bool keyed = false;      // governs every child at `at`, whatever its tag
     List<Field> fields;
     List<Rule> rules;
-    bool view = false;       // (@view): generates a C++ view
+    bool view = false;  // (@view): generates a C++ view
+    // (@view by_id): the view looks records up by their (@id ...), so its table keeps an ID
+    // column and an ID index; a table without it keeps neither.
+    bool by_id = false;
     baker::Symbol cxx_name;  // (@cxx_name N): the struct's name; empty: from the shape's
     baker::Symbol file;
     int32_t line = 0;
@@ -281,11 +286,27 @@ struct AssetUse {
 // `assets` command writes (baker.assets/1). Nothing is checked.
 [[nodiscard]] List<AssetUse> asset_uses(const Array& tree, const Set& shapes);
 
-// Checks every array of `tree` that a shape of `shapes` governs, into `report`. With
-// `packs`, a key a harder pack's field names from a softer pack's table is a warning, as the
-// one-way rule warns of a call.
-void check(const Array& tree, const Set& shapes, Report& report,
-           const LoadSession* packs = nullptr);
+// What check() limits itself to: a candidate layer's own tree, merged into `tree`.
+// Given `changed`, the check walks `tree` only down the paths `changed` names, and checks
+// each array there as a whole check would, with what it holds from below; arrays it does not
+// name are not visited, so their findings are not reported. A record `changed` removes,
+// (key #remove), is followed through the keys that name it: each record whose key field
+// names the removed key (or an alias the record had in `below`) is checked too. Removing
+// what a key field's table path passes through (a table, or a record holding one) checks
+// the whole tree. Shapes that `changed` declares are the caller's to see: the validator
+// checks the whole tree for a candidate that declares a #shape.
+struct Scope {
+    const Array* changed = nullptr;  // null: the whole tree
+    // The layers' own trees under `changed`, bottom to top: where a removed record's
+    // (@aka ...) names are found. Empty: a removal follows its key alone.
+    std::span<const Ref<Array>> below = {};
+};
+
+// Checks every array of `tree` that a shape of `shapes` governs, into `report`, or, with a
+// scope, those it names. With `packs`, a key a harder pack's field names from a softer
+// pack's table is a warning, as the one-way rule warns of a call.
+void check(const Array& tree, const Set& shapes, Report& report, const LoadSession* packs = nullptr,
+           const Scope& scope = {});
 // A warning in `report` for each shape of `shapes` that governs no array of `tree`: one whose
 // (@at ...) names a place the data does not have (a keyed shape one level off checks
 // nothing), or whose tag nothing carries. A tool's check, not a validator's: data a stack
@@ -299,14 +320,16 @@ void each_ruled(
     const Callback<void(const Array& record, const Shape& shape, std::string_view path)>& visit);
 // For Config::add_validator: reads the shapes each layer of the stack declares, bottom to
 // top, with the stack's session's packs (so harder packs' shapes hold), and checks the
-// merged root against them, reporting errors and warnings to the warning handler. It reads
+// merged root against them, reporting errors and warnings to the warning handler. Given a
+// stack's `changed` tree (a candidate's, or a pushed layer's), it checks only what that
+// tree names (Scope), unless the tree's file declares a #shape: then the whole. It reads
 // only its stack, so it may run on any thread:
 //   cfg.add_validator(baker::shape::validator(), {.any_thread = true});
 // It does not evaluate rules: add tools::rules_validator(ctx) for them. A build without
 // baker::script warns once that the shapes hold rules it cannot check.
 [[nodiscard]] Config::Validator validator();
 
-// The shapes of `shapes` as JSON (schema baker.shapes/1.7, docs/reference-json.md), sorted by
+// The shapes of `shapes` as JSON (schema baker.shapes/1.8, docs/reference-json.md), sorted by
 // name: each shape's place, keyed or not, and its fields with their types, ranges, steps,
 // kinds, documentation, and where they are declared, and its rules. For editors and agents.
 void write_json(const Set& shapes, TextSink out);

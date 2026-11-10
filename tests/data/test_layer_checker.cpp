@@ -41,7 +41,7 @@ void no_free_items(const ValidatorStack& stack, const Callback<void(const Error&
 std::string summary(const LayerReport& r) {
     std::string out;
     for (const LayerEffectEntry& e : r.effect) {
-        out += std::string(e.path.str()) + " " + to_string(e.values);
+        out += std::string(e.path->view()) + " " + to_string(e.values);
         if (e.below) out += " below " + to_string(*e.below);
         if (e.below_source)
             out += " from " + std::string(e.below_source->layer.str()) + ":" +
@@ -148,7 +148,7 @@ TEST_CASE("a checker's report holds until the Config changes, and the push runs 
     CHECK(any_runs == 1);
     REQUIRE(f.cfg->push_layer_text("hotfix", good, {.policy = &policy, .checked = &r}));
     CHECK(owner_runs == 2);  // the left-out check, then the merge
-    CHECK(any_runs == 2);    // the merge alone
+    CHECK(any_runs == 1);    // not again: the checker's run holds for the merge
     CHECK(f.cfg->get<int>("shop.item9.price") == 12);
     REQUIRE(f.cfg->remove_layer("hotfix"));
 

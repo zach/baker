@@ -7,6 +7,7 @@
 #include <baker/node.hpp>
 #include <baker/ref.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -26,6 +27,12 @@ inline constexpr uint32_t kSoloOffset = sizeof(SoloBlock);
 // Storage for a solo payload of `bytes`, from the default allocator; the payload's first
 // member must be the offset kSoloOffset.
 [[nodiscard]] void* solo_payload(OwnerKind kind, size_t bytes);
+
+// The baked curves a load keeps (curve.cpp): moved to a new epoch when one of the
+// load's arrays changes, and freed with the load.
+struct CurveCache;
+void curves_changed(CurveCache& cache) noexcept;
+void free_curves(CurveCache* cache) noexcept;
 
 // One load's arrays and strings: bump-allocated in blocks from an allocator and freed
 // together. A node stored here does not count its own arena; one that points elsewhere
@@ -57,6 +64,12 @@ public:
     [[nodiscard]] Owner& owner() noexcept { return head_.owner; }
     // The allocator its blocks come from.
     [[nodiscard]] const Allocator& allocator() const noexcept { return alloc_; }
+    // The baked curves sampled from this load, or null before the first.
+    [[nodiscard]] std::atomic<CurveCache*>& curves() noexcept { return curves_; }
+    // One of this load's arrays changed (Array::set): its baked curves are stale.
+    void changed() noexcept {
+        if (CurveCache* c = curves_.load(std::memory_order_acquire)) curves_changed(*c);
+    }
 
     // The creator's count, as a scoped handle.
     class Handle {
@@ -112,6 +125,7 @@ private:
     uint32_t dep_count_ = 0;
     uint32_t dep_cap_ = 0;
     size_t whole_ = sizeof(Arena);  // this allocation's size: more if it holds a block
+    std::atomic<CurveCache*> curves_{nullptr};
 };
 
 inline Arena& Arena::of(Owner& owner) noexcept {

@@ -5,6 +5,7 @@
 
 #include "common/containers.hpp"
 #include "data/text.hpp"
+#include "shape/view_members.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -250,6 +251,12 @@ List<baker::Symbol> view_shapes(const Set& set, std::span<const baker::Symbol> l
                                                 "`; name one with (@cxx_name N)",
                                             s.file, s.line));
         struct_names.push_back(sn);
+        if (s.by_id && !s.keyed)
+            errors.push_back(make_error(ErrorCode::Refused,
+                                        "shape " + quoted(s.name) +
+                                            " is (@view by_id), which only a (@keyed) shape's "
+                                            "table can keep",
+                                        s.file, s.line));
         Vec<Str> members;
         uint32_t required = 0;
         for (const Field& f : s.fields) {
@@ -312,8 +319,9 @@ void write_view_header(const Set& set, baker::Symbol shape, const ViewOptions& o
         Str(o.ns) + " {\n\n";
     const Str sn = struct_name(s);
     text += "struct " + sn + " {\n";
-    for (const Field& f : s.fields) {
-        if (!in_view(f)) continue;
+    // By alignment, largest first, so the struct has no padding the order could avoid.
+    for (const Field* fp : view_members(set, s)) {
+        const Field& f = *fp;
         text += "    " + member_type(f, set, o) + " " + member_name(f);
         if (f.type == Type::Int || f.type == Type::Float)
             text += " = 0";
@@ -329,6 +337,9 @@ void write_view_header(const Set& set, baker::Symbol shape, const ViewOptions& o
     for (const baker::Symbol seg : s.at) at += (at.empty() ? "" : " ") + Str(seg.str());
     text += "ull;\n    static constexpr std::string_view kAt = \"" + at +
             "\";\n    static constexpr bool kKeyed = " + (s.keyed ? "true" : "false") +
+            ";\n    // (@view by_id): the table keeps each record's ID, for index_of(RecordId).\n"
+            "    static constexpr bool kById = " +
+            (s.by_id ? "true" : "false") +
             ";\n    // The members a baked table relocates: defined in " + Str(s.name.str()) +
             "_read.hpp.\n    static constexpr std::span<const baker::ViewFixup> fixups() "
             "noexcept;\n};\n\n}  // namespace " +
@@ -341,8 +352,8 @@ void write_view_header(const Set& set, baker::Symbol shape, const ViewOptions& o
 Str fixups_text(const Set& set, const Shape& s, const ViewOptions& o) {
     const Str sn = Str(o.ns) + "::" + struct_name(s);
     Vec<Str> fixups;
-    for (const Field& f : s.fields) {
-        if (!in_view(f)) continue;
+    for (const Field* fp : view_members(set, s)) {
+        const Field& f = *fp;
         const Str offset = "offsetof(" + sn + ", " + member_name(f) + ")";
         Str nested_fixups = "nullptr, 0", nested_read = "nullptr";
         if (const Shape* n = f.shape.empty() ? nullptr : set.find(f.shape)) {

@@ -24,8 +24,13 @@
 //
 // A Curve read from a tree views its nodes: it is valid while that tree lives, as a
 // std::string_view read from one is. Tweak<Curve> keeps its tree, so its curve stays valid
-// until the next reload. A layer replaces a whole curve, as it replaces any key's values. A
-// shape's field type `curve` checks one without the game.
+// until the next reload. The first sample of a curve read from a load bakes its points into
+// a copy the load keeps beside its arrays and frees with them; a later read of the same key
+// views that copy, and samples as fast as a host's points. A load keeps up to 64 curves and
+// 8,192 points so; one past that, or one in an array built outside a load, samples from its
+// nodes. Array::set on an array of the load makes its curves bake again at their next sample. A
+// layer replaces a whole curve, as it replaces any key's values. A shape's field type `curve`
+// checks one without the game.
 
 #include <baker/array.hpp>
 
@@ -65,16 +70,21 @@ public:
     [[nodiscard]] CurveExtend extend() const noexcept { return extend_; }
 
     // The curve's value at `x`: a binary search for the segment, then its arithmetic.
-    // Allocates nothing.
+    // Allocates nothing, but for the first sample of a curve read from a load, which bakes
+    // it (above). Safe to call from several threads at once.
     [[nodiscard]] double sample(double x) const noexcept;
 
 private:
     friend struct CurveReader;
     const Node* nodes_ = nullptr;  // read from a tree: each point an array (x y [in out])
-    const CurvePoint* points_ = nullptr;
+    union {
+        const CurvePoint* points_ = nullptr;  // with no nodes_: the host's, or a baked copy
+        const Array* source_;  // with nodes_ and sourced_: the array whose values they are
+    };
     uint32_t size_ = 0;
     CurveMode mode_ = CurveMode::Monotone;
     CurveExtend extend_ = CurveExtend::Clamp;
+    bool sourced_ = false;  // source_ is set: its load can keep the baked copy
 
     [[nodiscard]] double x_at(size_t i) const noexcept;  // the search reads x alone
     [[nodiscard]] double slope_in(size_t i) const noexcept;

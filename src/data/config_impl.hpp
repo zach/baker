@@ -12,6 +12,7 @@
 #include "session.hpp"
 #include "table_build.hpp"
 #include "text.hpp"
+#include "tweak_index.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -34,6 +35,20 @@ struct Dep {
     bool present = false;
     uint64_t hash = 0;  // of its text; for a directory, of its listing
     bool directory = false;
+    // The session's stamper's, as of the last read or scan that found this text; 0: none.
+    // A scan that reads the file and finds the same text brings it up to date.
+    mutable uint64_t stamp = 0;
+};
+
+// What reading the stack's files uses beyond the Config's settings: the session the stack
+// reads from, the buffers a read fills, and where its warnings go. The Config keeps one for
+// its own thread (Impl::own()); a ReloadJob has its own, so that it can run on another
+// thread.
+struct ReadContext {
+    const LoadSession& base;
+    Str& scan;
+    Vec<Str>& listed;
+    Vec<Error>* deferred = nullptr;  // warnings kept here, not given to the warning handler
 };
 
 struct LayerState {
@@ -57,8 +72,9 @@ struct LayerState {
     // again only if one changed. Unknown when a cache replayed it, which parses nothing.
     Vec<Symbol> tested;
     bool tested_known = false;
-    // Its tree holds an (@aka ...), or it was replayed from a cache, which counts none: the
-    // merge then resolves a key the stack lacks against the aliases below it.
+    // Its tree holds an (@aka ...) or an (@id ...), or it was replayed from a cache written
+    // before the count: the merge then resolves a key the stack lacks against the aliases
+    // and IDs below it.
     bool aliases = false;
     // A directory of layers (push_layer_dir): its own layer, which holds nothing, is `dir`'s
     // marker, and the layers found in it stand directly above, each with `group` its name.
@@ -159,6 +175,23 @@ struct Leaf {
     // holder's record, and that array.
     uint32_t folded = 0;
     const Array* parent = nullptr;
+};
+
+// The path texts of a layer report (LayerEffectEntry::path), in one arena made at the first:
+// a report interns no path, so a candidate checked again and again leaves the symbol table as
+// it was. From the default allocator, as List's items are: a result outlives whoever
+// made it. `count` texts of `chars` in all size its first block.
+class ReportTexts {
+public:
+    ReportTexts(size_t count, size_t chars) noexcept;
+    ~ReportTexts();
+    ReportTexts(const ReportTexts&) = delete;
+    ReportTexts& operator=(const ReportTexts&) = delete;
+    [[nodiscard]] Ref<String> operator()(std::string_view text);
+
+private:
+    detail::Arena* arena_ = nullptr;
+    size_t expected_;
 };
 
 // What a check was made against (CheckStamp): a layer's name with its text, or with its
@@ -290,6 +323,9 @@ struct Config::Impl {
     mutable Vec<Str> listed{alloc};  // the same for a directory's listing
     // Every merge's temporaries, reused: a merge allocates only the arrays it keeps.
     mutable detail::MergeScratch merge_scratch{alloc};
+    // The tweaks by path, for a change to rebind only those under what changed;
+    // retune() marks what it binds.
+    mutable detail::TweakIndex tweak_index{alloc};
     // The merged tree as of the last commit or apply_edits: what a per-layer lookup consults
     // for a renamed record's aliases, only while some layer has one.
     Ref<Array> merged_root;
@@ -310,6 +346,10 @@ struct Config::Impl {
         ValidatorOptions options;
     };
     Vec<Check> validators{alloc};
+    // A merge with the live edits not yet applied, for get() above them, kept until the next
+    // change (by epoch): reads between two edits share one merge.
+    Ref<Array> pending_merge;
+    uint64_t pending_epoch = 0;
     // Baked tables: each registered spec, its current block, and the arrays it was
     // built from, so a change that shares them rebuilds nothing.
     Vec<detail::TableSlot> tables{alloc};
@@ -329,6 +369,7 @@ struct Config::Impl {
     // validator added or removed, a set(), a call of session(). Each Config starts its own
     // range, so a report never holds for another Config at the same address.
     uint64_t generation = 0;
+    uint64_t commits = 0;  // full merges: a ReloadJob begun before one is refused
 
     TimeSource clock = steady_now;
     void* clock_user = nullptr;
@@ -369,6 +410,47 @@ struct Config::Impl {
     // is superseded. Allocates only the ring, once.
     void log_edit(ScratchEntry& owner, const Node* before, uint32_t before_count,
                   std::span<const Node> after, const Source& source);
+    // The change log: a ring of transactions, the one being built aside until its
+    // end; `open` counts the begin_transaction nesting.
+    struct Kept {  // a transaction with the states before and after it, for undo and redo
+        Transaction t;
+        ConfigSnapshot before, after;
+    };
+    struct Changes {
+        explicit Changes(const Allocator& a) : ring(a), pending(a), pending_written(a) {}
+        Vec<Kept> ring;  // oldest first; ring[0, done) applied, the rest undone
+        size_t cap = 0;
+        size_t done = 0;
+        uint64_t count = 0;  // transactions ever finished
+        uint32_t open = 0;
+        bool quiet = false;  // an undo or redo in progress: not recorded
+        Symbol name;
+        uint64_t time_ns = 0;
+        ConfigSnapshot origin;  // the state when the log was turned on
+        Vec<ChangeRecord> pending;
+        Vec<WrittenLine> pending_written;
+    } changes{alloc};
+    [[nodiscard]] bool logging() const noexcept { return changes.cap != 0 && !changes.quiet; }
+    bool from_image = false;  // push_image_layers is pushing a section's tree
+    [[nodiscard]] ConfigSnapshot snapshot() const;
+    // Opens a transaction if none is, named `name`; a change then records into it, and
+    // close() finishes it unless begin_transaction keeps it open.
+    void begin_change(Symbol name);
+    void add_change(ChangeRecord record);
+    void close_change();
+    // A Set record for `path`, valued `before` (sourced at `source`) then `after`, written
+    // to `layer`: the values copied into trees of their own.
+    void record_set(const Path& path, std::span<const Node> before, std::span<const Node> after,
+                    const Source& source, Symbol layer);
+    // A commit's records: the walk of the previous root and the new one where they
+    // differ, into the open transaction or one named `trigger`.
+    void record_commit(const Config& c, const Array& before, const Array& after, Symbol trigger);
+    // The walk itself, into the open transaction. `layer` empty: the merged tree, each
+    // record's layer being the one that supplies the value; else one layer's own tree before
+    // and after a write into it (a write-back, a promotion), every record written to
+    // `layer`, since what the merged tree read need not change when the layer above
+    // supplied the values already.
+    void walk_changes(const Config& c, const Array& before, const Array& after, Symbol layer);
     // Gives `owner`'s latest entry its fate, if it is still unsaved.
     void settle(const ScratchEntry& owner, EditFate fate, WrittenLine written) noexcept {
         if (JournalEntry* e = journal_entry(owner.edit, owner.key);
@@ -408,8 +490,21 @@ struct Config::Impl {
 
     // --- Reading layers ---
 
+    [[nodiscard]] ReadContext own() const { return {base, scan, listed, nullptr}; }
+    // A warning from reading: to the context's list, or to the warning handler.
+    void tell(const ReadContext& io, const Error& e) const {
+        if (io.deferred)
+            io.deferred->push_back(e);
+        else if (warn)
+            warn(e);
+    }
+
+    [[nodiscard]] Rc<LoadSession> session_below(const ReadContext& io, const Vec<LayerState>& ls,
+                                                size_t i) const {
+        return i == 0 ? Rc<LoadSession>::make(alloc, io.base) : ls[i - 1].after;
+    }
     [[nodiscard]] Rc<LoadSession> session_below(const Vec<LayerState>& ls, size_t i) const {
-        return i == 0 ? Rc<LoadSession>::make(alloc, base) : ls[i - 1].after;
+        return session_below(own(), ls, i);
     }
 
     // A fresh cache of `path`, or the text and a new cache, written through the writer: a
@@ -422,8 +517,12 @@ struct Config::Impl {
     // Reads a file layer, recording every file it reads (or looks for) for reload, and the
     // time spent reading them into `read_ns`; or a layer pushed as text, from its text only.
     // The read's warnings go to the warning handler, and to `warnings` if given.
+    Expected<void> read(const ReadContext& io, LayerState& layer, const LoadSession& before,
+                        uint64_t* read_ns = nullptr, Vec<Error>* warnings = nullptr) const;
     Expected<void> read(LayerState& layer, const LoadSession& before, uint64_t* read_ns = nullptr,
-                        Vec<Error>* warnings = nullptr) const;
+                        Vec<Error>* warnings = nullptr) const {
+        return read(own(), layer, before, read_ns, warnings);
+    }
     // A layer pushed under a policy: the verdict of the report it brings if that still holds
     // (`subject` names it; 0 for a file), with the validators a LayerChecker left out run
     // now; else of a check.
@@ -431,7 +530,15 @@ struct Config::Impl {
                                        std::string_view name, const Ref<Array>& tree,
                                        uint64_t subject, bool on_top,
                                        std::span<const Node> commands, const LoadSession& session,
-                                       std::span<const Error> read_warnings) const;
+                                       std::span<const Error> read_warnings,
+                                       bool* held = nullptr) const;
+    // What the next commit's validators are told: the pushed layer's tree, for a
+    // push (ValidatorStack::changed), and whether the push's report held, when the
+    // any_thread validators do not run again. Set around the push's change(), then cleared.
+    const Array* pushed = nullptr;
+    bool pushed_held = false;
+    // change() for a push of `tree`, whose report held if `held`.
+    void change_pushed(Config& c, const Array* tree, bool held);
     // push_layer by path or text, once the layer is named.
     Expected<void> push_read(Config& c, LayerState&& layer, LayerOptions opts);
     // A pushed layer's options: its condition read, and options.enabled from it.
@@ -440,10 +547,11 @@ struct Config::Impl {
     // defines. Whether it changed.
     bool apply_condition(LayerState& l) const;
 
-    bool changed(const LayerState& layer, Symbol& first) const;
+    bool changed(const ReadContext& io, const LayerState& layer, Symbol& first) const;
     // Whether reload() must read `layer` again: a file of it changed, or, for a directory of
     // layers, its listing or order.dta.
-    bool stale(const LayerState& layer, Symbol& first) const;
+    bool stale(const ReadContext& io, const LayerState& layer, Symbol& first) const;
+    bool stale(const LayerState& layer, Symbol& first) const { return stale(own(), layer, first); }
 
     // --- Directories of layers ---
 
@@ -454,11 +562,16 @@ struct Config::Impl {
     };
     // Lists the directory of `marker`, filling its deps, and `found` with its
     // layers in order.dta's order. Warns of a name order.dta lists that the directory lacks.
-    [[nodiscard]] Expected<void> list_dir(LayerState& marker, Vec<Found>& found) const;
+    [[nodiscard]] Expected<void> list_dir(const ReadContext& io, LayerState& marker,
+                                          Vec<Found>& found) const;
     // Lists the directory of the marker at `ls[at]` again and puts the layers it holds above
     // it, in place of those that were: one that stays keeps its state (its enabled flag).
     // Returns how many layers the group now has above the marker.
-    [[nodiscard]] Expected<size_t> relist(Vec<LayerState>& ls, size_t at) const;
+    [[nodiscard]] Expected<size_t> relist(const ReadContext& io, Vec<LayerState>& ls,
+                                          size_t at) const;
+    [[nodiscard]] Expected<size_t> relist(Vec<LayerState>& ls, size_t at) const {
+        return relist(own(), ls, at);
+    }
     // How many layers of `ls[at]`'s directory stand above it (0 for a layer that is not one).
     [[nodiscard]] static size_t members(const Vec<LayerState>& ls, size_t at) noexcept {
         if (ls[at].dir.empty()) return 0;
@@ -470,12 +583,16 @@ struct Config::Impl {
     // Re-reads `layers[from..]` as the read and parse stages of `rec`, from `t`, which it
     // moves to their end; a failure marks the record a parse error.
     Expected<void> reread_stages(ReloadRecord& rec, size_t from, uint64_t& t) {
-        return reread_stages(rec, layers, from, t);
+        return reread_stages(own(), rec, layers, from, t);
     }
     // The same over `ls`, a stack to replace `layers` with.
     Expected<void> reread_stages(ReloadRecord& rec, Vec<LayerState>& ls, size_t from,
                                  uint64_t& t) const {
-        auto r = reread(ls, from, &rec.read_ns, &rec.files_reloaded);
+        return reread_stages(own(), rec, ls, from, t);
+    }
+    Expected<void> reread_stages(const ReadContext& io, ReloadRecord& rec, Vec<LayerState>& ls,
+                                 size_t from, uint64_t& t) const {
+        auto r = reread(io, ls, from, &rec.read_ns, &rec.files_reloaded);
         const uint64_t parsed = now();
         rec.parse_ns = parsed - t - rec.read_ns;
         t = parsed;
@@ -485,8 +602,12 @@ struct Config::Impl {
 
     // Re-reads `ls[from..]` in order (each sees the macros of the ones below), all or
     // nothing.
+    Expected<void> reread(const ReadContext& io, Vec<LayerState>& ls, size_t from,
+                          uint64_t* read_ns = nullptr, uint32_t* files = nullptr) const;
     Expected<void> reread(Vec<LayerState>& ls, size_t from, uint64_t* read_ns = nullptr,
-                          uint32_t* files = nullptr) const;
+                          uint32_t* files = nullptr) const {
+        return reread(own(), ls, from, read_ns, files);
+    }
 
     // Where push_layer puts a layer: its index in the stack, from opts.below or .above, which
     // it clears.

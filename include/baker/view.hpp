@@ -6,10 +6,10 @@
 // member's default, and a field the shape does not declare is left in the tree.
 //
 //   // generated from #shape (move (@at fighters * moves) (@keyed) (@view) ...)
-//   struct Move {
+//   struct Move {                                     // by alignment, largest first
+//       baker::ListView<baker::Symbol> cancel_into;
 //       int32_t startup = 0;
 //       float damage = 0;
-//       baker::ListView<baker::Symbol> cancel_into;
 //       static constexpr std::string_view kShapeName = "move";
 //       static constexpr uint64_t kShapeDigest = 0x...;   // shape::view_digest of the shape
 //   };

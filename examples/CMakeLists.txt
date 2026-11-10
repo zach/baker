@@ -74,7 +74,7 @@ if(BAKER_BUILD_SHAPE)
     PROJECT ${CMAKE_CURRENT_SOURCE_DIR}/content-tables/data/baker-project.dta)
   if(BAKER_BUILD_TESTS)  # in shipping builds too: the image is what ships
     baker_example_test(baker_example_content_tables baker_example_content_tables
-      "^views: 1, up to date${nl}jab: startup 4, damage 3[.]5, button light, cancels into slam kick; icon art/jab[.]png${nl}kestrel[.]slam is a7d2c41e9b06f58a3c1d2e4f60718293, startup 9${nl}kestrel[.]slam: \"Launches\"${nl}kestrel[.]slam runs a command on a hit${nl}wren[.]poke: \"Safe at range\"${nl}4 moves read${nl}table: 4 moves; slam is row 1, damage 12, id kept${nl}table: heavy is slam, row 1${nl}image: [0-9]+ bytes, 4 moves, jab cancels into slam${nl}baker: field 'startup' of 'move' is not an int: fast .*fighters/kestrel/moves/jab"
+      "^views: 1, up to date${nl}jab: startup 4, damage 3[.]5, button light, cancels into slam kick[;] icon art/jab[.]png${nl}kestrel[.]slam is a7d2c41e9b06f58a3c1d2e4f60718293, startup 9${nl}kestrel[.]slam: \"Launches\"${nl}kestrel[.]slam runs a command on a hit${nl}wren[.]poke: \"Safe at range\"${nl}4 moves read${nl}table: 4 moves[;] slam is row 1, damage 12, id kept${nl}table: heavy is slam, row 1${nl}(layer: fighters[.]kestrel[.]moves[.]slam[.]damage [(]12[)] -> [(]14[)] in change-set${nl}promote: fighters[.]kestrel[.]moves[.]heavy[.]damage none -> [(]damage 14[)] in content${nl}promote wrote content[.]dta:[0-9]+${nl}undone: slam damage 12, the change set gone${nl})?image: [0-9]+ bytes, 4 moves, jab cancels into slam${nl}baker: field 'startup' of 'move' is not an int: fast .*fighters/kestrel/moves/jab"
       ${CMAKE_CURRENT_SOURCE_DIR}/content-tables/data/baker-project.dta game.datb)
   endif()
 endif()

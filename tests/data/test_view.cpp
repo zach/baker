@@ -13,6 +13,7 @@
 #include "scalars_read.hpp"
 #include "views.hpp"
 
+#include <cstddef>
 #include <map>
 #include <string>
 #include <vector>
@@ -120,16 +121,38 @@ TEST_CASE("a packed list, a baked table's, reads its elements directly") {
     CHECK(fixups[2].element == ViewFixup::Element::Symbol);
     CHECK(fixups[2].read == nullptr);
     CHECK(fixups[2].element_size == sizeof(Symbol));
-    CHECK(fixups[3].kind == ViewFixupKind::Struct);
-    CHECK(fixups[3].nested_count == 0);  // vec2 has two floats
-    CHECK(fixups[3].read != nullptr);
-    CHECK(fixups[4].element == ViewFixup::Element::Struct);
-    CHECK(fixups[4].element_size == sizeof(views_test::Vec2));
-    CHECK(fixups[5].kind == ViewFixupKind::Curve);
+    CHECK(fixups[3].element == ViewFixup::Element::Struct);
+    CHECK(fixups[3].element_size == sizeof(views_test::Vec2));
+    CHECK(fixups[4].kind == ViewFixupKind::Curve);
+    CHECK(fixups[5].kind == ViewFixupKind::Struct);
+    CHECK(fixups[5].nested_count == 0);  // vec2 has two floats
+    CHECK(fixups[5].read != nullptr);
+    // In the struct's order, which is by alignment, largest first.
+    for (size_t i = 1; i < fixups.size(); ++i) CHECK(fixups[i - 1].offset < fixups[i].offset);
     CHECK(views_test::Move::kAt == "fighters * moves");
     CHECK(views_test::Move::kKeyed);
     CHECK(views_test::Vec2::fixups().empty());
     CHECK(views_test::Vec2::kAt.empty());
+}
+
+TEST_CASE("a generated struct orders its members by alignment, largest first") {
+    using views_test::Scalars;
+    // Pointers first, then the four-byte members, then the two- and one-byte ones, each
+    // group as the shape declares it.
+    CHECK(offsetof(Scalars, name) == 0);
+    CHECK(offsetof(Scalars, button) < offsetof(Scalars, damage));
+    CHECK(offsetof(Scalars, damage) < offsetof(Scalars, startup));
+    CHECK(offsetof(Scalars, startup) < offsetof(Scalars, armored));
+    CHECK(offsetof(Move, name) == 0);
+    CHECK(offsetof(Move, ramp) < offsetof(Move, damage));
+    CHECK(offsetof(Move, damage) < offsetof(Move, hitbox));
+    CHECK(offsetof(Move, hitbox) < offsetof(Move, startup));
+    CHECK(offsetof(Move, armored) == offsetof(Move, startup) + sizeof(uint16_t));
+    if constexpr (sizeof(void*) == 8) {
+        // In the shape's order they were 40 and 104 bytes, with 7 and 9 bytes of holes.
+        CHECK(sizeof(Scalars) == 32);
+        CHECK(sizeof(Move) == 96);
+    }
 }
 
 TEST_CASE("a view's errors name the field, located where it is written") {

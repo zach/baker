@@ -13,9 +13,15 @@
 #include "item_read.hpp"
 #include "move_read.hpp"
 #include "ok.hpp"
+#include "table_build.hpp"
 #include "temp_dir.hpp"
 
+#include <algorithm>
+#include <cstring>
+#include <new>
+#include <span>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 using namespace baker;
@@ -39,6 +45,108 @@ const char* const kFighters =
 
 std::string text(const Error& e) {
     return std::string(to_string(e));
+}
+
+bool same_curve(const Curve& a, const Curve& b) {
+    if (a.size() != b.size() || a.mode() != b.mode() || a.extend() != b.extend()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        const CurvePoint p = a.point(i), q = b.point(i);
+        if (p.x != q.x || p.y != q.y || p.in != q.in || p.out != q.out || p.sloped != q.sloped)
+            return false;
+    }
+    return true;
+}
+
+template <class V>
+bool same_list(const ListView<V>& a, const ListView<V>& b) {
+    if (a.size() != b.size()) return false;
+    for (uint32_t i = 0; i < a.size(); ++i) {
+        const V x = a[i], y = b[i];
+        if constexpr (std::is_same_v<V, views_test::Vec2>) {
+            if (x.x != y.x || x.y != y.y) return false;
+        } else if (!(x == y)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool same(const Move& a, const Move& b) {
+    return a.startup == b.startup && a.damage == b.damage && a.name == b.name &&
+           a.button == b.button && a.armored == b.armored &&
+           same_list(a.cancel_into, b.cancel_into) && a.hitbox.x == b.hitbox.x &&
+           a.hitbox.y == b.hitbox.y && same_list(a.points, b.points) && same_curve(a.ramp, b.ramp);
+}
+
+bool same(const Item& a, const Item& b) {
+    return a.price == b.price && a.tag == b.tag && same_list(a.sizes, b.sizes);
+}
+
+// Every row of `t` reads back what the view's reader reads from its record in `root`, found
+// by the row's path: the table changes how a row is stored, never what it reads.
+template <class T>
+void check_rows(const Table<T>& t, const Array& root, std::string_view at) {
+    REQUIRE(t);
+    for (uint32_t i = 0; i < t.size(); ++i) {
+        std::string path(at);
+        if (t.block()->wildcards()) {
+            // The parent's tag: the one whose range holds the row.
+            std::string parent;
+            for (const Node& n : *root.try_get(Path(at)))
+                if (const Array* a = n.try_array(); a && !a->tag().empty()) {
+                    const IndexRange r = t.children_of(a->tag());
+                    if (i >= r.first && i < r.first + r.count) parent = a->tag().str();
+                }
+            path += "." + parent + ".moves";
+        }
+        path += "." + std::string(t.key_of(i).str());
+        const Array* record = root.try_get(Path(path));
+        REQUIRE_MESSAGE(record, path);
+        T read{};
+        (void)ViewReader<T>::read(*record, read, nullptr);
+        CHECK_MESSAGE(same(t[i], read), path);
+    }
+}
+
+// A record ID's text: `n` in decimal digits, after an `a` and zeros to 32 digits.
+std::string id_text(int n) {
+    const std::string digits = std::to_string(n);
+    return "a" + std::string(31 - digits.size(), '0') + digits;
+}
+
+// The fixtures at scale: 300 moves and 40 items, with strings (many repeated), symbol lists,
+// lists of nested views, nested views, curves, aliases, IDs and a record in error.
+std::string many_fighters() {
+    std::string fighters = "(fighters\n";
+    for (int f = 0; f < 6; ++f) {
+        fighters += " (f" + std::to_string(f) + " (moves\n";
+        for (int m = 0; m < 50; ++m) {
+            const std::string i = std::to_string(f * 50 + m);
+            fighters += "  (m" + std::to_string(m) + (m % 9 == 0 ? " (@aka old" + i + ")" : "");
+            if (m % 7 == 0) fighters += " (@id " + id_text(100 + f * 50 + m) + ")";
+            fighters += " (startup " + std::to_string(m % 60 + 1) + ") (damage " + i + ".5)";
+            if (m % 4) fighters += " (name \"move number " + std::to_string(m % 10) + "\")";
+            if (m % 3) fighters += " (cancel_into m1 m2 m" + std::to_string(m % 7) + ")";
+            fighters += " (hitbox (x " + i + ") (y 2))";
+            for (int p = 0; p < m % 4; ++p) fighters += p ? "" : " (points";
+            for (int p = 0; p < m % 4; ++p)
+                fighters += " (p (x " + std::to_string(p) + ") (y " + i + "))";
+            if (m % 4) fighters += ")";
+            if (m % 5 == 0) fighters += " (ramp (0 0) (1 " + i + ") (2 1))";
+            if (m == 17) fighters += " (armored maybe)";  // not a bool: an error, located
+            fighters += ")\n";
+        }
+        fighters += " ))\n";
+    }
+    fighters += ")\n(items";
+    for (int k = 0; k < 40; ++k) {
+        fighters += " (it" + std::to_string(k) + " (price " + std::to_string(k) + ")";
+        if (k % 2) fighters += " (tag \"" + std::string(static_cast<size_t>(k % 6), 'x') + "\")";
+        if (k % 3) fighters += " (sizes 1 2 " + std::to_string(k) + ")";
+        fighters += ")";
+    }
+    fighters += ")\n";
+    return fighters;
 }
 
 }  // namespace
@@ -89,6 +197,114 @@ TEST_CASE("a table holds the records of a keyed shape, packed, with their string
     CHECK(items[0].sizes[2] == 3);
     CHECK(items[1].tag.empty());
     CHECK(items[1].sizes.empty());
+}
+
+TEST_CASE("every row reads back what the view reads from its record") {
+    SUBCASE("the fixtures") {
+        Config cfg({.tweaks = nullptr});
+        REQUIRE(add_table<Move>(cfg));
+        REQUIRE(add_table<Item>(cfg));
+        REQUIRE(cfg.push_layer_text("base", kFighters));
+        check_rows(table<Move>(cfg), *cfg.root(), "fighters");
+        check_rows(table<Item>(cfg), *cfg.root(), "items");
+    }
+    SUBCASE("strings, lists and nested views, with aliases, IDs and a record in error") {
+        Config cfg({.tweaks = nullptr});
+        std::vector<std::string> warnings;
+        cfg.set_warning_handler([&](const Error& e) { warnings.push_back(text(e)); });
+        REQUIRE(add_table<Move>(cfg));
+        REQUIRE(add_table<Item>(cfg));
+        REQUIRE(cfg.push_layer_text("base", many_fighters()));
+        REQUIRE(table<Move>(cfg).size() == 300);
+        CHECK(table<Item>(cfg).size() == 40);
+        // The record in error is reported once each build, from its one read.
+        CHECK(std::count_if(warnings.begin(), warnings.end(), [](const std::string& w) {
+                  return w.find("armored") != std::string::npos;
+              }) == 6);
+        check_rows(table<Move>(cfg), *cfg.root(), "fighters");
+        check_rows(table<Item>(cfg), *cfg.root(), "items");
+    }
+}
+
+TEST_CASE("a table stores each distinct string once") {
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(add_table<Move>(cfg));
+    REQUIRE(add_table<Item>(cfg));
+    REQUIRE(cfg.push_layer_text("base", many_fighters()));
+    const Table<Move> moves = table<Move>(cfg);
+    // Each name is one of ten texts: every row with the same text points at the same bytes.
+    std::vector<std::string_view> seen;
+    for (const Move& m : moves.rows()) {
+        if (m.name.empty()) continue;
+        const auto it = std::find(seen.begin(), seen.end(), m.name);
+        if (it == seen.end())
+            seen.push_back(m.name);
+        else
+            CHECK(it->data() == m.name.data());
+    }
+    CHECK(seen.size() == 10);
+    // The empty strings share one byte too, and each is terminated.
+    const Table<Item> items = table<Item>(cfg);
+    CHECK(items[0].tag.data() == items[2].tag.data());
+    CHECK(items[1].tag.data()[items[1].tag.size()] == '\0');
+    // The same rows with every text distinct take more pool: 300 rows of names, ten texts.
+    std::string distinct = many_fighters();
+    for (size_t at = 0, n = 0; (at = distinct.find("move number ", at)) != std::string::npos; ++n) {
+        at += 12;
+        distinct.insert(at, std::to_string(n) + "_");
+    }
+    Config other({.tweaks = nullptr});
+    REQUIRE(add_table<Move>(other));
+    REQUIRE(other.push_layer_text("base", distinct));
+    CHECK(table<Move>(other).block()->block_bytes() > moves.block()->block_bytes() + 200 * 13);
+}
+
+TEST_CASE("a table keeps IDs only when its view is (@view by_id)") {
+    // Move is by_id; Item is not, so its table keeps no ID column and finds no ID.
+    static_assert(Move::kById && !Item::kById);
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(add_table<Move>(cfg));
+    REQUIRE(add_table<Item>(cfg));
+    REQUIRE(cfg.push_layer_text(
+        "base", std::string(kFighters) +
+                    "(items (shield (@id a0000000000000000000000000000003) (price 40)))\n"));
+    const Table<Item> items = table<Item>(cfg);
+    REQUIRE(items.size() == 3);
+    CHECK_FALSE(items.block()->by_id());
+    CHECK(items.id_of(2).empty());
+    CHECK_FALSE(items.index_of(*RecordId::parse("a0000000000000000000000000000003")));
+    CHECK(items.index_of(Symbol("shield")) == 2);
+    const Table<Move> moves = table<Move>(cfg);
+    CHECK(moves.block()->by_id());
+    CHECK(moves.index_of(*RecordId::parse("a0000000000000000000000000000002")) == 3);
+    // The same view registered without by_id: the same rows, smaller by the ID column and
+    // its index, and no ID found.
+    TableSpec spec{
+        .digest = Move::kShapeDigest,
+        .name = Move::kShapeName,
+        .at = Move::kAt,
+        .row_size = sizeof(Move),
+        .row_align = alignof(Move),
+        .fixups = Move::fixups(),
+        .by_id = false,
+        .init = [](void* row) { new (row) Move{}; },
+        .read = &view_detail::read_erased<Move>,
+    };
+    Config plain({.tweaks = nullptr});
+    REQUIRE(plain.add_table(spec));
+    REQUIRE(plain.push_layer_text("base", many_fighters()));
+    Config full({.tweaks = nullptr});
+    REQUIRE(add_table<Move>(full));
+    REQUIRE(full.push_layer_text("base", many_fighters()));
+    const Table<Move> without = table<Move>(plain);
+    const Table<Move> with = table<Move>(full);
+    REQUIRE(without.size() == 300);
+    CHECK(without.block()->block_bytes() + 300 * (sizeof(RecordId) + sizeof(BakedTable::IdEntry)) ==
+          with.block()->block_bytes());
+    CHECK(with.index_of(*RecordId::parse(id_text(100))) == 0);
+    CHECK_FALSE(without.index_of(*RecordId::parse(id_text(100))));
+    CHECK(without.id_of(0).empty());
+    check_rows(without, *plain.root(), "fighters");
 }
 
 TEST_CASE("a table is read by key, by path, by ID, by alias and by parent") {
@@ -177,6 +393,40 @@ TEST_CASE("a table is rebuilt when its records change, a held handle keeps the o
     auto twice = add_table<Move>(late);
     REQUIRE_FALSE(twice);
     CHECK(text(twice.error()).find("registered already") != std::string::npos);
+}
+
+TEST_CASE("an edit elsewhere keeps a table whose records a layer overrides") {
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(add_table<Move>(cfg));
+    REQUIRE(cfg.push_layer_text("base", kFighters));
+    // The tune layer overrides kestrel's moves: every merge builds that array anew.
+    REQUIRE(cfg.push_layer_text("tune", "(fighters (kestrel (moves (jab (damage 4)))))"));
+    const Table<Move> tuned = table<Move>(cfg);
+    // A layer that touches nothing below fighters: an equal moves array, the table kept.
+    REQUIRE(cfg.push_layer_text("other", "(volume 3)"));
+    CHECK(table<Move>(cfg).block() == tuned.block());
+    if constexpr (!kShipping) {
+        REQUIRE(cfg.set("volume", 4));
+        cfg.apply_edits();
+        CHECK(table<Move>(cfg).block() == tuned.block());
+        // An edit to a record does rebuild it.
+        REQUIRE(cfg.set("fighters.kestrel.moves.kick.damage", 9));
+        cfg.apply_edits();
+        CHECK(table<Move>(cfg).block() != tuned.block());
+        CHECK(table<Move>(cfg)[2].damage == 9.0f);
+    }
+}
+
+TEST_CASE("a parent renamed above an unchanged records array rebuilds the table") {
+    Config cfg({.tweaks = nullptr});
+    REQUIRE(add_table<Move>(cfg));
+    REQUIRE(cfg.push_layer_text("base", "(fighters (kestrel (moves (jab (startup 4)))))"));
+    CHECK(table<Move>(cfg).index_of("kestrel.jab") == 0);
+    // The same moves, under another fighter: the rows' tags change with the `*`.
+    REQUIRE(cfg.remove_layer("base"));
+    REQUIRE(cfg.push_layer_text("base", "(fighters (falcon (moves (jab (startup 4)))))"));
+    CHECK_FALSE(table<Move>(cfg).index_of("kestrel.jab"));
+    CHECK(table<Move>(cfg).index_of("falcon.jab") == 0);
 }
 
 TEST_CASE("a field that is not a literal reads as its default, with a located error") {
@@ -288,6 +538,62 @@ TEST_CASE("a stack image holds the contract layers and the tables, and a Config 
     CHECK(table<Item>(cfg)[1].tag == "sharp");
 }
 
+TEST_CASE("a table section reads back every row, carries no addresses, and is checked") {
+    const std::string fighters = many_fighters();
+    // Two builds of the same data write the same bytes: the section holds offsets and names.
+    std::vector<std::string> sections[2];
+    std::vector<TableSpec> specs;
+    for (int build = 0; build < 2; ++build) {
+        Config cfg({.tweaks = nullptr});
+        REQUIRE(add_table<Move>(cfg));
+        REQUIRE(add_table<Item>(cfg));
+        REQUIRE(cfg.push_layer_text("base", fighters));
+        for (const detail::TableSlot& slot : detail::table_slots(cfg)) {
+            Str out;
+            REQUIRE(detail::write_table(*slot.built, slot.spec, out));
+            sections[build].emplace_back(out.data(), out.size());
+            if (build == 0) specs.push_back(slot.spec);
+        }
+        if (build == 1) continue;
+        // Read back into blocks of their own: every row as the view reads its record.
+        for (size_t i = 0; i < specs.size(); ++i) {
+            Error why;
+            Ref<const BakedTable> block =
+                detail::read_table(sections[0][i], specs[i], default_allocator(), why);
+            REQUIRE_MESSAGE(block, text(why));
+            if (specs[i].digest == Move::kShapeDigest) {
+                const Table<Move> moves(block);
+                check_rows(moves, *cfg.root(), "fighters");
+                CHECK(moves.index_of(*RecordId::parse(id_text(107))) == 7);
+                CHECK(moves.index_of("f3.old159") == 159);
+                CHECK(moves.children_of(Symbol("f5")).first == 250);
+            } else {
+                check_rows(Table<Item>(block), *cfg.root(), "items");
+            }
+        }
+    }
+    REQUIRE(sections[0].size() == 2);
+    CHECK(sections[0] == sections[1]);
+    // A section is refused, by name, for a view that differs, and as damaged when it does not
+    // hold together.
+    const std::string& moves =
+        specs[0].digest == Move::kShapeDigest ? sections[0][0] : sections[0][1];
+    const TableSpec& spec = specs[0].digest == Move::kShapeDigest ? specs[0] : specs[1];
+    const auto refused = [&](const std::string& bytes, const TableSpec& s) {
+        Error why;
+        const Ref<const BakedTable> block = detail::read_table(bytes, s, default_allocator(), why);
+        return block ? std::string() : text(why);
+    };
+    TableSpec other = spec;
+    other.by_id = false;
+    CHECK(refused(moves, other).find("lookup by ID differs") != std::string::npos);
+    CHECK(refused(moves.substr(0, moves.size() - 64), spec).find("damaged") != std::string::npos);
+    std::string more_rows = moves;
+    const uint32_t rows = 1u << 20;
+    std::memcpy(more_rows.data() + 20, &rows, sizeof rows);  // after digest, fixups, row_size
+    CHECK(refused(more_rows, spec).find("damaged") != std::string::npos);
+}
+
 TEST_CASE("an image's table that does not match the compiled view is skipped, with a warning") {
     test::TempDir dir;
     const Project project = two_layers(dir);
@@ -320,4 +626,14 @@ TEST_CASE("an image's table that does not match the compiled view is skipped, wi
     auto r = open_project(bad, project);
     REQUIRE_FALSE(r);
     CHECK(text(r.error()).find("damaged") != std::string::npos);
+    // An image of an older version is refused by its version, not as damaged; the
+    // table section's layout made it 3.
+    std::string old = image;
+    old[10] = 1;  // the version, after the ten bytes of magic
+    old[11] = 0;
+    Config older({.tweaks = nullptr, .stack_image = dir.write("old.datb", old)});
+    auto o = open_project(older, project);
+    REQUIRE_FALSE(o);
+    CHECK(o.error().code() == ErrorCode::Refused);
+    CHECK(text(o.error()).find("of version 1; this build reads version 3") != std::string::npos);
 }

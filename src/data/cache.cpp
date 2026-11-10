@@ -28,7 +28,11 @@ struct CacheLayout {
     static constexpr size_t kBlock = offsetof(Array, block_);
     static constexpr size_t kLine = offsetof(Array, line_);
     static const Node* slots(const Array& a) noexcept { return a.data(); }
-    static uint32_t tag_key(const Node& n) noexcept { return Array::tag_key(n); }
+    // The key `n` takes in the run of `parent`, whose header is in place: a sorted array's
+    // run holds its own keys.
+    static uint32_t run_key(const char* parent, const Node& n) noexcept {
+        return reinterpret_cast<const Array*>(parent)->run_key(n);
+    }
 };
 
 namespace {
@@ -419,9 +423,11 @@ private:
 };
 
 // Checks the cache at `file` and fixes it up in place, in the arena that holds it. `meta` is
-// set to the cache's record of its load, or null.
+// set to the cache's record of its load, or null. `trusted`: the bytes are a section of a
+// stack image whose own checksum has passed, so the cache's is not computed again; the rest
+// of the checks stand.
 Expected<Ref<Array>> load(char* file, size_t bytes, std::string_view name, const Cipher* cipher,
-                          const Allocator& alloc, const Array*& meta) {
+                          const Allocator& alloc, const Array*& meta, bool trusted = false) {
     Header h{};
     if (bytes < sizeof h) return bad(name, "is not a Baker cache");
     std::memcpy(&h, file, sizeof h);
@@ -441,7 +447,7 @@ Expected<Ref<Array>> load(char* file, size_t bytes, std::string_view name, const
                       (h.flags & ~kEnciphered) == 0 && h.symbols % 8 == 0 && h.symbols <= bytes &&
                       h.symbol_slots <= (bytes - h.symbols) / 16 && h.home_bits < 32 &&
                       (size_t{1} << h.home_bits) <= h.symbol_slots;
-    if (!fits || h.hash != file_hash(file, bytes)) return bad(name, "is damaged");
+    if (!fits || (!trusted && h.hash != file_hash(file, bytes))) return bad(name, "is damaged");
     if (h.flags & kEnciphered)
         cipher->decrypt(cipher->user,
                         {reinterpret_cast<std::byte*>(file) + sizeof h, bytes - sizeof h});
@@ -561,7 +567,7 @@ Expected<Ref<Array>> load(char* file, size_t bytes, std::string_view name, const
                 }
                 std::memcpy(n, &target, 8);
                 if (t != Type::String) {  // the parent's tag run, now the child's tag is set
-                    const uint32_t key = L::tag_key(*reinterpret_cast<const Node*>(n));
+                    const uint32_t key = L::run_key(parent, *reinterpret_cast<const Node*>(n));
                     std::memcpy(parent + sizeof(Array) + size_t{i} * 4, &key, 4);
                 }
                 ++i;
@@ -709,8 +715,8 @@ Ref<Array> record_of(const LoadSession& s) {
                         s.drop_metadata ? without_notes(d.form) : Node(d.form)};
         shapes.push_back(list(entry));
     }
-    // (aliases N): how many arrays of the load carry an (@aka ...), which the merge reads;
-    // a replay parses nothing, so the record says it.
+    // (aliases N): how many arrays of the load carry an (@aka ...) or an (@id ...), which
+    // the merge reads; a replay parses nothing, so the record says it.
     Vec<Node> aliases{Node(Symbol("aliases")), Node(int64_t{A::aliases(s)})};
     Vec<Node> meta{list(files),   list(before),      list(define),  list(undefine),
                    list(autorun), list(required),    list(require), list(levels),
@@ -886,12 +892,13 @@ Unexpected refused_text_only(std::string_view name) {
 }
 
 Expected<Ref<Array>> from_bytes(std::string_view bytes, std::string_view name,
-                                const LoadSession& session, const Array*& meta) {
+                                const LoadSession& session, const Array*& meta,
+                                bool trusted = false) {
     if (session.text_only) return refused_text_only(name);
     char* file;
     const Arena::Handle arena(Arena::create_holding(allocator_of(session), bytes.size(), file));
     if (!bytes.empty()) std::memcpy(file, bytes.data(), bytes.size());
-    return load(file, bytes.size(), name, session.cipher, allocator_of(session), meta);
+    return load(file, bytes.size(), name, session.cipher, allocator_of(session), meta, trusted);
 }
 
 // Loads the cache at `path` without replaying it.
@@ -939,6 +946,13 @@ Expected<Ref<Array>> load_and_replay(LoadSession& session, Load load) {
 }
 
 }  // namespace
+
+Expected<Ref<Array>> read_image_layer(std::string_view bytes, std::string_view name,
+                                      LoadSession& session) {
+    return load_and_replay(session, [&](const Array*& meta) {
+        return from_bytes(bytes, name, session, meta, /*trusted=*/true);
+    });
+}
 }  // namespace detail
 
 uint64_t detail::content_hash(std::string_view bytes) noexcept {
